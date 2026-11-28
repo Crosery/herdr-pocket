@@ -552,15 +552,18 @@ export function ingestPortalStreamEvent(ev: unknown, hostId?: string): void {
       let nextItem: PortalItem | undefined;
       if (existing) {
         const isEgo = Boolean(existing.egoSpace);
+        const isAiBrowser = Boolean(existing.aiBrowserSpaceId);
         const hadError = Boolean(existing.streamError);
         const urlChanged = Boolean(!isEgo && frame.url && frame.url !== existing.url);
-        const titleChanged = Boolean(!isEgo && frame.title && frame.title !== existing.title);
+        const titleChanged = Boolean(!isEgo && !isAiBrowser && frame.title && frame.title !== existing.title);
         const sizeChanged = existing.width !== frame.width || existing.height !== frame.height;
         if (hadError || urlChanged || titleChanged || sizeChanged) {
           const { streamError: _clearedError, ...restExisting } = existing;
           nextItem = {
             ...restExisting,
-            ...(urlChanged && frame.url ? { url: frame.url, subtitle: frame.url } : {}),
+            ...(urlChanged && frame.url
+              ? { url: frame.url, ...(isAiBrowser ? {} : { subtitle: frame.url }) }
+              : {}),
             ...(titleChanged && frame.title ? { title: frame.title } : {}),
             width: frame.width,
             height: frame.height,
@@ -794,6 +797,10 @@ export async function syncPortalClipboard(
 ): Promise<string | undefined> {
   const res = await sendPortalInput(hostId, portalId, { type: "clipboard", action, ...(text !== undefined ? { text } : {}) });
   return res.clipboardText;
+}
+
+export function subscribeHostPortals(hostId: string): () => void {
+  return subscribeAgentPortalUpdates(hostId, "");
 }
 
 export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): () => void {

@@ -709,7 +709,7 @@ internal class VocalEnhancer {
     prevX = 0f
   }
 
-  fun process(src: FloatArray, dst: FloatArray, n: Int = src.size) {
+  fun process(src: FloatArray, dst: FloatArray, n: Int = src.size, allowBoost: Boolean = true) {
     var sum = 0.0
     var peak = 0f
     for (i in 0 until n) {
@@ -720,12 +720,13 @@ internal class VocalEnhancer {
     }
     val rms = sqrt(sum / maxOf(1, n)).toFloat()
     noiseRms = when {
+      !allowBoost -> if (rms < 0.025f) 0.92f * noiseRms + 0.08f * rms else noiseRms
       rms < noiseRms -> 0.88f * noiseRms + 0.12f * rms
       rms < noiseRms * 1.8f -> 0.992f * noiseRms + 0.008f * rms
       else -> noiseRms
-    }.coerceIn(0.0004f, 0.012f)
+    }.coerceIn(0.0004f, 0.08f)
 
-    val voiced = rms > maxOf(0.002f, noiseRms * 2.2f)
+    val voiced = allowBoost && rms > maxOf(0.002f, noiseRms * 2.2f)
     var want = if (voiced) {
       (0.11f / maxOf(rms, 0.002f)).coerceIn(1.0f, 3.5f)
     } else {

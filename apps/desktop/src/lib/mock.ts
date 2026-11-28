@@ -792,7 +792,139 @@ const demoPortals: PortalItem[] = [
     createdAt: now - 5 * min,
     updatedAt: now - 40_000,
   },
+  {
+    id: "ptl-aib-ai-1",
+    hostId: "dev-mac",
+    kind: "browser",
+    title: "AI 调研 · 国际空间站",
+    subtitle: "已点击「最新发布」 · https://search.bilibili.com/all?keyword=国际空间站&order=pubdate",
+    url: "https://search.bilibili.com/all?keyword=%E5%9B%BD%E9%99%85%E7%A9%BA%E9%97%B4%E7%AB%99&order=pubdate",
+    canInteract: true,
+    width: 1280,
+    height: 800,
+    createdAt: now - 2 * min,
+    updatedAt: now - 15_000,
+    aiBrowserSpaceId: "ai-1",
+    aiBrowserPageLabel: "p2",
+    aiBrowserOwnership: "agentWorking",
+    aiBrowserStatusText: "已点击「最新发布」，捕获接口 HTTP 200（42 条结果）",
+    aiBrowserNetworkCount: 3,
+    aiBrowserCursor: {
+      x: 588,
+      y: 192,
+      viewportW: 1280,
+      viewportH: 800,
+      box: { x: 525, y: 168, width: 120, height: 44 },
+      label: "点击 最新发布",
+      op: "click",
+      at: now,
+    },
+  },
 ];
+
+let demoAiBrowserState: {
+  ownership: "agentWorking" | "agentHandoff" | "user";
+  statusText: string;
+  handoffReason?: string;
+  activePage: string;
+  pages: Array<{ label: string; title: string; url: string; openedBy: "agent" | "user" | "popup" }>;
+  net: Array<{
+    requestId: string;
+    seq: number;
+    method: string;
+    url: string;
+    resourceType: string;
+    status: number;
+    statusText: string;
+    mimeType: string;
+    startedAt: number;
+    durationMs: number;
+    encodedDataLength: number;
+    completed: boolean;
+    requestHeaders: Record<string, string>;
+    responseHeaders: Record<string, string>;
+    body: unknown;
+  }>;
+} = {
+  ownership: "agentWorking",
+  statusText: "已点击「最新发布」，捕获接口 HTTP 200（42 条结果）",
+  activePage: "p2",
+  pages: [
+    { label: "p1", title: "哔哩哔哩 (゜-゜)つロ 干杯~-bilibili", url: "https://www.bilibili.com/", openedBy: "agent" },
+    {
+      label: "p2",
+      title: "国际空间站 - 搜索结果 - 哔哩哔哩",
+      url: "https://search.bilibili.com/all?keyword=%E5%9B%BD%E9%99%85%E7%A9%BA%E9%97%B4%E7%AB%99&order=pubdate",
+      openedBy: "popup",
+    },
+  ],
+  net: [
+    {
+      requestId: "req-demo-1",
+      seq: 1,
+      method: "GET",
+      url: "https://search.bilibili.com/all?keyword=%E5%9B%BD%E9%99%85%E7%A9%BA%E9%97%B4%E7%AB%99&order=pubdate",
+      resourceType: "Document",
+      status: 200,
+      statusText: "OK",
+      mimeType: "text/html",
+      startedAt: now - 28_000,
+      durationMs: 142,
+      encodedDataLength: 38_420,
+      completed: true,
+      requestHeaders: { Accept: "text/html,application/xhtml+xml" },
+      responseHeaders: { "content-type": "text/html; charset=utf-8" },
+      body: "<!doctype html><html><title>国际空间站 - 搜索结果</title></html>",
+    },
+    {
+      requestId: "req-demo-2",
+      seq: 2,
+      method: "GET",
+      url: "https://api.bilibili.com/x/web-interface/wbi/search/type?search_type=video&keyword=%E5%9B%BD%E9%99%85%E7%A9%BA%E9%97%B4%E7%AB%99&order=pubdate&page=1",
+      resourceType: "XHR",
+      status: 200,
+      statusText: "OK",
+      mimeType: "application/json",
+      startedAt: now - 24_000,
+      durationMs: 86,
+      encodedDataLength: 18_940,
+      completed: true,
+      requestHeaders: { Accept: "application/json", Origin: "https://search.bilibili.com" },
+      responseHeaders: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        code: 0,
+        message: "0",
+        data: {
+          page: 1,
+          pagesize: 42,
+          numResults: 1000,
+          order: "pubdate",
+          result: [
+            { bvid: "BV1demoISS01", title: "国际空间站 4K 实时轨道视角回放", author: "深空观测站", pubdate: 1732700000 },
+            { bvid: "BV1demoISS02", title: "空间站宇航员舱外维修全纪录", author: "航天前沿", pubdate: 1732695000 },
+          ],
+        },
+      },
+    },
+    {
+      requestId: "req-demo-3",
+      seq: 3,
+      method: "GET",
+      url: "https://api.bilibili.com/x/web-interface/search/square?limit=10",
+      resourceType: "Fetch",
+      status: 200,
+      statusText: "OK",
+      mimeType: "application/json",
+      startedAt: now - 20_000,
+      durationMs: 41,
+      encodedDataLength: 2_310,
+      completed: true,
+      requestHeaders: { Accept: "application/json" },
+      responseHeaders: { "content-type": "application/json; charset=utf-8" },
+      body: { code: 0, data: { trending: { list: [{ keyword: "国际空间站" }, { keyword: "中国空间站" }] } } },
+    },
+  ],
+};
 
 // Minimal 1x1 PNG fallback for Node unit tests when canvas is unavailable.
 const FALLBACK_PNG_B64 =
@@ -2113,57 +2245,165 @@ export const mockApi = {
       return { ports: a.listeningPorts ?? [] };
     }
     if (method === "spaces.sync") {
+      const syncAgents = params?.mode !== "spaces_only" && params?.syncAgents !== false;
       return {
         syncedToCore: 1,
         syncedToHerdr: 0,
-        migratedAgents: params?.mode === "migrate" ? 1 : 0,
+        syncedAgentsToHerdr: syncAgents ? 2 : 0,
+        migratedAgents: syncAgents || params?.mode === "migrate" ? 1 : 0,
         herdrAvailable: true,
         spaces: demoSpacesForHost(to),
       };
     }
     if (method === "browser.status") {
-      const enabled = clientConfigStore.get().config.plugins.aiBrowser;
-      if (!enabled) {
-        return { enabled: false, backend: "none", spaces: [] };
-      }
-      const b = browserSpacesStore.get();
       return {
         enabled: true,
-        backend: "desktop",
-        activeSpaceId: b.activeSpaceId,
-        spaces: b.spaces.map((sp) => ({
-          id: sp.id,
-          name: sp.name,
-          kind: sp.kind,
-          ownership: sp.ownership,
-          ...(sp.statusText ? { statusText: sp.statusText } : {}),
-          ...(sp.handoffReason ? { handoffReason: sp.handoffReason } : {}),
-          activePage: sp.tabs.find((t) => t.id === sp.activeTabId)?.label ?? "p1",
-          pages: sp.tabs.map((t, idx) => ({
-            label: t.label || `p${idx + 1}`,
-            title: t.title,
-            url: t.url,
-            active: t.id === sp.activeTabId,
-          })),
-        })),
+        backend: "cdp" as const,
+        resident: true,
+        platform: "darwin",
+        chromePath: "/mock/chrome-headless-shell",
+        activeSpaceId: "ai-1",
+        spaces: [
+          {
+            id: "ai-1",
+            name: "AI 调研 · 国际空间站",
+            kind: "ai" as const,
+            ownership: demoAiBrowserState.ownership,
+            statusText: demoAiBrowserState.statusText,
+            ...(demoAiBrowserState.handoffReason ? { handoffReason: demoAiBrowserState.handoffReason } : {}),
+            activePage: demoAiBrowserState.activePage,
+            portalId: "ptl-aib-ai-1",
+            networkCount: demoAiBrowserState.net.length,
+            cursor: {
+              x: 588,
+              y: 192,
+              viewportW: 1280,
+              viewportH: 800,
+              box: { x: 525, y: 168, width: 120, height: 44 },
+              label: "点击 最新发布",
+              op: "click",
+              at: Date.now(),
+            },
+            createdAt: now - 2 * min,
+            updatedAt: Date.now(),
+            pages: demoAiBrowserState.pages.map((p) => ({
+              label: p.label,
+              title: p.title,
+              url: p.url,
+              active: p.label === demoAiBrowserState.activePage,
+              openedBy: p.openedBy,
+              networkCount: demoAiBrowserState.net.length,
+              canGoBack: true,
+              canGoForward: false,
+            })),
+          },
+        ],
+      };
+    }
+    if (method === "browser.net") {
+      const action = String(params?.action ?? "list");
+      const activePg = demoAiBrowserState.activePage;
+      if (action === "clear") {
+        demoAiBrowserState.net = [];
+        return { spaceId: "ai-1", page: activePg, requests: [], total: 0 };
+      }
+      if (action === "body") {
+        const reqId = String(params?.requestId ?? "");
+        const hit = demoAiBrowserState.net.find((n) => n.requestId === reqId);
+        if (!hit) throw new Error(`请求 ${reqId} 不存在`);
+        const isObj = typeof hit.body === "object" && hit.body !== null;
+        return {
+          spaceId: "ai-1",
+          page: activePg,
+          body: {
+            requestId: hit.requestId,
+            url: hit.url,
+            status: hit.status,
+            mimeType: hit.mimeType,
+            base64Encoded: false,
+            body: isObj ? JSON.stringify(hit.body) : String(hit.body ?? ""),
+            ...(isObj ? { json: hit.body } : {}),
+          },
+        };
+      }
+      const filter = typeof params?.filter === "string" ? params.filter.trim().toLowerCase() : "";
+      const types = Array.isArray(params?.resourceTypes)
+        ? new Set((params.resourceTypes as string[]).map((t) => t.toLowerCase()))
+        : null;
+      const list = demoAiBrowserState.net
+        .filter((n) => (!filter || n.url.toLowerCase().includes(filter)) && (!types || types.has(n.resourceType.toLowerCase())))
+        .map(({ body: _b, ...entry }) => entry);
+      return { spaceId: "ai-1", page: activePg, requests: list, total: demoAiBrowserState.net.length };
+    }
+    if (method === "browser.run") {
+      return {
+        ok: true,
+        stdout: '{"status":200,"count":42}',
+        stderr: "",
+        spaceId: "ai-1",
+        portalId: "ptl-aib-ai-1",
+        durationMs: 120,
       };
     }
     if (method === "browser.act") {
-      const enabled = clientConfigStore.get().config.plugins.aiBrowser;
-      if (!enabled) {
-        throw new Error("AI 浏览器插件默认关闭，请在 设置 › 插件中心 按需启用");
+      const sid = typeof params?.spaceId === "string" && params.spaceId ? params.spaceId : "ai-1";
+      const op = String(params?.op ?? "");
+      if (op === "takeover") {
+        demoAiBrowserState.ownership = "user";
+        demoAiBrowserState.statusText = "已由你接管，可直接操作页面";
+      } else if (op === "handoff") {
+        demoAiBrowserState.ownership = "agentHandoff";
+        demoAiBrowserState.handoffReason = String(params?.reason ?? "请完成验证后交还 AI");
+        demoAiBrowserState.statusText = demoAiBrowserState.handoffReason;
+      } else if (op === "resume") {
+        demoAiBrowserState.ownership = "agentWorking";
+        demoAiBrowserState.handoffReason = undefined;
+        demoAiBrowserState.statusText = "已交还 AI 继续执行";
+      } else if (op === "tabs") {
+        const ta = String(params?.tabAction ?? "list");
+        if (ta === "open") {
+          const nextLabel = `p${demoAiBrowserState.pages.length + 1}`;
+          demoAiBrowserState.pages.push({
+            label: nextLabel,
+            title: "新标签页",
+            url: typeof params?.url === "string" ? params.url : "about:blank",
+            openedBy: "user",
+          });
+          demoAiBrowserState.activePage = nextLabel;
+        } else if (ta === "switch" && typeof params?.page === "string") {
+          demoAiBrowserState.activePage = params.page;
+        } else if (ta === "close" && typeof params?.page === "string" && demoAiBrowserState.pages.length > 1) {
+          demoAiBrowserState.pages = demoAiBrowserState.pages.filter((p) => p.label !== params.page);
+          demoAiBrowserState.activePage = demoAiBrowserState.pages[0]!.label;
+        }
+      } else if ((op === "open" || op === "navigate") && typeof params?.url === "string") {
+        const pg = demoAiBrowserState.pages.find((p) => p.label === demoAiBrowserState.activePage) ?? demoAiBrowserState.pages[0];
+        if (pg) {
+          pg.url = params.url;
+          pg.title = params.url;
+        }
       }
-      const sid = typeof params?.spaceId === "string" && params.spaceId ? params.spaceId : "ai-demo";
+      const ptl = demoPortals.find((p) => p.id === "ptl-aib-ai-1");
+      if (ptl) {
+        ptl.aiBrowserOwnership = demoAiBrowserState.ownership;
+        ptl.aiBrowserStatusText = demoAiBrowserState.statusText;
+        ptl.aiBrowserPageLabel = demoAiBrowserState.activePage;
+        const curPg = demoAiBrowserState.pages.find((p) => p.label === demoAiBrowserState.activePage);
+        if (curPg) ptl.url = curPg.url;
+        emitMockPortalEvent("updated", ptl);
+      }
       return {
         ok: true,
         spaceId: sid,
-        page: typeof params?.page === "string" && params.page ? params.page : "p1",
-        url: typeof params?.url === "string" ? params.url : "https://pocket.example.com",
-        title: "Demo Browser Space",
-        ownership: params?.op === "handoff" ? "agentHandoff" : params?.op === "finish" ? "user" : "agentWorking",
-        ...(params?.op === "handoff" ? { handoffReason: String(params?.reason ?? "请完成验证后交还 AI") } : {}),
-        ...(params?.op === "snapshot"
-          ? { snapshot: "Title: Demo Workspace\nURL: https://pocket.example.com\n---\n@e1 [link] \"Docs\"\n@e2 [button] \"Deploy\"" }
+        page: demoAiBrowserState.activePage,
+        portalId: "ptl-aib-ai-1",
+        url: demoAiBrowserState.pages.find((p) => p.label === demoAiBrowserState.activePage)?.url ?? "https://www.bilibili.com/",
+        title: demoAiBrowserState.pages.find((p) => p.label === demoAiBrowserState.activePage)?.title ?? "AI 浏览器",
+        ownership: demoAiBrowserState.ownership,
+        ...(demoAiBrowserState.handoffReason ? { handoffReason: demoAiBrowserState.handoffReason } : {}),
+        ...(op === "screenshot" ? { screenshotPath: "/tmp/herdr-pocket-demo-screenshot.png" } : {}),
+        ...(op === "snapshot"
+          ? { snapshot: 'Title: 国际空间站 - 搜索结果\nURL: https://search.bilibili.com/all?keyword=国际空间站&order=pubdate\n---\n@e1 [button] "最新发布"\n@e2 [textbox] "国际空间站"' }
           : {}),
       };
     }
@@ -2303,6 +2543,10 @@ export const mockApi = {
     const nextWebhooks = patch.webhooks !== undefined ? patch.webhooks.map((w) => ({ ...w })) : cur.webhooks;
     const cleanPlugins: AssistantSettings["plugins"] = {};
     if (nextPlugins) {
+      for (const k of ["herdr", "uniflo"] as const) {
+        if (nextPlugins[k] === false) cleanPlugins[k] = false;
+        else if (nextPlugins[k] === true) cleanPlugins[k] = true;
+      }
       for (const k of ["browser", "workspace", "webfetch", "webhooks"] as const) {
         if (nextPlugins[k]) cleanPlugins[k] = true;
       }

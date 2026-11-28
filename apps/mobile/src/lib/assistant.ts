@@ -19,6 +19,28 @@ import { loadToken } from "./auth";
 import { isMockServer, mockAssistant } from "./mock";
 import { onAssistantConfigFrame } from "./assistantConfig";
 
+export const DEFAULT_ASSISTANT_PLUGINS: Record<AssistantPluginId, boolean> = {
+  herdr: true,
+  uniflo: true,
+  browser: false,
+  workspace: false,
+  webfetch: false,
+  webhooks: false,
+};
+
+export function resolveAssistantPlugins(
+  raw?: Partial<Record<AssistantPluginId, boolean>>,
+): Record<AssistantPluginId, boolean> {
+  return {
+    herdr: raw?.herdr !== false,
+    uniflo: raw?.uniflo !== false,
+    browser: raw?.browser === true,
+    workspace: raw?.workspace === true,
+    webfetch: raw?.webfetch === true,
+    webhooks: raw?.webhooks === true,
+  };
+}
+
 interface AssistantStore {
   items: AssistantItem[];
   busy: boolean;
@@ -29,7 +51,7 @@ interface AssistantStore {
   reminders: Reminder[];
   /** "always": the assistant asks before acting in typed chats. Unknown (older relay): null. Calls never wait. */
   confirm: AssistantConfirm | null;
-  plugins: Partial<Record<AssistantPluginId, boolean>>;
+  plugins: Record<AssistantPluginId, boolean>;
   webhooks: AssistantWebhookTool[];
   loaded: boolean;
   error: string | null;
@@ -46,7 +68,7 @@ export const useAssistant = create<AssistantStore>()(() => ({
   model: null,
   reminders: [],
   confirm: null,
-  plugins: {},
+  plugins: { ...DEFAULT_ASSISTANT_PLUGINS },
   webhooks: [],
   loaded: false,
   error: null,
@@ -82,7 +104,7 @@ export function applyAssistantState(s: AssistantState): void {
     model: s.model ?? null,
     reminders: s.reminders,
     confirm: s.settings?.confirm ?? null,
-    plugins: s.settings?.plugins ?? {},
+    plugins: resolveAssistantPlugins(s.settings?.plugins),
     webhooks: s.settings?.webhooks ?? [],
     loaded: true,
     error: null,
@@ -223,23 +245,28 @@ export async function updateAssistantPlugins(patch: {
 }): Promise<AssistantSettings> {
   const prevPlugins = useAssistant.getState().plugins;
   const prevWebhooks = useAssistant.getState().webhooks;
+  const optimisticPlugins = patch.plugins ? resolveAssistantPlugins({ ...prevPlugins, ...patch.plugins }) : prevPlugins;
   useAssistant.setState({
-    ...(patch.plugins ? { plugins: patch.plugins } : {}),
+    ...(patch.plugins ? { plugins: optimisticPlugins } : {}),
     ...(patch.webhooks !== undefined ? { webhooks: patch.webhooks } : {}),
   });
   try {
     if (isMockServer(useSettings.getState().server)) {
       const next = mockAssistant.setPluginSettings(patch);
-      useAssistant.setState({ plugins: next.plugins ?? {}, webhooks: next.webhooks ?? [] });
-      return next;
+      const resolved = patch.plugins
+        ? resolveAssistantPlugins({ ...prevPlugins, ...patch.plugins })
+        : resolveAssistantPlugins(next.plugins);
+      useAssistant.setState({ plugins: resolved, webhooks: next.webhooks ?? [] });
+      return { ...next, plugins: resolved };
     }
     const r = await api<AssistantSettings>("/v1/assistant/settings", { body: patch });
+    const resolved = resolveAssistantPlugins(r.plugins);
     useAssistant.setState({
       confirm: r.confirm,
-      plugins: r.plugins ?? {},
+      plugins: resolved,
       webhooks: r.webhooks ?? [],
     });
-    return r;
+    return { ...r, plugins: resolved };
   } catch (e) {
     useAssistant.setState({ plugins: prevPlugins, webhooks: prevWebhooks });
     throw e;

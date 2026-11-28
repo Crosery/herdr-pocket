@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Bot, Check, ChevronDown, ChevronUp, Copy, Sparkles, X } from "lucide-react";
+import { Bot, Check, ChevronDown, ChevronUp, Copy, MessageSquarePlus, Sparkles, X } from "lucide-react";
 import type { Agent, ConvEvent } from "@herdr-pocket/protocol";
 import { assistantStore, loadAssistant, sendToAssistant, type AssistantStoreState } from "../lib/assistant";
 import { copyToClipboard } from "../lib/bridge";
@@ -529,8 +529,10 @@ export interface BtwSideDrawerProps {
   turns?: BtwTurn[];
   turn?: BtwTurn | null;
   agent?: Pick<Agent, "status" | "harness" | "title" | "name">;
+  mainRunning?: boolean;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  onAskAgain?: () => void;
   onDismiss: (turnId?: string) => void;
   onOpenFile?: (target: string) => void;
 }
@@ -543,8 +545,10 @@ export function BtwSideDrawer({
   turns,
   turn,
   agent,
+  mainRunning,
   collapsed: controlledCollapsed,
   onToggleCollapse,
+  onAskAgain,
   onDismiss,
   onOpenFile,
 }: BtwSideDrawerProps) {
@@ -558,7 +562,7 @@ export function BtwSideDrawer({
   const toggleCollapse = onToggleCollapse ?? (() => setLocalCollapsed((v) => !v));
   const latest = items[items.length - 1]!;
   const latestDuration = formatDurationMs(latest.durationMs);
-  const isWorking = agent?.status === "working";
+  const isWorking = mainRunning ?? (agent?.status === "working");
 
   const handleCopy = (target: BtwTurn) => {
     const content = target.answer?.trim();
@@ -604,6 +608,17 @@ export function BtwSideDrawer({
           ) : null}
         </div>
         <div className="btw-drawer-actions">
+          {onAskAgain ? (
+            <button
+              type="button"
+              className="btw-icon-btn"
+              aria-label="继续旁路追问"
+              title="继续追问 /btw"
+              onClick={onAskAgain}
+            >
+              <MessageSquarePlus size={13} />
+            </button>
+          ) : null}
           {latest.status === "done" && latest.answer ? (
             <button
               type="button"

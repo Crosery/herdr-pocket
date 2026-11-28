@@ -348,6 +348,39 @@ test("BtwSideDrawer renders duration, streaming, and formatBtwTranscriptFromEven
   );
   assert.match(html, /旁路提问 \/btw/);
   assert.ok(html.includes("5.9s"));
+  assert.ok(html.includes("主线运行中"), "should fall back to agent.status === working when mainRunning is omitted");
+  assert.ok(!html.includes("继续旁路追问"), "should omit follow-up icon when onAskAgain is not provided");
+
+  // When mainRunning={false} (e.g. stale hc working after turn_end), drawer must NOT show 主线运行中.
+  const idleMainHtml = renderToStaticMarkup(
+    React.createElement(BtwSideDrawer, {
+      agent: baseAgent, // status: "working"
+      mainRunning: false,
+      onAskAgain: () => {},
+      turns: [
+        {
+          id: "t2",
+          question: "主线还在跑吗？",
+          status: "done",
+          answer: "已空闲。",
+          model: "gemini-4",
+          durationMs: 910,
+          createdAt: Date.now(),
+        },
+      ],
+      onDismiss: () => {},
+    }),
+  );
+  assert.ok(!idleMainHtml.includes("主线运行中"), "mainRunning={false} must override stale agent.status === working");
+  assert.ok(idleMainHtml.includes("继续旁路追问"), "onAskAgain should render follow-up icon button");
+
+  // CSS layout alignment guardrails: .btw-drawer stays centered within 48rem composer width and compact body height.
+  const btwCss = readFileSync(new URL("../src/styles/btw-slash.css", import.meta.url), "utf8");
+  const drawerRule = /\.btw-drawer\s*\{[^}]*\}/.exec(btwCss)?.[0] ?? "";
+  assert.match(drawerRule, /max-width:\s*calc\(48rem\s*-\s*40px\)/);
+  assert.match(drawerRule, /margin:\s*0\s+auto\s+8px/);
+  assert.match(btwCss, /\.t3-composer-shell\s+\.btw-drawer\s*\{[^}]*width:\s*100%/);
+  assert.match(btwCss, /\.btw-drawer-body\s*\{[^}]*max-height:\s*min\(260px,\s*36vh\)/);
 });
 
 test("desktop and mobile slashCommands expose /btw across all harnesses", () => {

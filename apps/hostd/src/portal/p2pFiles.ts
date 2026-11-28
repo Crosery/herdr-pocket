@@ -5,7 +5,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { DIRECT_PORTAL_FS_PREFIX, FILES_LIMITS, type FileEntry, type PortalFileTicket } from "@herdr-pocket/protocol";
-import { FilesError, inside, isPrivateName, resolveInside, type FilesOptions } from "../files.ts";
+import { FilesError, inside, isPrivateName, resolveInside, smartResolveFile, type FilesOptions } from "../files.ts";
 
 const CAP_TTL_MS = 30 * 60_000;
 const CAP_MAX = 256;
@@ -135,7 +135,7 @@ export class PortalFileTicketStore {
     port: number | null;
     addrs: string[];
   }): Promise<PortalFileTicket & { absPath: string }> {
-    const resolved = await resolveInside(opts.agentCwd, opts.path, opts.filesOpts);
+    const resolved = await smartResolveFile(opts.agentCwd, opts.path, opts.filesOpts);
     const st = await stat(resolved.real);
     const isDir = st.isDirectory();
     const realAgentCwd =
@@ -367,7 +367,7 @@ export async function readChunkForRpc(
   filesOpts: FilesOptions,
 ): Promise<{ path: string; size: number; mtime: number; offset: number; bytes: number; eof: boolean; mime: string; base64: string }> {
   const root = p.cwd?.trim() || agentCwd;
-  const resolved = await resolveInside(root, p.path, filesOpts);
+  const resolved = await smartResolveFile(root, p.path, filesOpts);
   const st = await stat(resolved.real);
   if (!st.isFile()) throw new FilesError("bad_request", "只能分片读取普通文件");
   const size = st.size;
@@ -406,7 +406,7 @@ export async function bundleHtmlForRelay(
   filesOpts: FilesOptions,
 ): Promise<{ html: string; title: string }> {
   const root = p.cwd?.trim() || agentCwd;
-  const resolved = await resolveInside(root, p.path, filesOpts);
+  const resolved = await smartResolveFile(root, p.path, filesOpts);
   const st = await stat(resolved.real);
   if (!st.isFile()) throw new FilesError("bad_request", "目标不是 HTML 文件");
   const baseDir = dirname(resolved.real);

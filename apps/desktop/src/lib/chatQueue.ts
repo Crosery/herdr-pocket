@@ -553,6 +553,17 @@ export async function sendPromptNow(
 ): Promise<boolean> {
   const clean = rawText.trim();
   if (!clean && attachments.length === 0) return false;
+  // Guard against rapid duplicate Enter / IME double-submit creating twin optimistic bubbles.
+  const now = Date.now();
+  const existing = chatQueueStore.get().outgoingByAgent[agent.key] ?? EMPTY_OUTGOING;
+  const dupRecent = existing.find(
+    (x) =>
+      x.state !== "failed" &&
+      now - x.ts < 800 &&
+      x.attachedCount === attachments.length &&
+      sameMessage(x.text, clean, attachments.length > 0),
+  );
+  if (dupRecent) return true;
   const entry = createOutgoingEntry(agent, clean, attachments, "sending");
   updateOutgoing(agent.key, (list) => [...list, entry]);
   return deliverOutgoing(entry, delivery);

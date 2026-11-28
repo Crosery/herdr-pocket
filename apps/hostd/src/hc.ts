@@ -37,7 +37,7 @@ const MODAL_PICKER_TAIL_PATTERNS: readonly RegExp[] = [
 ];
 
 const INTERACTIVE_APPROVAL_RE =
-  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool)|allow tool execution|permission required|approve|reject|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|\[y\/n\]|\(y\/n\)|chat about this|type your(?: own)? answer|enter to submit answer)\b|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认/i;
+  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool)|allow tool execution|permission required|approve|reject|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|chat about this|type your(?: own)? answer|enter to submit answer)\b|\[y\/n\]|\(y\/n\)|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认/i;
 
 const WORKING_INLINE_HINT_RE =
   /\(\s*(?:[^()]*[•·]\s*)?esc\s+(?:to\s+)?(?:cancel|interrupt)\s*\)\s*$|\(\s*按\s*esc\s*(?:键)?\s*(?:取消|中断)\s*\)\s*$/i;
@@ -108,9 +108,29 @@ const AGY_IDLE_PROMPT_LINE_RE = /^>\s*$/;
 const AGY_COMPOSER_PROMPT_LINE_RE = /^>(?:\s.*)?$/;
 const AGY_BORDER_LINE_RE = /^[─━═┄┈-]{8,}$/;
 const AGY_ACTIVE_SPINNER_RE =
-  /^[⣾⣽⣻⢿⡿⣟⣯⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✶✳✻✽]\s+\S|^●\s+Running\b|\(\s*(?:[^()]*[•·]\s*)?esc\s+(?:to\s+)?(?:cancel|interrupt)\s*\)/i;
+  /^[⣾⣽⣻⢿⡿⣟⣯⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✶✳✻✽]\s+\S|^[●⏺•]\s+Running\b|\(\s*(?:[^()]*[•·]\s*)?esc\s+(?:to\s+)?(?:cancel|interrupt)\s*\)/i;
 const AGY_MODAL_APPROVAL_RE =
-  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool)|allow tool execution|permission required|approve\s+plan\?|proceed\?|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|press enter to (?:approve|proceed|confirm|submit)|\[y\/n\]|\(y\/n\)|enter to submit answer)\b|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认/i;
+  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool|this command)|allow tool execution|permission required|approve\s+plan\?|proceed\?|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|press enter to (?:approve|proceed|confirm|submit)|enter to (?:select|confirm|submit)|space to toggle|use arrow keys|chat about this|type your(?: own)? answer|submit answers?|trust (?:this|the) (?:folder|directory|workspace|files)|do you trust|question \d+\s*(?:of|\/)\s*\d+|esc\s+(?:to\s+)?(?:cancel|reject|decline|dismiss))\b|\[y\/n\]|\(y\/n\)|↑\/↓|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认|信任(?:此|该)?(?:目录|文件夹|工作区)/i;
+const AUTH_MODAL_RE =
+  /\b(?:please\s+(?:log\s*in|sign\s*in|authenticate)|(?:login|sign[- ]?in|authentication|re-?authentication)\s+required|sign\s+in\s+(?:with|to)\b|log\s+in\s+(?:with|to)\b|waiting\s+for\s+(?:browser\s+)?(?:auth|authentication|login|sign[- ]?in)|authorize\s+in\s+(?:your\s+)?browser|open\s+(?:this|the)\s+url\s+to\s+(?:auth|authenticate|log\s*in|sign\s*in)|(?:enter|paste|provide)\s+(?:your\s+|the\s+)?(?:api\s*key|auth(?:entication)?\s+code|verification\s+code|device\s+code|access\s+token|one-time\s+code)|device\s+code\s*[:：]|verification\s+code\s*[:：]|oauth\s+(?:login|flow|authorization|callback|token\s+expired)|session\s+expired\b.*(?:log\s*in|sign\s*in|auth))\b|请(?:先)?登录|登录以继续|扫码登录|授权登录|等待浏览器(?:授权|登录)|请输入\s*(?:API\s*Key|验证码|授权码)|需要重新(?:登录|认证)/i;
+const IDLE_PROMPT_GLYPH_RE = /^[❯›>]\s*$/;
+const QUESTION_HEADER_LINE_RE = /^[?？☐]\s+\S/;
+const IDLE_COMPOSER_FOOTER_RE =
+  /\b(?:shift\+tab\s+to\s+cycle|\?\s+for\s+shortcuts|for\s+shortcuts|context\s+left|bypass\s+permissions\s+on|plan\s+mode\s+on|accept\s+edits\s+on|auto-?accept\s+edits)\b|\b\d+(?:\.\d+)?%\s*(?:ctx|context|\/\s*\d+[kKmM]?)\b|\bctx\s*·\s*(?:idle|done|reviewing)\b|\b\d+\s+artifacts?\s*·\s*\/artifact\s+to\s+review\b|[·•|]\s*(?:idle|done|reviewing)\b/i;
+
+/**
+ * Resolves the finished status (`"done"` vs `"idle"`) when demoting a terminal whose raw `hc`
+ * `working` or `blocked` state was verified against its live screen to be idle/finished.
+ * Unseen finished turns (`herdr.seen` missing or `< turn`) stay `"done"` ("已完成").
+ */
+export function demotedFinishedStatus(rawTerm: HcTerminal | undefined): "done" | "idle" {
+  if (typeof rawTerm?.turn === "number" && rawTerm.turn > 0) {
+    const rawSeen = rawTerm.labels?.["herdr.seen"];
+    const seen = rawSeen !== undefined && rawSeen.trim() !== "" ? Number(rawSeen) : NaN;
+    return Number.isFinite(seen) && seen >= rawTerm.turn ? "idle" : "done";
+  }
+  return "idle";
+}
 
 /**
  * True when an agent's raw `hc` status matches the Antigravity `· reviewing` false-block
@@ -221,6 +241,113 @@ export function isFalseAntigravityReviewBlock(opts: {
   if (isInteractiveApprovalOrQuestion(tail16.slice(promptIdx - 1).join("\n"))) return false;
   const aboveComposer = tail16.slice(Math.max(0, promptIdx - 4), promptIdx - 1).join("\n");
   if (aboveComposer && AGY_MODAL_APPROVAL_RE.test(aboveComposer)) return false;
+
+  return true;
+}
+
+/**
+ * True when a non-shell agent's raw `hc` status is a non-error, non-auth `"blocked"` state
+ * that should be verified against its live terminal screen before alerting the user.
+ */
+export function isFalseBlockedCandidate(opts: {
+  harness: string;
+  status: AgentStatus;
+  statusKind?: Agent["statusKind"];
+  errored?: boolean;
+  isShell?: boolean;
+}): boolean {
+  if (opts.isShell || SHELL_HARNESSES.has(opts.harness.toLowerCase())) return false;
+  if (opts.status !== "blocked") return false;
+  if (opts.errored) return false;
+  if (opts.statusKind === "auth") return false;
+  return true;
+}
+
+/**
+ * Universal screen-verified false-block detector across harnesses (`antigravity`, `claude-code`,
+ * `codex`, `omp`, `gemini`, etc.). Returns true ONLY when the live screen unambiguously shows
+ * an empty idle composer prompt with a recognized idle footer AND passes all Hard Vetoes
+ * (no selectable choice menu, no approval/question/`[y/n]` UI, no auth/OAuth/login prompt,
+ * no active spinner / `Running` line above the composer).
+ */
+export function isFalseBlockedState(opts: {
+  harness: string;
+  status: AgentStatus;
+  statusKind?: Agent["statusKind"];
+  statusNote?: string;
+  errored?: boolean;
+  isShell?: boolean;
+  screen: string;
+}): boolean {
+  if (!isFalseBlockedCandidate(opts)) return false;
+
+  const rawLines = opts.screen.split("\n").map((l) => l.replace(ANSI_SGR_RE, "").trimEnd());
+  const nonEmpty = rawLines.map((l) => l.trim()).filter(Boolean);
+  if (nonEmpty.length === 0) return false;
+
+  // Hard Veto: any selectable choice menu / ask_question options on screen.
+  if (parseTerminalChoices(rawLines).length > 0) return false;
+
+  const tail24 = nonEmpty.slice(-24);
+  const tail16 = nonEmpty.slice(-16);
+
+  // Hard Veto: explicit auth/OAuth/login prompt on screen.
+  if (AUTH_MODAL_RE.test(tail16.join("\n"))) return false;
+
+  const harness = opts.harness.toLowerCase();
+  let promptIdx = -1;
+
+  if (harness === "antigravity") {
+    const footerLines = tail24.slice(-3);
+    if (footerLines.some((l) => AGY_WORKING_FOOTER_RE.test(l))) return false;
+    const hasNonWorkingFooter = tail24.some((l) => AGY_NON_WORKING_FOOTER_RE.test(l) || AGY_ARTIFACT_HINT_RE.test(l));
+    if (!hasNonWorkingFooter) return false;
+
+    for (let i = tail24.length - 1; i >= 1; i -= 1) {
+      if (
+        AGY_IDLE_PROMPT_LINE_RE.test(tail24[i]!) &&
+        AGY_BORDER_LINE_RE.test(tail24[i - 1]!) &&
+        i + 1 < tail24.length &&
+        AGY_BORDER_LINE_RE.test(tail24[i + 1]!)
+      ) {
+        promptIdx = i;
+        break;
+      }
+    }
+    if (promptIdx < 1) return false;
+  } else {
+    const minPromptIdx = Math.max(0, tail24.length - 8);
+    for (let i = tail24.length - 1; i >= minPromptIdx; i -= 1) {
+      if (IDLE_PROMPT_GLYPH_RE.test(tail24[i]!)) {
+        promptIdx = i;
+        break;
+      }
+    }
+    if (promptIdx < 0) return false;
+
+    const belowPrompt = tail24.slice(promptIdx + 1);
+    if (belowPrompt.length === 0) return false;
+    if (belowPrompt.some((l) => WORKING_INLINE_HINT_RE.test(l) || AGY_WORKING_FOOTER_RE.test(l))) return false;
+    if (!belowPrompt.some((l) => IDLE_COMPOSER_FOOTER_RE.test(l))) return false;
+  }
+
+  const aboveEnd = promptIdx > 0 && AGY_BORDER_LINE_RE.test(tail24[promptIdx - 1]!) ? promptIdx - 1 : promptIdx;
+  const aboveComposerLines = tail24.slice(Math.max(0, aboveEnd - 12), aboveEnd);
+  const aboveComposerRecent = tail24.slice(Math.max(0, aboveEnd - 5), aboveEnd);
+  const fromComposer = tail24.slice(Math.max(0, promptIdx - 1)).join("\n");
+
+  // Hard Veto: active spinner / foreground `Running` / interrupt hint above composer.
+  if (aboveComposerLines.some((l) => AGY_ACTIVE_SPINNER_RE.test(l))) return false;
+
+  // Hard Veto: approval / question / confirmation / `[y/n]` / modal picker UI.
+  if (isInteractiveApprovalOrQuestion(fromComposer)) return false;
+  if (aboveComposerRecent.length > 0 && AGY_MODAL_APPROVAL_RE.test(aboveComposerRecent.join("\n"))) return false;
+  if (tail24.slice(promptIdx + 1).some((l) => MODAL_PICKER_TAIL_PATTERNS.some((re) => re.test(l)))) return false;
+
+  // Hard Veto: for `statusKind === "question"`, also reject active `? ...` / `☐ ...` question headers above composer.
+  if (opts.statusKind === "question" && aboveComposerRecent.some((l) => QUESTION_HEADER_LINE_RE.test(l))) {
+    return false;
+  }
 
   return true;
 }
@@ -337,6 +464,7 @@ export class HcAdapter extends EventEmitter {
   private stopped = false;
   private backoff = 1000;
   private resync = debounce(() => void this.list(), 400);
+  private doneResyncTimer: NodeJS.Timeout | null = null;
   private titleFlush = debounce(() => this.emit("change"), 1500);
   private timer: NodeJS.Timeout | null = null;
   /** Last line from the subscription; herdr-core sends a heartbeat every 15 s. */
@@ -415,8 +543,22 @@ export class HcAdapter extends EventEmitter {
   stop(): void {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
+    if (this.doneResyncTimer) {
+      clearTimeout(this.doneResyncTimer);
+      this.doneResyncTimer = null;
+    }
     this.child?.kill();
     this.screens.stop();
+  }
+
+  /** Non-starvable immediate resync for `done` transitions so busy sibling events cannot delay them. */
+  private scheduleImmediateResync(): void {
+    if (this.doneResyncTimer || this.stopped) return;
+    this.doneResyncTimer = setTimeout(() => {
+      this.doneResyncTimer = null;
+      if (!this.stopped) void this.list();
+    }, 25);
+    this.doneResyncTimer.unref?.();
   }
 
   private connect(): void {
@@ -507,19 +649,25 @@ export class HcAdapter extends EventEmitter {
         if (cleanTitle(t.title) !== before) this.titleFlush();
         return;
       }
-      if (p.type === "status" && t && p.data && "status" in p.data) {
+      if (p.type === "status" && p.data && "status" in p.data) {
         const next = p.data.status ?? null;
-        // A finished turn waits for the list: the event comes before the new turn
-        // number, and with the old one the turn would read as already seen (idle).
-        if (next?.state !== "done") {
+        // A finished turn waits for the list: the event carries no turn number,
+        // and with the old one the turn would read as already seen (idle).
+        // Schedule a non-starvable immediate resync so `done` is never delayed or swallowed.
+        if (normalizeStatus(next?.state) === "done") {
+          this.scheduleImmediateResync();
+          return;
+        }
+        if (t) {
           // Applied at once: the phone must not wait for a full list. Only a change
           // of state matters; the status message changes every few seconds.
           const before = HcAdapter.status(t);
+          const kindBefore = HcAdapter.statusKind(t);
           const noteBefore = HcAdapter.note(t);
           t.status = next;
           if (HcAdapter.status(t) === before) {
-            // Same state; a new error or question still has to reach the phone.
-            if (HcAdapter.note(t) !== noteBefore) this.emit("change");
+            // Same state; a new error, kind change, or question still has to reach the phone.
+            if (HcAdapter.note(t) !== noteBefore || HcAdapter.statusKind(t) !== kindBefore) this.emit("change");
             return;
           }
           t.status_ms = Date.now();
@@ -666,6 +814,11 @@ export class HcAdapter extends EventEmitter {
     return raw === "permission" || raw === "question" || raw === "auth" ? raw : undefined;
   }
 
+  /** True when `hc` reports a terminal error/failed state (which maps to `blocked` + `errored`). */
+  static errored(t: HcTerminal): boolean {
+    return ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "");
+  }
+
   /** What the program says while it waits for a person (an error or a question), clipped. */
   static note(t: HcTerminal): string | undefined {
     if (HcAdapter.status(t) !== "blocked") return undefined;
@@ -715,7 +868,7 @@ export class HcAdapter extends EventEmitter {
       statusKind: HcAdapter.statusKind(t),
       statusSince: t.status_ms ?? undefined,
       statusNote: HcAdapter.note(t),
-      errored: ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "") || undefined,
+      errored: HcAdapter.errored(t) || undefined,
       turn: t.turn,
       isShell: !t.status && !restoredApp && SHELL_HARNESSES.has(harness.toLowerCase()),
       updatedAt: t.status_ms ?? t.created_ms ?? Date.now(),

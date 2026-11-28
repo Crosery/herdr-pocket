@@ -633,3 +633,213 @@ test("reconcileOutgoingSends: non-image file attachments (absolute, relative, sh
   assert.deepEqual(recRel.matchedIds, ["out-rel"]);
   assert.equal(recRel.unmatched.length, 0);
 });
+
+test("foldConvEvents (image-149 regression): finalizes superseded orphan tool calls while preserving live parallel tail batch", () => {
+  const events: ConvEvent[] = [
+    { id: "u1", session: "s", ts: 1000, kind: "user_message", text: "调度 swarm 修复问题" },
+    { id: "r1", session: "s", ts: 1100, kind: "reasoning", text: "拆分子任务并派发" },
+    // Batch 1: 4 tools, two of which (post_message, update_steps) never emit tool_result
+    { id: "c1", session: "s", ts: 1200, kind: "tool_call", call_id: "b1-1", name: "swarm", input: { action: "add" } },
+    { id: "c2", session: "s", ts: 1201, kind: "tool_call", call_id: "b1-2", name: "write_file", input: { path: "a.ts" } },
+    { id: "c3", session: "s", ts: 1202, kind: "tool_call", call_id: "b1-3", name: "post_message", input: { text: "go" } },
+    { id: "c4", session: "s", ts: 1203, kind: "tool_call", call_id: "b1-4", name: "update_steps", input: { steps: [] } },
+    { id: "c1r", session: "s", ts: 1300, kind: "tool_result", call_id: "b1-1", name: "swarm", output: "ok" },
+    { id: "c2r", session: "s", ts: 1301, kind: "tool_result", call_id: "b1-2", name: "write_file", output: "ok" },
+    // Model moves on to next reasoning + swarm_wait (also without tool_result)
+    { id: "r2", session: "s", ts: 2000, kind: "reasoning", text: "等待子任务回复" },
+    { id: "c5", session: "s", ts: 2100, kind: "tool_call", call_id: "b2-1", name: "swarm_wait", input: { since: 1 } },
+    // Model wakes up, thinks again, and issues a live parallel tail batch (2 tools; 1 finished, 1 still running)
+    { id: "r3", session: "s", ts: 3000, kind: "reasoning", text: "检查结果并跑验证" },
+    { id: "c6", session: "s", ts: 3100, kind: "tool_call", call_id: "b3-1", name: "read_file", input: { path: "a.ts" } },
+    { id: "c7", session: "s", ts: 3101, kind: "tool_call", call_id: "b3-2", name: "run_command", input: { CommandLine: "pnpm test" } },
+    { id: "c6r", session: "s", ts: 3200, kind: "tool_result", call_id: "b3-1", name: "read_file", output: "contents" },
+  ];
+
+  const liveRows = foldConvEvents(events, "standard");
+  const groups = liveRows.filter((r): r is Extract<ChatRow, { kind: "activity_group" }> => r.kind === "activity_group");
+  const singleTools = liveRows.filter((r): r is Extract<ChatRow, { kind: "tool" }> => r.kind === "tool");
+  assert.equal(groups.length, 2);
+  assert.equal(singleTools.length, 1);
+
+  // Earlier 4-tool group must NOT be stuck spinning.
+  assert.equal(groups[0]!.running, false);
+  assert.equal(groups[0]!.headline, "已调用 4 个工具");
+  assert.equal(groups[0]!.activeStep, undefined);
+  assert.equal(groups[0]!.tools.every((t) => !t.running), true);
+  assert.equal(groups[0]!.series.every((s) => !s.running), true);
+
+  // Superseded swarm_wait must NOT be stuck spinning.
+  assert.equal(singleTools[0]!.step.running, false);
+
+  // Active parallel tail batch keeps its still-running call live while finished sibling is done.
+  assert.equal(groups[1]!.running, true);
+  assert.match(groups[1]!.headline, /正在运行.*已调用 2 个工具/);
+  assert.equal(groups[1]!.tools[0]!.running, false);
+  assert.equal(groups[1]!.tools[1]!.running, true);
+
+  // Once assistant_message or turn_end finishes the turn (even if c7r never arrived), tail group finalizes cleanly.
+  const finishedWithAssistant = foldConvEvents(
+    [...events, { id: "a1", session: "s", ts: 4000, kind: "assistant_message", text: "全部修复完成。" }],
+    "standard",
+  );
+  const finishedGroups = finishedWithAssistant.filter(
+    (r): r is Extract<ChatRow, { kind: "activity_group" }> => r.kind === "activity_group",
+  );
+  assert.equal(finishedGroups.every((g) => !g.running), true);
+  assert.equal(finishedGroups[1]!.headline, "已调用 2 个工具");
+  assert.equal(finishedGroups[1]!.hasFollowingAssistant, true);
+
+  const finishedWithTurnEnd = foldConvEvents(
+    [...events, { id: "te1", session: "s", ts: 4000, kind: "turn_end" }],
+    "standard",
+  );
+  const teGroups = finishedWithTurnEnd.filter(
+    (r): r is Extract<ChatRow, { kind: "activity_group" }> => r.kind === "activity_group",
+  );
+  assert.equal(teGroups.every((g) => !g.running), true);
+
+  // Sequential batches without reasoning: earlier orphan call finalizes when a new batch starts after a tool_result,
+  // while multiple parallel calls emitted together in the new batch ALL stay running.
+  const noReasoningSeq: ConvEvent[] = [
+    { id: "n1", session: "s", ts: 100, kind: "tool_call", call_id: "nb-1", name: "update_steps", input: {} },
+    { id: "n2", session: "s", ts: 101, kind: "tool_call", call_id: "nb-2", name: "read_file", input: { path: "x.ts" } },
+    { id: "n2r", session: "s", ts: 200, kind: "tool_result", call_id: "nb-2", name: "read_file", output: "ok" },
+    { id: "n3", session: "s", ts: 300, kind: "tool_call", call_id: "nb-3", name: "edit_file", input: { path: "x.ts" } },
+    { id: "n4", session: "s", ts: 301, kind: "tool_call", call_id: "nb-4", name: "run_command", input: { cmd: "test" } },
+  ];
+  const noReasoningRows = foldConvEvents(noReasoningSeq, "standard");
+  assert.equal(noReasoningRows.length, 1);
+  assert.equal(noReasoningRows[0]!.kind, "activity_group");
+  if (noReasoningRows[0]!.kind === "activity_group") {
+    assert.deepEqual(
+      noReasoningRows[0]!.tools.map((t) => `${t.callId}:${t.running}`),
+      ["nb-1:false", "nb-2:false", "nb-3:true", "nb-4:true"],
+    );
+  }
+
+  // Compact mode: reasoning inside the same activity_group also finalizes earlier orphan tool calls.
+  const compactRows = foldConvEvents(
+    [
+      { id: "cm1", session: "s", ts: 100, kind: "reasoning", text: "step 1" },
+      { id: "cm2", session: "s", ts: 110, kind: "tool_call", call_id: "cm-orphan", name: "update_steps", input: {} },
+      { id: "cm3", session: "s", ts: 200, kind: "reasoning", text: "step 2" },
+      { id: "cm4", session: "s", ts: 210, kind: "tool_call", call_id: "cm-done", name: "read_file", input: { path: "a.ts" } },
+      { id: "cm5", session: "s", ts: 220, kind: "tool_result", call_id: "cm-done", name: "read_file", output: "ok" },
+    ],
+    "compact",
+  );
+  assert.equal(compactRows.length, 1);
+  assert.equal(compactRows[0]!.kind, "activity_group");
+  if (compactRows[0]!.kind === "activity_group") {
+    assert.equal(compactRows[0]!.running, false);
+    assert.equal(compactRows[0]!.headline, "已调用 2 个工具");
+  }
+});
+
+test("reconcileOutgoingSends & foldConvEvents (image-148 regression): uploaded path matching, duplicate claimed cleanup within ±15s, and consecutive user echo coalescing", () => {
+  const uniqueImgPath = "/Users/demo/.cache/herdr-pocket/files/t19g/image-147.png";
+
+  // 1. Unique uploaded image path matches even when text has zero-width chars, curly quotes, or slight PTY normalization drift.
+  const foldedImg = foldConvEvents(
+    [
+      {
+        id: "u-img-1",
+        session: "s1",
+        ts: 500_500,
+        kind: "user_message",
+        text: `帮我看一下"重复气泡"的问题，截图在这里\n${uniqueImgPath}`,
+      },
+    ],
+    "standard",
+  );
+  const sendWithDrift: OutgoingSendLike = {
+    id: "out-drift",
+    text: "帮我看一下“重复气泡”的问题，\u200B截图在\uFEFF这里",
+    attachedCount: 1,
+    uploadedPaths: [uniqueImgPath],
+    ts: 500_000,
+    state: "sent",
+  };
+  const recDrift = reconcileOutgoingSends([sendWithDrift], foldedImg, "working", 502_000);
+  assert.deepEqual(recDrift.matchedIds, ["out-drift"]);
+  assert.equal(recDrift.unmatched.length, 0);
+
+  // Even for a short caption with minor PTY text drop, sharing the exact unique upload path reconciles cleanly.
+  const sendShortCaptionDrift: OutgoingSendLike = {
+    id: "out-short-path",
+    text: "看这个图！",
+    attachedCount: 1,
+    uploadedPaths: [uniqueImgPath],
+    ts: 500_200,
+    state: "sent",
+  };
+  const recShortPath = reconcileOutgoingSends([sendShortCaptionDrift], foldedImg, "working", 502_000);
+  assert.deepEqual(recShortPath.matchedIds, ["out-short-path"]);
+  assert.equal(recShortPath.unmatched.length, 0);
+
+  // 2. Duplicate optimistic OutgoingSend targeting an already-claimed user row within ±15s cleans up cleanly,
+  //    while a genuinely later resend (> 15s later) stays unmatched until persisted.
+  const dup1: OutgoingSendLike = {
+    id: "out-dup-1",
+    text: "帮我看一下“重复气泡”的问题，截图在这里",
+    attachedCount: 1,
+    uploadedPaths: [uniqueImgPath],
+    ts: 500_000,
+    state: "sent",
+  };
+  const dup2Within15s: OutgoingSendLike = {
+    id: "out-dup-2",
+    text: "帮我看一下“重复气泡”的问题，截图在这里",
+    attachedCount: 1,
+    uploadedPaths: [uniqueImgPath],
+    ts: 503_000,
+    state: "sent",
+  };
+  const laterDistinctSend: OutgoingSendLike = {
+    id: "out-later",
+    text: "帮我看一下“重复气泡”的问题，截图在这里",
+    attachedCount: 1,
+    ts: 525_000, // > 15s after u-img-1 (ts=500_500)
+    state: "sent",
+  };
+  const recDup = reconcileOutgoingSends([dup1, dup2Within15s, laterDistinctSend], foldedImg, "working", 526_000);
+  assert.deepEqual(recDup.matchedIds, ["out-dup-1", "out-dup-2"]);
+  assert.deepEqual(
+    recDup.unmatched.map((s) => s.id),
+    ["out-later"],
+  );
+
+  // 3. Consecutive duplicate user_message echoes emitted with different ids within 15s coalesce into one user row.
+  const echoedEvents: ConvEvent[] = [
+    {
+      id: "u-echo-a",
+      session: "s1",
+      ts: 600_000,
+      kind: "user_message",
+      text: `检查一下这张图\u200B\n${uniqueImgPath}`,
+    },
+    {
+      id: "u-echo-b",
+      session: "s1",
+      ts: 601_200,
+      kind: "user_message",
+      text: `检查一下这张图\n${uniqueImgPath}`,
+    },
+  ];
+  const coalesced = foldConvEvents(echoedEvents, "standard");
+  assert.equal(coalesced.length, 1);
+  assert.equal(coalesced[0]!.kind, "user");
+  if (coalesced[0]!.kind === "user") {
+    assert.deepEqual(coalesced[0]!.attachedLines, [uniqueImgPath]);
+  }
+
+  // Distinct back-to-back image-only turns with different paths must NOT be collapsed together.
+  const distinctImages = foldConvEvents(
+    [
+      { id: "u-i1", session: "s1", ts: 700_000, kind: "user_message", text: "/tmp/files/t19g/image-147.png" },
+      { id: "u-i2", session: "s1", ts: 701_000, kind: "user_message", text: "/tmp/files/t19g/image-148.png" },
+    ],
+    "standard",
+  );
+  assert.equal(distinctImages.length, 2);
+});

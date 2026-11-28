@@ -57,6 +57,21 @@ function shellTabRootNode(tab: ShellTab): SplitNode {
       },
     };
   }
+  if (tab.kind === "ai-browser") {
+    return {
+      type: "leaf",
+      id: tab.primaryPaneId ?? `p0:${tab.id}`,
+      weight: 1,
+      content: {
+        kind: "ai-browser",
+        hostId: tab.hostId,
+        spaceId: tab.spaceId,
+        title: tab.title,
+        ...(tab.portalId ? { portalId: tab.portalId } : {}),
+        ...(tab.spaceKey !== undefined ? { spaceKey: tab.spaceKey } : {}),
+      },
+    };
+  }
   return {
     type: "leaf",
     id: tab.primaryPaneId ?? `p0:${tab.id}`,

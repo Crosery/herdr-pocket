@@ -23,7 +23,7 @@ class VoiceModels private constructor(
   internal val voxlockChunk: OrtSession?,
 ) : AutoCloseable {
   companion object {
-    private fun options(intraThreads: Int = 1) = OrtSession.SessionOptions().apply {
+    private fun options(intraThreads: Int = 1, enableXnnpack: Boolean = true) = OrtSession.SessionOptions().apply {
       setIntraOpNumThreads(intraThreads)
       setInterOpNumThreads(1)
       setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
@@ -31,7 +31,27 @@ class VoiceModels private constructor(
       // No busy-waiting between runs: the audio threads must not spin a core.
       addConfigEntry("session.intra_op.allow_spinning", "0")
       addConfigEntry("session.inter_op.allow_spinning", "0")
+      if (enableXnnpack) {
+        // Attach XNNPACK EP for accelerated SIMD Conv/GEMM on ARM64/x86; silently fall back to CPU if unsupported.
+        runCatching {
+          addXnnpack(mapOf("intra_op_num_threads" to intraThreads.toString()))
+        }
+      }
     }
+
+    private fun createSession(env: OrtEnvironment, modelBytes: ByteArray, intraThreads: Int): OrtSession =
+      try {
+        options(intraThreads, enableXnnpack = true).use { o -> env.createSession(modelBytes, o) }
+      } catch (_: Throwable) {
+        options(intraThreads, enableXnnpack = false).use { o -> env.createSession(modelBytes, o) }
+      }
+
+    private fun createSession(env: OrtEnvironment, modelPath: String, intraThreads: Int): OrtSession =
+      try {
+        options(intraThreads, enableXnnpack = true).use { o -> env.createSession(modelPath, o) }
+      } catch (_: Throwable) {
+        options(intraThreads, enableXnnpack = false).use { o -> env.createSession(modelPath, o) }
+      }
 
     fun load(
       dpdfnet: ByteArray,
@@ -43,15 +63,15 @@ class VoiceModels private constructor(
       val env = OrtEnvironment.getEnvironment()
       val opened = ArrayList<OrtSession>()
       try {
-        val d = options(1).use { o -> env.createSession(dpdfnet, o).also { opened.add(it) } }
-        val v = options(1).use { o -> env.createSession(vad, o).also { opened.add(it) } }
+        val d = createSession(env, dpdfnet, 1).also { opened.add(it) }
+        val v = createSession(env, vad, 1).also { opened.add(it) }
         val workerThreads = minOf(2, Runtime.getRuntime().availableProcessors()).coerceAtLeast(1)
-        val s = speakerPath?.let { path -> options(workerThreads).use { o -> env.createSession(path, o).also { x -> opened.add(x) } } }
+        val s = speakerPath?.let { path -> createSession(env, path, workerThreads).also { x -> opened.add(x) } }
         val vlEnr = if (voxlockEnrollPath != null && voxlockChunkPath != null) {
-          options(workerThreads).use { o -> env.createSession(voxlockEnrollPath, o).also { x -> opened.add(x) } }
+          createSession(env, voxlockEnrollPath, workerThreads).also { x -> opened.add(x) }
         } else null
         val vlChk = if (voxlockEnrollPath != null && voxlockChunkPath != null) {
-          options(workerThreads).use { o -> env.createSession(voxlockChunkPath, o).also { x -> opened.add(x) } }
+          createSession(env, voxlockChunkPath, workerThreads).also { x -> opened.add(x) }
         } else null
         return VoiceModels(env, d, v, s, vlEnr, vlChk)
       } catch (e: Throwable) {

@@ -849,22 +849,28 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     }
     const mark = `${agent.key}:${agent.turn ?? ""}`;
     if (lastSeenMarkRef.current === mark && !justBecameViewed) return;
-    lastSeenMarkRef.current = mark;
-    liveStore.set((prev) => {
-      const list = prev.agents[agent.deviceId];
-      if (!list?.some((a) => a.key === agent.key && a.status === "done")) return prev;
-      return {
-        ...prev,
-        agents: {
-          ...prev.agents,
-          [agent.deviceId]: list.map((a) =>
-            a.key === agent.key && a.status === "done" ? { ...a, status: "idle" } : a,
-          ),
-        },
-        rev: prev.rev + 1,
-      };
-    });
-    void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
+    const timer = window.setTimeout(() => {
+      if (lastSeenMarkRef.current === mark && !justBecameViewed) return;
+      lastSeenMarkRef.current = mark;
+      liveStore.set((prev) => {
+        const list = prev.agents[agent.deviceId];
+        if (!list?.some((a) => a.key === agent.key && a.status === "done")) return prev;
+        return {
+          ...prev,
+          agents: {
+            ...prev.agents,
+            [agent.deviceId]: list.map((a) =>
+              a.key === agent.key && a.status === "done" ? { ...a, status: "idle" } : a,
+            ),
+          },
+          rev: prev.rev + 1,
+        };
+      });
+      void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
+    }, 600);
+    return () => {
+      window.clearTimeout(timer);
+    };
   }, [agent.deviceId, agent.key, agent.status, agent.turn, canMarkSeen]);
 
   useEffect(() => {
@@ -2669,17 +2675,6 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
         </div>
       ) : null}
 
-      {activeMode === "chat" && !activeSub && btwTurns.length > 0 ? (
-        <BtwSideDrawer
-          turns={btwTurns}
-          agent={agent}
-          onDismiss={(turnId) => dismissBtwTurn(agent.key, turnId)}
-          onOpenFile={(target) => {
-            void openAgentFileTarget(agent, target);
-          }}
-        />
-      ) : null}
-
       {/* Composer or Subagent Read-Only Footer */}
       {activeMode === "chat" && activeSub ? (
         <SubagentReadOnlyBar
@@ -2692,6 +2687,25 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
         />
       ) : activeMode === "chat" ? (
         <div className="t3-composer-shell">
+        {btwTurns.length > 0 ? (
+          <BtwSideDrawer
+            turns={btwTurns}
+            agent={agent}
+            mainRunning={isTurnBusy}
+            onAskAgain={() => {
+              setSlashDismissedFor(null);
+              setChipDismissedPrefix(null);
+              if (!/^\/btw(?:\s|$)/i.test(text)) {
+                setText(text.trim() ? `/btw ${text.trim()}` : "/btw ");
+              }
+              requestAnimationFrame(() => composer.textareaRef.current?.focus());
+            }}
+            onDismiss={(turnId) => dismissBtwTurn(agent.key, turnId)}
+            onOpenFile={(target) => {
+              void openAgentFileTarget(agent, target);
+            }}
+          />
+        ) : null}
         {usageOpen ? (
           <AgentUsageCard
             agent={agent}

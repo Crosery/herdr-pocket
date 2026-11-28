@@ -138,6 +138,15 @@ export type PortalTab = TabSplitFields & {
   activePortalId?: string;
   spaceKey?: string | null;
 };
+export type AiBrowserTab = TabSplitFields & {
+  id: string;
+  kind: "ai-browser";
+  hostId: string;
+  spaceId: string;
+  title: string;
+  portalId?: string;
+  spaceKey?: string | null;
+};
 export type DiffTab = TabSplitFields & {
   id: string;
   kind: "diff";
@@ -150,7 +159,7 @@ export type DiffTab = TabSplitFields & {
   title: string;
   spaceKey?: string | null;
 };
-export type ShellTab = AgentTab | FileTab | WebTab | DiffTab | PortalTab;
+export type ShellTab = AgentTab | FileTab | WebTab | DiffTab | PortalTab | AiBrowserTab;
 
 /** Side panel sections (Herdr: files / changes; ours adds git, browser, 小羊, and subagent aside). */
 export type PanelId = "files" | "git" | "browser" | "assistant" | "subagent";
@@ -280,6 +289,16 @@ export function tabToPaneContent(tab: ShellTab): PaneContent {
       ...(tab.spaceKey !== undefined ? { spaceKey: tab.spaceKey } : {}),
     };
   }
+  if (tab.kind === "ai-browser") {
+    return {
+      kind: "ai-browser",
+      hostId: tab.hostId,
+      spaceId: tab.spaceId,
+      title: tab.title,
+      ...(tab.portalId ? { portalId: tab.portalId } : {}),
+      ...(tab.spaceKey !== undefined ? { spaceKey: tab.spaceKey } : {}),
+    };
+  }
   return {
     kind: "web",
     webId: tab.webId ?? tab.id,
@@ -346,6 +365,9 @@ export function paneContentSpaceKey(
     }
     return null;
   }
+  if (content.kind === "ai-browser") {
+    return content.spaceKey ?? null;
+  }
   return content.spaceKey ?? null;
 }
 
@@ -388,7 +410,12 @@ export function visibleTabsForSpace(
       if (matchedSpaceId && t.docSpaceId && t.docSpaceId === matchedSpaceId) return true;
       return t.docSpaceName === selName;
     }
-    return tabLeaves(t).some((l) => paneContentSpaceKey(l.content, lookupAgent) === selectedSpace);
+    return tabLeaves(t).some((l) => {
+      if (l.content.kind === "ai-browser" && !l.content.spaceKey && (!selHost || l.content.hostId === selHost)) {
+        return true;
+      }
+      return paneContentSpaceKey(l.content, lookupAgent) === selectedSpace;
+    });
   });
 }
 
@@ -494,7 +521,12 @@ function normalizePersistedShellState(rawInput: unknown): PersistedShellState | 
       Boolean(
         t &&
           typeof t.id === "string" &&
-          (t.kind === "agent" || t.kind === "file" || t.kind === "web" || t.kind === "diff" || t.kind === "portal"),
+          (t.kind === "agent" ||
+            t.kind === "file" ||
+            t.kind === "web" ||
+            t.kind === "diff" ||
+            t.kind === "portal" ||
+            t.kind === "ai-browser"),
       ),
     )
     .map(normalizePersistedTab);
@@ -752,7 +784,9 @@ function standaloneTabIdForContent(content: PaneContent, existingIds: ReadonlySe
           ? `d:${content.deviceId}:${content.cwd}:${content.commit ? content.commit : content.staged ? "staged" : "work"}:${content.path}`
           : content.kind === "portal"
             ? `pt:${content.agentKey}`
-            : content.webId || `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+            : content.kind === "ai-browser"
+              ? `aib:${content.hostId}:${content.spaceId}`
+              : content.webId || `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
   if (!existingIds.has(base)) return base;
   return `${base}:${makeSplitId("p")}`;
 }
@@ -805,6 +839,18 @@ export function contentToStandaloneTab(content: PaneContent, id: string, primary
       agentKey: content.agentKey,
       title: content.title,
       ...(content.activePortalId ? { activePortalId: content.activePortalId } : {}),
+      ...(content.spaceKey !== undefined ? { spaceKey: content.spaceKey } : {}),
+      ...paneField,
+    };
+  }
+  if (content.kind === "ai-browser") {
+    return {
+      id,
+      kind: "ai-browser",
+      hostId: content.hostId,
+      spaceId: content.spaceId,
+      title: content.title,
+      ...(content.portalId ? { portalId: content.portalId } : {}),
       ...(content.spaceKey !== undefined ? { spaceKey: content.spaceKey } : {}),
       ...paneField,
     };
@@ -1330,6 +1376,93 @@ export function updatePortalTabActive(tabId: string, paneId: string, activePorta
       return applyRootToTab(t, root);
     }),
   }));
+}
+
+export function openAiBrowserTab(
+  hostId: string,
+  spaceId: string,
+  title: string,
+  opts?: { portalId?: string; spaceKey?: string | null; focus?: boolean; splitBesideActive?: boolean },
+): void {
+  const s = shellStore.get();
+  const id = `aib:${hostId}:${spaceId}`;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
+  const scope = opts?.spaceKey !== undefined ? opts.spaceKey : s.selectedSpace;
+  const hit = findTabWithLeaf(s.tabs, (c) => c.kind === "ai-browser" && c.hostId === hostId && c.spaceId === spaceId);
+  if (hit) {
+    if (opts?.focus === false) {
+      set((prev) => ({
+        ...prev,
+        tabs: prev.tabs.map((t) =>
+          t.id === hit.tab.id
+            ? applyRootToTab(
+                t,
+                updateLeafContent(tabRootNode(t), hit.leaf.id, (c) =>
+                  c.kind === "ai-browser"
+                    ? { ...c, title: title || c.title, ...(opts?.portalId ? { portalId: opts.portalId } : {}) }
+                    : c,
+                ),
+              )
+            : t,
+        ),
+      }));
+      return;
+    }
+    set(
+      focusTabAndLeaf(
+        s,
+        hit.tab,
+        hit.leaf.id,
+        scope,
+        lookup,
+        spacesMap,
+        (c) =>
+          c.kind === "ai-browser"
+            ? {
+                ...c,
+                title: title || c.title,
+                ...(opts?.portalId ? { portalId: opts.portalId } : {}),
+                ...(scope ? { spaceKey: scope } : {}),
+              }
+            : c,
+        { capturePeek: true },
+      ),
+    );
+    return;
+  }
+
+  const content: PaneContent = {
+    kind: "ai-browser",
+    hostId,
+    spaceId,
+    title: title || "AI 浏览器",
+    ...(opts?.portalId ? { portalId: opts.portalId } : {}),
+    ...(scope ? { spaceKey: scope } : {}),
+  };
+
+  if (opts?.splitBesideActive && s.active) {
+    splitActivePaneWithContent("right", content);
+    return;
+  }
+
+  const tab: AiBrowserTab = {
+    id,
+    kind: "ai-browser",
+    hostId,
+    spaceId,
+    title: title || "AI 浏览器",
+    ...(opts?.portalId ? { portalId: opts.portalId } : {}),
+    ...(scope ? { spaceKey: scope } : {}),
+  };
+  if (opts?.focus === false) {
+    set({ tabs: [...s.tabs, tab] });
+    return;
+  }
+  set({
+    tabs: [...s.tabs, tab],
+    ...activationTransition(s, id, scope, lookup, spacesMap, { capturePeek: true }),
+  });
 }
 
 export function openWebTab(url: string, title?: string, opts?: { spaceKey?: string | null; insertBeforeId?: string }): void {
@@ -2460,7 +2593,9 @@ export function stableSplitLeafKeys(leaves: readonly SplitLeafNode[]): string[] 
           ? `web:${c.webId}`
           : c.kind === "portal"
             ? `portal:${c.agentKey}`
-            : c.kind === "file"
+            : c.kind === "ai-browser"
+              ? `aib:${c.hostId}:${c.spaceId}`
+              : c.kind === "file"
               ? `file:${c.agentKey}:${c.path}`
               : `diff:${c.deviceId}:${c.cwd}:${c.commit || (c.staged ? "staged" : "work")}:${c.path}`;
     const occ = seen.get(base) ?? 0;

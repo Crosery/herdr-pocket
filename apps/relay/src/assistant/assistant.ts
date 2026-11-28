@@ -45,7 +45,9 @@ import type { ContentBlock, Llm, Msg, ToolDef } from "./llm.ts";
 import { PROMPT_EPOCH, delegateAsk, herdrCommandList, systemPrompt, wakeBatch, wakeBlocked, wakeFinished, type Occasion } from "./prompts.ts";
 import {
   PLUGIN_READ_ONLY_TOOLS,
+  disabledBuiltinToolMessage,
   executePluginTool,
+  filterBuiltinToolsByPlugins,
   maskWebhooks,
   normalizePlugins,
   normalizeWebhooks,
@@ -363,7 +365,7 @@ export class Assistant {
       const cur = this.pluginMap();
       const next = normalizePlugins({ ...cur, ...patch.plugins });
       this.store.putSetting(SETTING_PLUGINS, serializePlugins(next));
-      const diff = (["browser", "workspace", "webfetch", "webhooks"] as const)
+      const diff = (["herdr", "uniflo", "browser", "workspace", "webfetch", "webhooks"] as const)
         .filter((k) => cur[k] !== next[k])
         .map((k) => `${k}:${next[k] ? "on" : "off"}`);
       if (diff.length) {
@@ -659,7 +661,7 @@ export class Assistant {
     const system =
       systemPrompt(this.name, opts.occasion, this.backendBoard(), { confirm: !this.direct(turn) }) +
       pluginPromptHints(plugins);
-    const allTools = [...TOOLS, ...pluginToolDefs(plugins, webhooks)];
+    const allTools = [...filterBuiltinToolsByPlugins(TOOLS, plugins), ...pluginToolDefs(plugins, webhooks)];
     const tools = opts.allow ? allTools.filter((t) => opts.allow!.has(t.name)) : allTools;
     const rounds = opts.maxRounds ?? (opts.occasion === "text" ? TEXT_TOOL_ROUNDS : MAX_TOOL_ROUNDS);
     /** What is said must match what was done in this run (the guard), and the log says when it did not. */
@@ -999,6 +1001,8 @@ export class Assistant {
   }
 
   private async tool(name: string, input: Record<string, unknown>, turn: Turn): Promise<{ out: string; step?: string }> {
+    const blocked = disabledBuiltinToolMessage(name, this.pluginMap());
+    if (blocked) return { out: blocked };
     switch (name) {
       case "list_agents": {
         const status = typeof input.status === "string" ? input.status : "all";

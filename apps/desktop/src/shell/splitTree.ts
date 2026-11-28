@@ -23,6 +23,14 @@ export type PaneContent =
       spaceKey?: string | null;
     }
   | {
+      kind: "ai-browser";
+      hostId: string;
+      spaceId: string;
+      title: string;
+      portalId?: string;
+      spaceKey?: string | null;
+    }
+  | {
       kind: "diff";
       deviceId: string;
       agentKey?: string;
@@ -611,6 +619,9 @@ function isValidPaneContent(raw: unknown): raw is PaneContent {
   }
   if (c.kind === "portal") {
     return typeof c.hostId === "string" && typeof c.agentKey === "string" && typeof c.title === "string";
+  }
+  if (c.kind === "ai-browser") {
+    return typeof c.hostId === "string" && typeof c.spaceId === "string" && typeof c.title === "string";
   }
   if (c.kind === "diff") {
     return (

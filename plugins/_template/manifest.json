@@ -1,0 +1,10 @@
+{
+  "id": "example-plugin",
+  "scope": "assistant",
+  "category": "tools",
+  "name": "示例插件",
+  "summary": "一句话说明该工具包或操作流提供的能力",
+  "defaultEnabled": false,
+  "tools": ["example_tool"],
+  "icon": "blocks"
+}

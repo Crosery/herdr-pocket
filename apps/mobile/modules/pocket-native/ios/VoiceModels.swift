@@ -143,6 +143,10 @@ final class VoiceModels {
     self.tseChunk = tseChunk
   }
 
+  var coreMLActive: Bool {
+    (speaker?.usingCoreML ?? false) || (tseEnroll?.usingCoreML ?? false) || (tseChunk?.usingCoreML ?? false)
+  }
+
   static func load(
     dpdfPath: String,
     vadPath: String,
@@ -160,12 +164,20 @@ final class VoiceModels {
       return opts
     }
     let cfg = DpdfConfig.fromModel(atPath: dpdfPath)
+    // Keep tiny 10 ms recurrent models (DPDFNet & Silero VAD) on pure CPU for minimal scheduling jitter.
     let dpdf = try ORTSession(env: env, modelPath: dpdfPath, sessionOptions: makeOpts(1))
     let v = try ORTSession(env: env, modelPath: vadPath, sessionOptions: makeOpts(1))
+    // Prefer CoreML (ANE) for heavy models (ERes2NetV2 & VoxLock) with automatic pure-CPU fallback.
     let twoThreads: Int32 = ProcessInfo.processInfo.activeProcessorCount >= 2 ? 2 : 1
-    let s = try speakerPath.map { try ORTSession(env: env, modelPath: $0, sessionOptions: makeOpts(twoThreads)) }
-    let te = try tseEnrollPath.map { try ORTSession(env: env, modelPath: $0, sessionOptions: makeOpts(twoThreads)) }
-    let tc = try tseChunkPath.map { try ORTSession(env: env, modelPath: $0, sessionOptions: makeOpts(twoThreads)) }
+    let s = try speakerPath.map {
+      try ORTSession(env: env, modelPath: $0, sessionOptions: makeOpts(twoThreads), preferCoreML: true)
+    }
+    let te = try tseEnrollPath.map {
+      try ORTSession(env: env, modelPath: $0, sessionOptions: makeOpts(twoThreads), preferCoreML: true)
+    }
+    let tc = try tseChunkPath.map {
+      try ORTSession(env: env, modelPath: $0, sessionOptions: makeOpts(twoThreads), preferCoreML: true)
+    }
     return VoiceModels(env: env, dpdfnet: dpdf, dpdfConfig: cfg, vad: v, speaker: s, tseEnroll: te, tseChunk: tc)
   }
 }

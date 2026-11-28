@@ -1,0 +1,15 @@
+import type { PluginManifest } from "@herdr-pocket/protocol";
+
+export const manifest: PluginManifest = {
+  id: "ai-browser",
+  scope: "pocket",
+  category: "workflow",
+  name: "AI 浏览器",
+  summary: "内置跨平台 Chromium 浏览器，提供页面操作流、主标签实时画面与网络抓包",
+  defaultEnabled: false,
+  configKey: "plugins.aiBrowser",
+  cli: ["herdr-pocket browser"],
+  icon: "globe",
+};
+
+export default manifest;

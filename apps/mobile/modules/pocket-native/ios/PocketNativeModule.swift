@@ -144,6 +144,7 @@ public class PocketNativeModule: Module {
         "svSize": Double(VoiceModelManager.svSize),
         "modelSize": Double(VoiceModelManager.speakerSize),
         "benchAt": Double(VoicePrefs.benchAt),
+        "ios_mic_mode": currentIosMicMode(),
       ]
       if let rec = VoicePrefs.benchRecommendedTier { state["recommendedTier"] = rec }
       if let reason = VoicePrefs.benchReason { state["recommendReason"] = reason }
@@ -269,6 +270,21 @@ public class PocketNativeModule: Module {
 
     Function("stopVoiceTest") {
       VoiceLab.stop()
+    }
+
+    /// Presents the iOS 15+ Control Center microphone mode picker when Voice Isolation
+    /// is not currently active. Returns true if the system picker was requested.
+    Function("showMicrophoneModePicker") { () -> Bool in
+      if #available(iOS 15.0, *) {
+        guard AVCaptureDevice.activeMicrophoneMode != .voiceIsolation else {
+          return false
+        }
+        DispatchQueue.main.async {
+          AVCaptureDevice.showSystemUserInterface(.microphoneModes)
+        }
+        return true
+      }
+      return false
     }
   }
 }

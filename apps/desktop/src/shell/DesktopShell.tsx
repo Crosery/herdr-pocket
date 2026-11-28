@@ -52,6 +52,7 @@ import { openInteractiveTutorialReplay } from "../components/TutorialSandboxStag
 import { useClientConfig, clientConfigStore } from "../lib/config";
 import { overlayStore, useToast } from "../components/PocketUI";
 import { installBrowserAiBridgeListeners } from "../lib/browserSpaces";
+import { portalStore, subscribeHostPortals } from "../lib/portalClient";
 import { isH5Web, isTauri } from "../lib/bridge";
 import { refreshH5Bundle } from "../lib/pwa";
 import { logAction } from "../lib/log";
@@ -79,6 +80,7 @@ import {
   focusedLeafOfTab,
   focusPaneDirection,
   openAgentTab,
+  openAiBrowserTab,
   openSettingsFrame,
   openWebTab,
   renameSpaceInShellStore,
@@ -199,7 +201,63 @@ export function DesktopShell({
   useHerdrDocSync();
   useEffect(() => startAttentionCenter(), []);
   useEffect(() => installWindowFocusTelemetry(), []);
-  useEffect(() => installBrowserAiBridgeListeners(() => showPanel("browser")), []);
+  useEffect(
+    () =>
+      installBrowserAiBridgeListeners(() => {
+        const localId = localHostIdStore.get();
+        const devs = liveStore.get().devices;
+        const targetHost =
+          (localId && devs[localId]?.online ? localId : "") ||
+          Object.values(devs).find((d) => d.kind === "host" && d.online)?.id ||
+          "";
+        if (targetHost) {
+          openAiBrowserTab(targetHost, "ai-1", "AI 浏览器", { focus: true });
+        } else {
+          showPanel("browser");
+        }
+      }),
+    [],
+  );
+
+  // Subscribe to host portals for all online hosts & auto-open full-width AI Browser tabs in the main workspace tab bar.
+  const onlineHostIdsKey = useMemo(
+    () =>
+      Object.values(devices)
+        .filter((d) => d.kind === "host" && d.online)
+        .map((d) => d.id)
+        .sort()
+        .join(","),
+    [devices],
+  );
+  useEffect(() => {
+    const ids = onlineHostIdsKey ? onlineHostIdsKey.split(",") : [];
+    if (!ids.length) return;
+    const unsubs = ids.map((hid) => subscribeHostPortals(hid));
+    return () => {
+      for (const fn of unsubs) fn();
+    };
+  }, [onlineHostIdsKey]);
+
+  const seenAiBrowserSeqRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const checkPortals = () => {
+      const ps = portalStore.get();
+      for (const item of Object.values(ps.itemsById)) {
+        if (!item.aiBrowserSpaceId) continue;
+        const openSeq = ps.openSeqById[item.id] ?? 0;
+        const prevSeq = seenAiBrowserSeqRef.current.get(item.id) ?? -1;
+        if (openSeq > 0 && openSeq !== prevSeq) {
+          seenAiBrowserSeqRef.current.set(item.id, openSeq);
+          openAiBrowserTab(item.hostId, item.aiBrowserSpaceId, item.title || "AI 浏览器", {
+            portalId: item.id,
+            focus: true,
+          });
+        }
+      }
+    };
+    checkPortals();
+    return portalStore.subscribe(checkPortals);
+  }, []);
   useEffect(() => {
     const onTourCommand = (ev: Event) => {
       const cmd = (ev as CustomEvent<{ action?: string }>).detail?.action;
@@ -326,7 +384,9 @@ export function DesktopShell({
         : undefined;
       const targetContent = targetLeaf?.content;
       const targetAgentKey =
-        targetContent && targetContent.kind !== "web" ? targetContent.agentKey : undefined;
+        targetContent && targetContent.kind !== "web" && targetContent.kind !== "ai-browser"
+          ? targetContent.agentKey
+          : undefined;
       const activeAgent = targetAgentKey ? allMap.get(targetAgentKey) : undefined;
       const [selHost, selSpace] = s.selectedSpace ? (s.selectedSpace.split("\u0000") as [string, string]) : [null, null];
 

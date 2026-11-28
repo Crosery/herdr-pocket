@@ -31,9 +31,10 @@ import {
 } from "@herdr-pocket/protocol";
 import {
   HcAdapter,
-  isAntigravityReviewBlockCandidate,
-  isFalseAntigravityReviewBlock,
+  demotedFinishedStatus,
   isFalseAntigravityWorkingState,
+  isFalseBlockedCandidate,
+  isFalseBlockedState,
   type AppNames,
 } from "./hc.ts";
 import { sendAndCaptureSlashCommand } from "./slashCapture.ts";
@@ -62,8 +63,17 @@ import { askAgentBtw } from "./btw.ts";
 import { getAgentModels, setAgentModelAndThinking } from "./models.ts";
 import { getAgentUsageReport } from "./usage.ts";
 import { scanAgentListeningPorts, stopAgentListeningPort } from "./ports.ts";
-import { mergeHerdrWorkspacesIntoSpaces, syncSpacesBidirectional } from "./spaceBridge.ts";
-import { BrowserPluginError, getBrowserStatus, runBrowserAct, shutdownBrowserPluginCdp } from "./browserPlugin.ts";
+import { mergeHerdrWorkspacesIntoSpaces, syncCoreAgentsToHerdr, syncSpacesBidirectional } from "./spaceBridge.ts";
+import {
+  BrowserPluginError,
+  getBrowserStatus,
+  getResidentAiBrowserEngine,
+  runBrowserAct,
+  runBrowserNet,
+  runBrowserScript,
+  shutdownBrowserPluginCdp,
+  startResidentBrowserBridge,
+} from "./browserPlugin.ts";
 import { run } from "./util.ts";
 import { changedKeys } from "./configcmd.ts";
 import { VERSION, clientConfigPath, readClientConfig, type LoadedClientConfig } from "@herdr-pocket/update";
@@ -103,6 +113,7 @@ const MUTATING = new Set([
   "portal.input",
   "portal.close",
   "browser.act",
+  "browser.run",
 ]);
 
 const QUIET_READ_RPCS = new Set(["portal.frame", "terminal.read", "session.events", "terminal.putChunk"]);
@@ -202,9 +213,9 @@ export class Host {
   private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean; delivery?: "auto" | "steer" }>>();
   private queueSeq = 0;
   private subscreenByAgent = new Map<string, "viewer" | "pager">();
-  /** Keys whose raw `hc` `antigravity` "Approve plan" block was verified against live screen as idle `· reviewing`. */
+  /** Keys whose raw `hc` non-error `"blocked"` state was verified against live screen as idle/finished. */
   private falseReviewBlockedByAgent = new Map<string, string>();
-  /** Keys whose raw `hc` `antigravity` "working" state was verified against live screen as idle (background tasks only). */
+  /** Keys whose raw `hc` `antigravity` "working" state was verified against live screen as idle/finished (background tasks only). */
   private falseWorkingByAgent = new Map<string, string>();
   private stopped = false;
   private backoff = 1000;
@@ -489,6 +500,11 @@ export class Host {
     void this.refreshListeningPorts();
     const hook = await this.portal.startHookAndShims().catch(() => null);
     if (hook?.execWrapper) this.app.execWrapper = hook.execWrapper;
+    const aiBrowserEngine = getResidentAiBrowserEngine();
+    this.portal.bindAiBrowserEngine(aiBrowserEngine);
+    void startResidentBrowserBridge(aiBrowserEngine).catch((err) => {
+      this.note("warn", "browser", `resident browser bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
     await this.startDirect();
     this.connect();
   }
@@ -672,7 +688,13 @@ export class Host {
       workspace: (wsId?: string) => this.herdr.resolveWorkspaceName(wsId),
       tab: (tabId?: string) => this.herdr.resolveTabName(tabId),
     };
-    for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id, herdrLabels));
+    for (const info of this.herdr.agents) {
+      if (this.herdr.isMirroredCoreAgent(info)) {
+        const coreAddr = this.herdr.mirroredCoreAddrOf(info);
+        if (!coreAddr || this.hc.terminals.has(coreAddr)) continue;
+      }
+      agents.push(HerdrAdapter.toAgent(info, id, herdrLabels));
+    }
     const unifloEnriched = this.uniflo.enrich(agents, pids, hints, created, statusMsgs);
     if (this.subscreenByAgent.size || this.falseReviewBlockedByAgent.size || this.falseWorkingByAgent.size) {
       const liveKeys = new Set(unifloEnriched.map((a) => a.key));
@@ -688,22 +710,28 @@ export class Host {
     }
     const normalized = unifloEnriched.map((a) => {
       let next = a;
-      if (isAntigravityReviewBlockCandidate(next)) {
-        const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}:${next.statusNote ?? ""}`;
+      const rawTerm = next.source === "hc" ? this.hc.terminals.get(next.localId) : undefined;
+      if (next.source === "hc" && isFalseBlockedCandidate(next)) {
+        const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}:${next.statusKind ?? ""}:${next.statusNote ?? ""}`;
         const demotedSig = this.falseReviewBlockedByAgent.get(next.key);
         if (demotedSig === sig) {
-          next = { ...next, status: "idle", statusKind: undefined, statusNote: undefined };
+          next = {
+            ...next,
+            status: demotedFinishedStatus(rawTerm),
+            statusKind: undefined,
+            statusNote: undefined,
+          };
         } else if (demotedSig !== undefined) {
           this.falseReviewBlockedByAgent.delete(next.key);
         }
       } else {
         this.falseReviewBlockedByAgent.delete(next.key);
       }
-      if (next.status === "working" && next.harness.toLowerCase() === "antigravity") {
+      if (next.source === "hc" && next.status === "working" && next.harness.toLowerCase() === "antigravity") {
         const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}`;
         const demotedSig = this.falseWorkingByAgent.get(next.key);
         if (demotedSig === sig) {
-          next = { ...next, status: "idle" };
+          next = { ...next, status: demotedFinishedStatus(rawTerm) };
         } else if (demotedSig !== undefined) {
           this.falseWorkingByAgent.delete(next.key);
         }
@@ -769,10 +797,21 @@ export class Host {
       herdrAvailable: true,
       mirrorToHerdr: true,
     })
-      .then((res) => {
+      .then(async (res) => {
         if (res.syncedToCore > 0 || res.syncedToHerdr > 0) {
           this.note("info", "spaces", `background space bridge synced core:+${res.syncedToCore} herdr:+${res.syncedToHerdr}`);
           void this.refreshNames().then(() => this.publish());
+        }
+        // Lightweight metadata-only refresh on ALREADY-mirrored panes (never spawns new PTYs in background).
+        if (this.herdr.mirroredCorePaneMap.size > 0) {
+          const coreAgents = this.agents.filter((a) => a.source === "hc" && !a.isShell);
+          await syncCoreAgentsToHerdr({
+            agents: coreAgents,
+            herdrWorkspaces: this.herdr.workspaces,
+            herdr: this.herdr,
+            hcBin: defaultHcBin(),
+            updateExistingOnly: true,
+          }).catch(() => {});
         }
       })
       .catch(() => {})
@@ -801,7 +840,7 @@ export class Host {
     if (data === this.lastPublished) return;
     this.lastPublished = data;
     this.send({ type: "agents", agents: this.agents });
-    if (this.agents.some((a) => a.source === "hc" && isAntigravityReviewBlockCandidate(a))) {
+    if (this.agents.some((a) => a.source === "hc" && isFalseBlockedCandidate(a))) {
       void this.refreshScreenQueues();
     }
   }
@@ -1411,20 +1450,36 @@ export class Host {
             const rawStatus = rawTerm ? HcAdapter.status(rawTerm) : a.status;
             const rawStatusKind = rawTerm ? HcAdapter.statusKind(rawTerm) : a.statusKind;
             const rawStatusNote = rawTerm ? HcAdapter.note(rawTerm) : a.statusNote;
-            if (isAntigravityReviewBlockCandidate({ harness: rawHarness, status: rawStatus, statusKind: rawStatusKind, statusNote: rawStatusNote })) {
-              const rawSig = `${rawTerm?.status_ms ?? a.statusSince ?? 0}:${rawTerm?.turn ?? a.turn ?? 0}:${rawStatusNote ?? ""}`;
-              const isFalseBlock = isFalseAntigravityReviewBlock({
+            const rawErrored = rawTerm ? HcAdapter.errored(rawTerm) : Boolean(a.errored);
+            if (
+              isFalseBlockedCandidate({
+                harness: rawHarness,
+                status: rawStatus,
+                statusKind: rawStatusKind,
+                errored: rawErrored,
+                isShell: a.isShell,
+              })
+            ) {
+              const rawSig = `${rawTerm?.status_ms ?? a.statusSince ?? 0}:${rawTerm?.turn ?? a.turn ?? 0}:${rawStatusKind ?? ""}:${rawStatusNote ?? ""}`;
+              const isFalseBlock = isFalseBlockedState({
                 harness: rawHarness,
                 status: rawStatus,
                 statusKind: rawStatusKind,
                 statusNote: rawStatusNote,
+                errored: rawErrored,
+                isShell: a.isShell,
                 screen: text,
               });
               if (isFalseBlock) {
                 if (this.falseReviewBlockedByAgent.get(a.key) !== rawSig) {
                   this.falseReviewBlockedByAgent.set(a.key, rawSig);
                   changed = true;
-                  this.note("info", "hc.false_block", `demoted false antigravity "Approve plan" review block on ${a.localId}`, { agent: a.key });
+                  this.note(
+                    "info",
+                    "hc.false_block",
+                    `demoted false ${rawHarness} blocked state on ${a.localId} -> ${demotedFinishedStatus(rawTerm)}`,
+                    { agent: a.key },
+                  );
                 }
               } else if (this.falseReviewBlockedByAgent.delete(a.key)) {
                 changed = true;
@@ -1443,7 +1498,12 @@ export class Host {
                 if (this.falseWorkingByAgent.get(a.key) !== rawWorkSig) {
                   this.falseWorkingByAgent.set(a.key, rawWorkSig);
                   changed = true;
-                  this.note("info", "hc.false_working", `demoted false antigravity "working" state (footer idle) on ${a.localId}`, { agent: a.key });
+                  this.note(
+                    "info",
+                    "hc.false_working",
+                    `demoted false antigravity "working" state (footer idle) on ${a.localId} -> ${demotedFinishedStatus(rawTerm)}`,
+                    { agent: a.key },
+                  );
                 }
               } else if (this.falseWorkingByAgent.delete(a.key)) {
                 changed = true;
@@ -1962,6 +2022,10 @@ export class Host {
         await this.herdr.refreshWorkspaces().catch(() => []);
         const herdrCounts = new Map<string, number>();
         for (const a of this.herdr.agents) {
+          if (this.herdr.isMirroredCoreAgent(a)) {
+            const coreAddr = this.herdr.mirroredCoreAddrOf(a);
+            if (!coreAddr || this.hc.terminals.has(coreAddr)) continue;
+          }
           if (a.workspace_id) herdrCounts.set(a.workspace_id, (herdrCounts.get(a.workspace_id) ?? 0) + 1);
         }
         spaces = mergeHerdrWorkspacesIntoSpaces(spaces, this.herdr.workspaces, herdrCounts);
@@ -1984,52 +2048,84 @@ export class Host {
       this.writable();
       const herdrAvailable = this.sources.includes("herdr") || (await this.herdr.available());
       const hasCore = this.sources.includes("hc");
+      const syncAgents = p?.mode === "spaces_only" ? false : p?.syncAgents !== false;
       const syncRes = await syncSpacesBidirectional({
         core: hasCore ? this.hc : null,
         herdr: herdrAvailable ? this.herdr : null,
         herdrAvailable,
         mirrorToHerdr: true,
       });
+      let syncedAgentsToHerdr = 0;
       let migratedAgents = 0;
-      if (p?.mode === "migrate" && hasCore && herdrAvailable && this.sources.includes("uniflo")) {
-        await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+      if (hasCore && herdrAvailable && syncAgents) {
+        await Promise.all([
+          this.hc.list().catch(() => undefined),
+          this.refreshNames().catch(() => undefined),
+          this.herdr.refreshNow().catch(() => undefined),
+        ]);
         this.agents = this.collect();
-        const openSessionKeys = new Set(this.agents.filter((a) => a.source === "hc" && a.sessionKey).map((a) => a.sessionKey!));
-        const installedIds = await this.installed();
-        const coreSpaces = await this.app.spaces(this.hc.terminals).catch(() => this.app.spacesFromDocs(this.hc.terminals));
-        for (const a of this.agents) {
-          if (a.source !== "herdr" || !a.sessionKey || openSessionKeys.has(a.sessionKey)) continue;
-          const wsName = a.where?.split(" / ")[0]?.trim() || "";
-          if (p.herdrSpace && wsName && wsName.toLowerCase() !== p.herdrSpace.trim().toLowerCase()) continue;
-          try {
-            const r = await this.uniflo.resume(a.sessionKey);
-            if (!r.supported) continue;
-            const argv = resumeArgv(r.argv, installedIds);
-            const folder = r.cwd ? checkFolder(r.cwd) : a.cwd ? checkFolder(a.cwd) : undefined;
-            const matchedSpace = coreSpaces.find(
-              (s) =>
-                (wsName && s.name.trim().toLowerCase() === wsName.toLowerCase()) ||
-                (folder && s.folder && s.folder.replace(/[\\/]+$/, "").toLowerCase() === (shortHome(folder) ?? folder).replace(/[\\/]+$/, "").toLowerCase()),
-            );
-            await this.newTerminal(
-              () => this.app.open({ space: matchedSpace?.id, folder, argv }),
-              withProgramPath(argv),
-              folder,
-              { space: matchedSpace?.id, spaceName: matchedSpace?.name ?? (wsName || undefined) },
-            );
-            openSessionKeys.add(a.sessionKey);
-            migratedAgents += 1;
-          } catch {
-            // Best effort per agent; never abort the whole sync.
+
+        // Step 2a (Core -> Herdr): live-mirror non-shell `hc` agents into `herdr` TUI tabs via `hc attach` (zero duplicate processes).
+        const nativeHerdrSessionKeys = new Set(
+          this.agents.filter((a) => a.source === "herdr" && a.sessionKey).map((a) => a.sessionKey!),
+        );
+        const mirrorRes = await syncCoreAgentsToHerdr({
+          agents: this.agents.filter((a) => a.source === "hc" && !a.isShell),
+          herdrWorkspaces: this.herdr.workspaces,
+          herdr: this.herdr,
+          hcBin: defaultHcBin(),
+          herdrSpace: p?.herdrSpace,
+          herdrSessionKeys: nativeHerdrSessionKeys,
+        }).catch(() => ({ syncedAgentsToHerdr: 0, updatedMirrors: 0 }));
+        syncedAgentsToHerdr = mirrorRes.syncedAgentsToHerdr;
+
+        // Step 2b (Herdr -> Core): resume native `herdr` agents (never mirrored core panes!) into `herdr-core` via Uniflo.
+        const shouldResumeToCore = p?.mode === "migrate" || (syncAgents && p?.mode !== "spaces_only");
+        if (shouldResumeToCore && this.sources.includes("uniflo")) {
+          const openSessionKeys = new Set(this.agents.filter((a) => a.source === "hc" && a.sessionKey).map((a) => a.sessionKey!));
+          const installedIds = await this.installed();
+          const coreSpaces = await this.app.spaces(this.hc.terminals).catch(() => this.app.spacesFromDocs(this.hc.terminals));
+          for (const a of this.agents) {
+            if (a.source !== "herdr" || !a.sessionKey || openSessionKeys.has(a.sessionKey)) continue;
+            const rawHerdr = this.herdr.find(a.localId);
+            if (rawHerdr && this.herdr.isMirroredCoreAgent(rawHerdr)) continue;
+            const wsName = a.where?.split(" / ")[0]?.trim() || "";
+            if (p?.herdrSpace && wsName && wsName.toLowerCase() !== p.herdrSpace.trim().toLowerCase()) continue;
+            try {
+              const r = await this.uniflo.resume(a.sessionKey);
+              if (!r.supported) continue;
+              const argv = resumeArgv(r.argv, installedIds);
+              const folder = r.cwd ? checkFolder(r.cwd) : a.cwd ? checkFolder(a.cwd) : undefined;
+              const matchedSpace = coreSpaces.find(
+                (s) =>
+                  (wsName && s.name.trim().toLowerCase() === wsName.toLowerCase()) ||
+                  (folder && s.folder && s.folder.replace(/[\\/]+$/, "").toLowerCase() === (shortHome(folder) ?? folder).replace(/[\\/]+$/, "").toLowerCase()),
+              );
+              await this.newTerminal(
+                () => this.app.open({ space: matchedSpace?.id, folder, argv }),
+                withProgramPath(argv),
+                folder,
+                { space: matchedSpace?.id, spaceName: matchedSpace?.name ?? (wsName || undefined) },
+              );
+              openSessionKeys.add(a.sessionKey);
+              migratedAgents += 1;
+            } catch {
+              // Best effort per agent; never abort the whole sync.
+            }
           }
         }
       }
-      await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+      await Promise.all([
+        this.hc.list().catch(() => undefined),
+        this.refreshNames().catch(() => undefined),
+        ...(herdrAvailable ? [this.herdr.refreshNow().catch(() => undefined)] : []),
+      ]);
       this.publishNow();
       const listed = await this.handlers["spaces.list"]({}, "local");
       return {
         syncedToCore: syncRes.syncedToCore,
         syncedToHerdr: syncRes.syncedToHerdr,
+        syncedAgentsToHerdr,
         migratedAgents,
         herdrAvailable: syncRes.herdrAvailable,
         spaces: listed.spaces,
@@ -2322,15 +2418,31 @@ export class Host {
       const a = this.resolve(p.agent);
       if (a.source === "hc") {
         let t = this.hc.terminals.get(a.localId);
-        if (!t || typeof t.turn !== "number" || HcAdapter.status(t) !== "done") {
+        const isDemotedOrDone =
+          a.status === "done" ||
+          this.falseWorkingByAgent.has(a.key) ||
+          this.falseReviewBlockedByAgent.has(a.key);
+        if (!t || typeof t.turn !== "number" || (HcAdapter.status(t) !== "done" && !isDemotedOrDone)) {
           await this.hc.list();
           t = this.hc.terminals.get(a.localId);
         }
-        // Same mark the desktop app leaves when the person looks at a finished turn.
-        if (t && typeof t.turn === "number" && HcAdapter.status(t) === "done") {
-          await this.hc.label(a.localId, { "herdr.seen": String(t.turn) });
-          await this.hc.list();
-          this.publishNow();
+        // Same mark the desktop app leaves when the person looks at a finished turn
+        // (including turns demoted from false `working`/`blocked` to `"done"`).
+        if (
+          t &&
+          typeof t.turn === "number" &&
+          (HcAdapter.status(t) === "done" ||
+            a.status === "done" ||
+            this.falseWorkingByAgent.has(a.key) ||
+            this.falseReviewBlockedByAgent.has(a.key))
+        ) {
+          const rawSeen = t.labels?.["herdr.seen"];
+          const seen = rawSeen !== undefined && rawSeen.trim() !== "" ? Number(rawSeen) : NaN;
+          if (!(Number.isFinite(seen) && seen >= t.turn)) {
+            await this.hc.label(a.localId, { "herdr.seen": String(t.turn) });
+            await this.hc.list();
+            this.publishNow();
+          }
         }
       }
       return { ok: true as const };
@@ -2679,12 +2791,34 @@ export class Host {
       return this.portal.listEgoSpaces(p?.serverName);
     },
     "browser.status": async () => {
-      return getBrowserStatus();
+      return getBrowserStatus({ inHostd: true });
     },
     "browser.act": async (p) => {
       this.writable();
       try {
-        return await runBrowserAct(p);
+        return await runBrowserAct(p, { inHostd: true });
+      } catch (err) {
+        if (err instanceof BrowserPluginError) {
+          throw new RpcFailure(err.code, err.message);
+        }
+        throw err;
+      }
+    },
+    "browser.net": async (p) => {
+      if (p.action === "clear") this.writable();
+      try {
+        return await runBrowserNet(p, { inHostd: true });
+      } catch (err) {
+        if (err instanceof BrowserPluginError) {
+          throw new RpcFailure(err.code, err.message);
+        }
+        throw err;
+      }
+    },
+    "browser.run": async (p) => {
+      this.writable();
+      try {
+        return await runBrowserScript(p, { inHostd: true });
       } catch (err) {
         if (err instanceof BrowserPluginError) {
           throw new RpcFailure(err.code, err.message);

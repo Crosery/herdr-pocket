@@ -847,6 +847,18 @@ export function mockLink(): Link {
             durationMs: 38,
           };
         }
+        case "spaces.sync": {
+          const sp = (params ?? {}) as { mode?: "sync" | "migrate" | "spaces_only"; syncAgents?: boolean };
+          const syncAgents = sp.mode !== "spaces_only" && sp.syncAgents !== false;
+          return {
+            syncedToCore: 1,
+            syncedToHerdr: 0,
+            syncedAgentsToHerdr: syncAgents ? 2 : 0,
+            migratedAgents: syncAgents || sp.mode === "migrate" ? 1 : 0,
+            herdrAvailable: true,
+            spaces: DEMO_SPACES,
+          };
+        }
         case "space.delete":
           return { ok: true, closedTerminals: 0 };
         case "agent.seen":
@@ -1304,7 +1316,7 @@ export const mockAssistant = {
   setPluginSettings(patch: { plugins?: AssistantSettings["plugins"]; webhooks?: AssistantSettings["webhooks"] }): AssistantSettings {
     if (patch.plugins) assistantPlugins = { ...assistantPlugins, ...patch.plugins };
     if (patch.webhooks !== undefined) assistantWebhooks = patch.webhooks.map((w) => ({ ...w }));
-    const hasPlugins = Object.values(assistantPlugins ?? {}).some(Boolean);
+    const hasPlugins = Object.keys(assistantPlugins ?? {}).length > 0;
     return {
       confirm: assistantConfirm,
       ...(hasPlugins ? { plugins: { ...assistantPlugins } } : {}),

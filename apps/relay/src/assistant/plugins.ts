@@ -6,13 +6,41 @@ import type { ToolDef } from "./llm.ts";
 export type AssistantPluginMap = Record<AssistantPluginId, boolean>;
 
 export const DEFAULT_PLUGINS: AssistantPluginMap = {
+  herdr: true,
+  uniflo: true,
   browser: false,
   workspace: false,
   webfetch: false,
   webhooks: false,
 };
 
-export const PLUGIN_READ_ONLY_TOOLS = new Set(["inspect_workspace", "fetch_webpage"]);
+/** Tool names belonging to the `herdr` tool-pack plugin (mirrors `plugins/assistant/herdr/manifest.json`). */
+export const HERDR_PLUGIN_TOOLS = new Set([
+  "list_agents",
+  "list_devices",
+  "read_agent",
+  "send_to_agent",
+  "press_keys",
+  "list_launchers",
+  "create_agent",
+  "interrupt_agent",
+  "close_agent",
+  "list_spaces",
+  "create_space",
+  "herdr_do",
+  "costs",
+]);
+
+/** Tool names belonging to the `uniflo` tool-pack plugin (mirrors `plugins/assistant/uniflo/manifest.json`). */
+export const UNIFLO_PLUGIN_TOOLS = new Set([
+  "search_sessions",
+  "list_sessions",
+  "read_session",
+  "resume_session",
+  "usage",
+]);
+
+export const PLUGIN_READ_ONLY_TOOLS = new Set(["inspect_workspace", "fetch_webpage", "browser_net"]);
 
 const MAX_WEBHOOKS = 16;
 const MAX_OUTPUT_CHARS = 8000;
@@ -21,6 +49,8 @@ const PRIVATE_HOST_SUFFIXES = [".local", ".internal", ".localhost", ".arpa", ".h
 export function normalizePlugins(raw: unknown): AssistantPluginMap {
   const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   return {
+    herdr: obj.herdr !== false,
+    uniflo: obj.uniflo !== false,
     browser: obj.browser === true,
     workspace: obj.workspace === true,
     webfetch: obj.webfetch === true,
@@ -30,10 +60,30 @@ export function normalizePlugins(raw: unknown): AssistantPluginMap {
 
 export function serializePlugins(map: AssistantPluginMap): Partial<Record<AssistantPluginId, boolean>> {
   const out: Partial<Record<AssistantPluginId, boolean>> = {};
+  if (!map.herdr) out.herdr = false;
+  if (!map.uniflo) out.uniflo = false;
   for (const k of ["browser", "workspace", "webfetch", "webhooks"] as const) {
     if (map[k]) out[k] = true;
   }
   return out;
+}
+
+export function filterBuiltinToolsByPlugins(tools: readonly ToolDef[], plugins: AssistantPluginMap): ToolDef[] {
+  return tools.filter((t) => {
+    if (HERDR_PLUGIN_TOOLS.has(t.name) && !plugins.herdr) return false;
+    if (UNIFLO_PLUGIN_TOOLS.has(t.name) && !plugins.uniflo) return false;
+    return true;
+  });
+}
+
+export function disabledBuiltinToolMessage(name: string, plugins: AssistantPluginMap): string | null {
+  if (HERDR_PLUGIN_TOOLS.has(name) && !plugins.herdr) {
+    return "Herdr 插件已关闭，请先在「设置 › 插件中心」启用。";
+  }
+  if (UNIFLO_PLUGIN_TOOLS.has(name) && !plugins.uniflo) {
+    return "Uniflo 插件已关闭，请先在「设置 › 插件中心」启用。";
+  }
+  return null;
 }
 
 export function sanitizeWebhookId(raw: unknown, fallbackIndex = 1): string {
@@ -264,35 +314,90 @@ export function pluginToolDefs(plugins: AssistantPluginMap, webhooks: AssistantW
   const defs: ToolDef[] = [];
 
   if (plugins.browser) {
-    defs.push({
-      name: "browser_act",
-      description:
-        "操作已授权开启 AI 浏览器协作插件的电脑内置浏览器（默认隔离在 AI 空间，带粉色虚拟光标反馈）。" +
-        "可用 op：open（打开网址）、snapshot（读取带 @eN 引用的可见元素列表，只读）、click/dblclick/hover（点击或悬停 @eN）、" +
-        "fill（填写表单）、select（选择下拉值）、press（按键）、scroll（滚动）、handoff（请求用户接管登录/验证码）、resume/finish。" +
-        "遇到登录框、密码或验证码会自动触发 handoff，严禁绕过。",
-      input_schema: {
-        type: "object",
-        properties: {
-          device: { type: "string", description: "目标电脑名或 id；只有一台在线电脑时可省略" },
-          spaceId: { type: "string", description: "浏览器空间 id；第一次 open 时自动创建" },
-          page: { type: "string", description: "页签标识（如 p1）" },
-          op: {
-            type: "string",
-            enum: ["open", "snapshot", "click", "dblclick", "hover", "fill", "select", "press", "scroll", "handoff", "resume", "finish"],
+    defs.push(
+      {
+        name: "browser_act",
+        description:
+          "操作已授权开启 AI 浏览器插件的电脑内置跨平台 Chromium 浏览器（主标签栏实时可视化，支持粉色幽灵光标）。" +
+          "可用 op：open/navigate/back/forward/reload、snapshot（读取带 @eN 引用的可见元素列表）、click/dblclick/hover、fill/type/select/press/scroll、tabs、screenshot、handoff/takeover/resume/popout/finish。" +
+          "遇到登录框、密码或验证码会自动触发 handoff，严禁绕过。",
+        input_schema: {
+          type: "object",
+          properties: {
+            device: { type: "string", description: "目标电脑名或 id；只有一台在线电脑时可省略" },
+            spaceId: { type: "string", description: "浏览器空间 id；第一次 open 时自动创建" },
+            page: { type: "string", description: "页签标识（如 p1）" },
+            op: {
+              type: "string",
+              enum: [
+                "open",
+                "navigate",
+                "back",
+                "forward",
+                "reload",
+                "snapshot",
+                "click",
+                "dblclick",
+                "hover",
+                "fill",
+                "type",
+                "select",
+                "press",
+                "scroll",
+                "tabs",
+                "screenshot",
+                "handoff",
+                "takeover",
+                "resume",
+                "popout",
+                "finish",
+              ],
+            },
+            url: { type: "string" },
+            target: { type: "string", description: "snapshot 返回的 @eN 引用、text=... 或 CSS 选择器" },
+            value: { type: "string" },
+            key: { type: "string" },
+            deltaY: { type: "number" },
+            label: { type: "string", description: "显示在虚拟光标旁的简短动作提示" },
+            reason: { type: "string", description: "handoff 时说明需要协助的原因" },
+            confirmed: { type: "boolean", description: "开启“动手前先问”时，用户明确同意后传 true" },
           },
-          url: { type: "string" },
-          target: { type: "string", description: "snapshot 返回的 @eN 引用（如 @e3）" },
-          value: { type: "string" },
-          key: { type: "string" },
-          deltaY: { type: "number" },
-          label: { type: "string", description: "显示在虚拟光标旁的简短中文动作提示" },
-          reason: { type: "string", description: "handoff 时告诉用户需要协助的原因" },
-          confirmed: { type: "boolean", description: "开启“动手前先问”时，用户明确同意后传 true" },
+          required: ["op"],
         },
-        required: ["op"],
       },
-    });
+      {
+        name: "browser_run",
+        description: "在电脑内置 AI 浏览器中执行一段多步异步 JS 操作流脚本（支持 taskSpace / page.goto / fill / press / click / waitForEvent('popup') / waitForResponse）。",
+        input_schema: {
+          type: "object",
+          properties: {
+            device: { type: "string", description: "目标电脑名或 id；只有一台在线电脑时可省略" },
+            spaceId: { type: "string" },
+            script: { type: "string", description: "异步脚本正文" },
+            timeoutMs: { type: "number" },
+            confirmed: { type: "boolean" },
+          },
+          required: ["script"],
+        },
+      },
+      {
+        name: "browser_net",
+        description: "只读查看电脑内置 AI 浏览器捕获的 HTTP 请求列表或读取指定请求的响应体 JSON/文本。",
+        input_schema: {
+          type: "object",
+          properties: {
+            device: { type: "string" },
+            spaceId: { type: "string" },
+            page: { type: "string" },
+            action: { type: "string", enum: ["list", "body", "clear"] },
+            filter: { type: "string", description: "按 URL 关键字筛选" },
+            requestId: { type: "string", description: "action=body 时必填" },
+            limit: { type: "number" },
+          },
+          required: ["action"],
+        },
+      },
+    );
   }
 
   if (plugins.workspace) {
@@ -348,11 +453,11 @@ export function pluginToolDefs(plugins: AssistantPluginMap, webhooks: AssistantW
 
 export function pluginPromptHints(plugins: AssistantPluginMap): string {
   const parts: string[] = [];
-  if (plugins.browser) parts.push("browser_act（浏览器协作：登录/验证码必 handoff 给用户，不绕过）");
-  if (plugins.workspace) parts.push("inspect_workspace（项目与 Git 只读巡检）");
-  if (plugins.webfetch) parts.push("fetch_webpage（公开网页阅读）");
-  if (plugins.webhooks) parts.push("webhook_*（已启用的自定义 Webhook 工具）");
-  return parts.length ? `\n\n## 已启用的可选插件\n${parts.join("；")}。` : "";
+  if (plugins.browser) parts.push("browser_act / browser_run / browser_net（内置 AI 浏览器与网络抓包：登录/验证码必 handoff，不绕过）");
+  if (plugins.workspace) parts.push("inspect_workspace（代码与 Git 只读巡检）");
+  if (plugins.webfetch) parts.push("fetch_webpage（网页阅读）");
+  if (plugins.webhooks) parts.push("webhook_*（自定义 Webhook 工具）");
+  return parts.length ? `\n\n## 已启用的扩展工具包\n${parts.join("；")}。` : "";
 }
 
 export interface PluginExecDeps {
@@ -434,6 +539,57 @@ export async function executePluginTool(
       .filter(Boolean)
       .join("\n");
     return { out: summaryLines, step: `浏览器 ${op}` };
+  }
+
+  if (name === "browser_run") {
+    if (!deps.plugins.browser) throw new Error("AI 浏览器操作插件未开启，请先在「设置 › 插件中心」启用");
+    const script = typeof input.script === "string" ? input.script : "";
+    if (!script.trim()) throw new Error("需要 script");
+    const id = deps.resolveDevice(input.device);
+    const gate = deps.requireConfirm(
+      `browser_run:${id}`,
+      `在 ${deps.deviceName(id)} 上执行 AI 浏览器脚本`,
+      input.confirmed === true,
+    );
+    if (gate) return { out: gate, step: "等确认执行浏览器脚本" };
+    const r = await deps.callHost<{ ok: boolean; stdout?: string; stderr?: string; error?: string; spaceId?: string }>(
+      id,
+      "browser.run",
+      {
+        script,
+        ...(typeof input.spaceId === "string" && input.spaceId ? { spaceId: input.spaceId } : {}),
+        ...(typeof input.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : {}),
+      },
+      120_000,
+    );
+    const body = [r.stdout, r.stderr, r.error ? `ERROR: ${r.error}` : ""].filter(Boolean).join("\n");
+    return {
+      out: (body || (r.ok ? "ok" : "failed")).slice(0, MAX_OUTPUT_CHARS),
+      step: "执行了浏览器脚本",
+    };
+  }
+
+  if (name === "browser_net") {
+    if (!deps.plugins.browser) throw new Error("AI 浏览器操作插件未开启，请先在「设置 › 插件中心」启用");
+    const action = input.action === "body" || input.action === "clear" ? input.action : "list";
+    const id = deps.resolveDevice(input.device);
+    const r = await deps.callHost<Record<string, unknown>>(
+      id,
+      "browser.net",
+      {
+        action,
+        ...(typeof input.spaceId === "string" && input.spaceId ? { spaceId: input.spaceId } : {}),
+        ...(typeof input.page === "string" && input.page ? { page: input.page } : {}),
+        ...(typeof input.filter === "string" && input.filter ? { filter: input.filter } : {}),
+        ...(typeof input.requestId === "string" && input.requestId ? { requestId: input.requestId } : {}),
+        ...(typeof input.limit === "number" ? { limit: input.limit } : {}),
+      },
+      15_000,
+    );
+    return {
+      out: JSON.stringify(r, null, 2).slice(0, MAX_OUTPUT_CHARS),
+      step: action === "body" ? "读取了接口响应体" : action === "clear" ? "清空了网络抓包" : "查看了网络请求",
+    };
   }
 
   if (name === "inspect_workspace") {

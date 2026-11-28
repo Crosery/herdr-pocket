@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Copy, Laptop, Monitor, Plus, QrCode, Radio, RefreshCw, Server, Smartphone, Trash2, Upload, Zap } from "lucide-react";
+import { Activity, ArrowUpCircle, Copy, Laptop, Monitor, Plus, QrCode, Radio, RefreshCw, Server, Smartphone, Trash2, Upload, Zap } from "lucide-react";
 import { configKeySpec, type Device } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../../components/MascotAndVendor";
 import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, useToast } from "../../components/PocketUI";
@@ -1017,8 +1017,10 @@ function DeviceRow({
   probeRttMs,
   relayRttMs,
   probing,
+  upgrading,
   onProbe,
   onTryDirect,
+  onUpgradeHostd,
   onRemove,
 }: {
   item: ClassifiedDevice;
@@ -1028,8 +1030,10 @@ function DeviceRow({
   probeRttMs?: number;
   relayRttMs?: number | null;
   probing?: boolean;
+  upgrading?: boolean;
   onProbe?: () => void;
   onTryDirect?: () => void;
+  onUpgradeHostd?: () => void;
   onRemove?: () => void;
 }) {
   const { device: d, isCurrentDevice, isLocalHost, isExecutionHost, roleLabel, mergedViewer } = item;
@@ -1052,7 +1056,10 @@ function DeviceRow({
     .filter(Boolean)
     .join(" · ");
   const roleTone = isLocalHost ? "mint" : isExecutionHost ? "lav" : "neutral";
-  const showActionBar = Boolean((isHost && online && (onProbe || (!directAddr && onTryDirect))) || (isHost && onRemove));
+  const showActionBar = Boolean(
+    (isHost && online && (onProbe || (!directAddr && onTryDirect) || (outdatedHost && onUpgradeHostd))) ||
+      (isHost && onRemove),
+  );
   return (
     <div className="sf-net-card">
       <div className="sf-net-card-top">
@@ -1111,6 +1118,12 @@ function DeviceRow({
               <span>尝试直连</span>
             </PocketButton>
           ) : null}
+          {isHost && online && outdatedHost && onUpgradeHostd ? (
+            <PocketButton size="sm" variant="primary" disabled={upgrading} onClick={onUpgradeHostd}>
+              <ArrowUpCircle size={13} className={upgrading ? "pk-spin" : undefined} />
+              <span>{upgrading ? "升级中…" : "升级 hostd"}</span>
+            </PocketButton>
+          ) : null}
           {onRemove ? (
             <span className="sf-net-card-action-end">
               <button className="sf-icon-btn" aria-label={`移除 ${d.name}`} title="移除授权" onClick={onRemove}>
@@ -1152,6 +1165,7 @@ export function MachinesPane({
   const [syncingSpaces, setSyncingSpaces] = useState<"sync" | "migrate" | null>(null);
   const [probingAll, setProbingAll] = useState(false);
   const [probingHostId, setProbingHostId] = useState<string | null>(null);
+  const [upgradingHostId, setUpgradingHostId] = useState<string | null>(null);
   const status = linkLabel(link);
   const real = Boolean(server && !isMockServer(server));
   const { desktop, mobile, desktopOnlineCount, mobileOnlineCount } = useMemo(
@@ -1218,6 +1232,36 @@ export function MachinesPane({
     [toast],
   );
 
+  const runUpgradeHostd = useCallback(
+    async (hostId: string, hostName: string) => {
+      setUpgradingHostId(hostId);
+      try {
+        const res = await rpcCall(hostId, "tools.update", { targets: ["hostd"], waitMs: 15_000 }, 25_000);
+        const item = res.completed?.find((c) => c.id === "hostd");
+        if (item?.status === "failed") {
+          toast(`${hostName} hostd 升级失败：${item.message}`, true);
+        } else if (item?.status === "up_to_date") {
+          toast(`${hostName} hostd 已是最新版本`);
+        } else if (item?.status === "restarting" || item?.status === "updated") {
+          toast(`${hostName} hostd 升级已启动（正在自动重启重连…）`);
+        } else {
+          toast(`${hostName} hostd 升级任务已下发`);
+        }
+      } catch (err) {
+        const msg = (err as Error)?.message || "升级请求失败";
+        toast(
+          /unsupported|unknown/i.test(msg)
+            ? `${hostName} 当前版本不支持远程升级，请在该电脑运行 herdr-pocket update`
+            : `${hostName} 升级 hostd 失败：${msg}`,
+          true,
+        );
+      } finally {
+        setUpgradingHostId((cur) => (cur === hostId ? null : cur));
+      }
+    },
+    [toast],
+  );
+
   // Auto-populate live relay & host latencies when opening this pane so metrics never stay blank.
   useEffect(() => {
     if (link !== "online") return;
@@ -1238,17 +1282,23 @@ export function MachinesPane({
     if (!syncTargetHost) return;
     setSyncingSpaces(mode);
     try {
-      const res = await rpcCall(syncTargetHost.id, "spaces.sync", { mode }, 20_000);
+      const res = await rpcCall(syncTargetHost.id, "spaces.sync", { mode, syncAgents: true }, 30_000);
       refreshHostSpaces(syncTargetHost.id);
       if (!res.herdrAvailable) {
         toast("未检测到正在运行的 herdr 终端（已保持 Herdr Core 空间完整）");
       } else {
-        const parts = [`Core +${res.syncedToCore}`, `Herdr +${res.syncedToHerdr}`];
-        if (mode === "migrate") parts.push(`迁移会话 ${res.migratedAgents} 个`);
-        toast(`空间同步完成：${parts.join(" · ")}`);
+        const syncedAgents = res.syncedAgentsToHerdr ?? 0;
+        const parts = [
+          `空间 Core +${res.syncedToCore} / Herdr +${res.syncedToHerdr}`,
+          `Agent 镜像至 Herdr +${syncedAgents}`,
+        ];
+        if (res.migratedAgents > 0 || mode === "migrate") {
+          parts.push(`续跑至 Core ${res.migratedAgents} 个`);
+        }
+        toast(`双向同步完成：${parts.join(" · ")}`);
       }
     } catch (e) {
-      toast((e as Error).message || "空间同步失败", true);
+      toast((e as Error).message || "双向同步失败", true);
     } finally {
       setSyncingSpaces(null);
     }
@@ -1461,10 +1511,10 @@ export function MachinesPane({
 
       {syncTargetHost ? (
         <>
-          <SetHeading>Herdr ↔ Herdr Core 空间同步</SetHeading>
+          <SetHeading>Herdr ↔ Herdr Core 双向同步</SetHeading>
           <SetRow
-            title={`无感双向同步（${syncTargetHost.name}）`}
-            about="自动将 herdr 终端与 Herdr Core 的工作空间保持一致，并支持一键把 herdr 会话续跑迁移到 Herdr Core"
+            title={`空间与 Agent 双向同步（${syncTargetHost.name}）`}
+            about="双向保持 herdr 终端与 Herdr Core 的工作空间及 Agent 实时互通，自动去重、不中断运行中实例"
           >
             <span className="sf-combo">
               <PocketButton
@@ -1474,7 +1524,7 @@ export function MachinesPane({
                 onClick={() => void runSpaceSync("sync")}
               >
                 <RefreshCw size={13} className={syncingSpaces === "sync" ? "pk-spin" : undefined} />
-                <span>{syncingSpaces === "sync" ? "同步中…" : "双向同步"}</span>
+                <span>{syncingSpaces === "sync" ? "同步中…" : "双向同步空间与 Agent"}</span>
               </PocketButton>
               <PocketButton
                 size="sm"
@@ -1482,7 +1532,7 @@ export function MachinesPane({
                 disabled={syncingSpaces !== null}
                 onClick={() => void runSpaceSync("migrate")}
               >
-                <span>{syncingSpaces === "migrate" ? "迁移中…" : "迁移会话"}</span>
+                <span>{syncingSpaces === "migrate" ? "迁移中…" : "迁移会话到 Core"}</span>
               </PocketButton>
             </span>
           </SetRow>
@@ -1505,6 +1555,7 @@ export function MachinesPane({
                 probeRttMs={isHost ? hostProbeRttMs[id] : undefined}
                 relayRttMs={relayRttMs}
                 probing={probingHostId === id || probingAll}
+                upgrading={upgradingHostId === id}
                 onProbe={isHost ? () => void runProbeSingleHost(id, item.device.name) : undefined}
                 onTryDirect={
                   isHost
@@ -1514,6 +1565,7 @@ export function MachinesPane({
                       }
                     : undefined
                 }
+                onUpgradeHostd={isHost ? () => void runUpgradeHostd(id, item.device.name) : undefined}
                 onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
               />
             );

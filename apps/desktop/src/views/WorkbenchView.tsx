@@ -1950,8 +1950,8 @@ export function WebPane({
             {!aiBrowserEnabled ? (
               <div className="web-start-plugin">
                 <div className="web-start-plugin-copy">
-                  <strong>可选：AI 浏览器协作插件（默认关闭）</strong>
-                  <span>开启后支持 AI 独立浏览空间、粉色虚拟光标可视化与随点随接管，零外部依赖。</span>
+                  <strong>AI 浏览器插件</strong>
+                  <span>开启后可在主标签栏实时操控页面、查看网络抓包并随时接管。</span>
                 </div>
                 <PocketButton size="sm" variant="soft" onClick={() => openSettingsFrame("plugins")}>
                   <Blocks size={13} />

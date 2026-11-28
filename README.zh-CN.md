@@ -81,16 +81,16 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 
 | 平台 | 架构 / 格式 | 直接下载链接 | 说明 |
 | --- | --- | --- | --- |
-| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.59-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-macos-arm64.dmg) | Tauri v2 原生桌面端 |
-| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.59-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-macos-x64.dmg) | Intel Mac 桌面端 |
-| **Windows** | `x64` NSIS 安装器 `.exe` | [herdr-pocket-0.2.59-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-windows-x64-setup.exe) | 推荐的标准安装向导 |
-| **Windows** | `x64` `.msi` 安装包 | [herdr-pocket-0.2.59-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-windows-x64.msi) | 静默 / MSI 批量部署 |
-| **Linux** | `x64` `.AppImage` | [herdr-pocket-0.2.59-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-linux-x64.AppImage) | 免安装便携镜像 |
-| **Linux** | `x64` Debian / Ubuntu `.deb` | [herdr-pocket-0.2.59-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-linux-x64.deb) | `apt` / `dpkg` 安装包 |
-| **Android** | `arm64` `.apk` | [herdr-pocket-0.2.59-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-android-arm64.apk) | 支持应用内更新与语音通话 |
-| **HarmonyOS NEXT** | `arm64` `.hap` | [herdr-pocket-0.2.59-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-harmonyos-arm64.hap) | Stage 模型 ArkTS 客户端 |
-| **iOS** | `arm64` `.ipa` | [herdr-pocket-0.2.59-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59-ios-arm64.ipa) | 支持 AltStore / SideStore / TrollStore |
-| **中转与守护进程** | 跨平台源码包 `.tar.gz` | [herdr-pocket-0.2.59.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.59/herdr-pocket-0.2.59.tar.gz) | 供 `install-host` 与 `herdr-pocket update` 使用 |
+| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.60-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-macos-arm64.dmg) | Tauri v2 原生桌面端 |
+| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.60-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-macos-x64.dmg) | Intel Mac 桌面端 |
+| **Windows** | `x64` NSIS 安装器 `.exe` | [herdr-pocket-0.2.60-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-windows-x64-setup.exe) | 推荐的标准安装向导 |
+| **Windows** | `x64` `.msi` 安装包 | [herdr-pocket-0.2.60-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-windows-x64.msi) | 静默 / MSI 批量部署 |
+| **Linux** | `x64` `.AppImage` | [herdr-pocket-0.2.60-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-linux-x64.AppImage) | 免安装便携镜像 |
+| **Linux** | `x64` Debian / Ubuntu `.deb` | [herdr-pocket-0.2.60-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-linux-x64.deb) | `apt` / `dpkg` 安装包 |
+| **Android** | `arm64` `.apk` | [herdr-pocket-0.2.60-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-android-arm64.apk) | 支持应用内更新与语音通话 |
+| **HarmonyOS NEXT** | `arm64` `.hap` | [herdr-pocket-0.2.60-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-harmonyos-arm64.hap) | Stage 模型 ArkTS 客户端 |
+| **iOS** | `arm64` `.ipa` | [herdr-pocket-0.2.60-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60-ios-arm64.ipa) | 支持 AltStore / SideStore / TrollStore |
+| **中转与守护进程** | 跨平台源码包 `.tar.gz` | [herdr-pocket-0.2.60.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.60/herdr-pocket-0.2.60.tar.gz) | 供 `install-host` 与 `herdr-pocket update` 使用 |
 
 ## 系统架构与安全边界
 

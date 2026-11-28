@@ -362,7 +362,7 @@ final class VocalEnhancer {
     prevX = 0
   }
 
-  func process(_ src: [Float], into dst: inout [Float]) {
+  func process(_ src: [Float], into dst: inout [Float], allowBoost: Bool = true) {
     var sum = 0.0
     var peak: Float = 0
     for v in src {
@@ -371,14 +371,20 @@ final class VocalEnhancer {
       if av > peak { peak = av }
     }
     let rms = Float((sum / Double(max(1, src.count))).squareRoot())
-    if rms < noiseRms {
+    if !allowBoost {
+      // Only adapt noise floor on genuine low-energy background/silence frames so loud
+      // unverified or non-owner speech never inflates noiseRms and suppresses quiet owner speech.
+      if rms < 0.025 {
+        noiseRms = 0.92 * noiseRms + 0.08 * rms
+      }
+    } else if rms < noiseRms {
       noiseRms = 0.88 * noiseRms + 0.12 * rms
     } else if rms < noiseRms * 1.8 {
       noiseRms = 0.992 * noiseRms + 0.008 * rms
     }
     noiseRms = min(0.012, max(0.0004, noiseRms))
 
-    let activeSpeech = rms > max(0.002, noiseRms * 2.2)
+    let activeSpeech = allowBoost && rms > max(0.002, noiseRms * 2.2)
     var want: Float = activeSpeech ? min(3.5, max(1.0, 0.11 / max(rms, 0.002))) : 1.0
     if peak > 1e-4 { want = min(want, max(1.0, 0.85 / peak)) }
 

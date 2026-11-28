@@ -41,9 +41,121 @@ function CodeFence({ lang, code }: { lang: string; code: string }) {
   );
 }
 
-function renderInline(text: string, onOpenFile?: (target: string) => void): ReactNode[] {
+/**
+ * Rejoins hard terminal line-wraps inside Markdown `[label](url\nmore)` links outside fenced
+ * code blocks and strips leaked TUI footer hints so links like `file:///.../antigravity-\ncli/...`
+ * always parse as a single clickable link.
+ */
+export function normalizeMarkdownText(raw: string): string {
+  const normalized = raw.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  const out: string[] = [];
+  let inFence = false;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      i += 1;
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      i += 1;
+      continue;
+    }
+    // Strip leaked Antigravity swarm footer line from chat bubbles.
+    if (/^\s*Run\s+\/swarm\s+board\b.*(?:live\s+board|worker\s+status|swarm\s+board)\.?\s*$/i.test(line)) {
+      i += 1;
+      continue;
+    }
+    // Rejoin hard line-wraps inside `[label](target\ncontinued)` or bare `file:///...\n...`
+    let merged = line;
+    let joined = 0;
+    while (joined < 4 && i + 1 < lines.length) {
+      const next = lines[i + 1]!;
+      if (/^\s*```/.test(next) || !next.trim()) break;
+      const openLinkUrl = /\[[^\]\n]+\]\([^)\n]*$/.test(merged);
+      const openLinkLabel = /\[[^\]\n]*$/.test(merged) && /^[^[\n]*\]\([^)\n]+/.test(next.trim());
+      if (openLinkUrl) {
+        merged = `${merged.replace(/[ \t]+$/, "")}${next.trimStart()}`;
+        i += 1;
+        joined += 1;
+        continue;
+      }
+      if (openLinkLabel) {
+        merged = `${merged.replace(/[ \t]+$/, "")} ${next.trimStart()}`;
+        i += 1;
+        joined += 1;
+        continue;
+      }
+      break;
+    }
+    out.push(merged);
+    i += 1;
+  }
+  return out.join("\n");
+}
+
+function renderFileChip(
+  target: string,
+  label: string,
+  key: number,
+  onOpenFile: (target: string) => void,
+  asLink = false,
+): ReactNode {
+  const cleanTarget = target.trim();
+  const handleOpen = (e: { preventDefault: () => void; stopPropagation: () => void }) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onOpenFile(cleanTarget);
+  };
+  if (asLink) {
+    return (
+      <a
+        key={key}
+        href={cleanTarget}
+        className="md-file-link"
+        title={`点击打开 ${cleanTarget}`}
+        onClick={handleOpen}
+        onContextMenu={(e) => {
+          if (!e.ctrlKey) return;
+          handleOpen(e);
+        }}
+      >
+        {label}
+      </a>
+    );
+  }
+  return (
+    <code
+      key={key}
+      role="link"
+      tabIndex={0}
+      className="md-code md-file-chip"
+      title={`点击打开 ${cleanTarget}`}
+      onClick={handleOpen}
+      onContextMenu={(e) => {
+        if (!e.ctrlKey) return;
+        handleOpen(e);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          handleOpen(e);
+        }
+      }}
+    >
+      <FileText size={11} />
+      <span>{label}</span>
+    </code>
+  );
+}
+
+function renderInline(text: string, onOpenFile?: (target: string) => void, depth = 0): ReactNode[] {
   const out: ReactNode[] = [];
-  const tokenRe = /(`[^`]+`|\*\*[^*]+\*\*|\[([^\]]+)\]\(([^)\s]+)\)|https?:\/\/[^\s<>"')\]]+)/g;
+  const tokenRe =
+    /(`[^`\n]+`|\*\*[^*\n]+(?:\*(?!\*)[^*\n]+)*\*\*|~~[^~\n]+~~|\[([^\]]+)\]\(([^)\s]+)\)|file:\/\/[^\s<>"'`)\]]+|https?:\/\/[^\s<>"'`)\]]+|(?:~\/|\/(?:Users|home|tmp|var|opt|etc)\/)[^\s<>"'`)\],;!?]+)/g;
   let last = 0;
   let m: RegExpExecArray | null;
   let idx = 0;
@@ -53,36 +165,7 @@ function renderInline(text: string, onOpenFile?: (target: string) => void): Reac
     if (full.startsWith("`")) {
       const inner = full.slice(1, -1);
       if (onOpenFile && looksLikeClickableFilePath(inner)) {
-        out.push(
-          <code
-            key={idx++}
-            role="link"
-            tabIndex={0}
-            className="md-code md-file-chip"
-            title={`按住 Ctrl 点击打开 ${inner}`}
-            onClick={(e) => {
-              if (!hasFileJumpModifier(e)) return;
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenFile(inner);
-            }}
-            onContextMenu={(e) => {
-              if (!e.ctrlKey) return;
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenFile(inner);
-            }}
-            onKeyDown={(e) => {
-              if ((e.key === "Enter" || e.key === " ") && hasFileJumpModifier(e)) {
-                e.preventDefault();
-                onOpenFile(inner);
-              }
-            }}
-          >
-            <FileText size={11} />
-            <span>{inner}</span>
-          </code>,
-        );
+        out.push(renderFileChip(inner, inner, idx++, onOpenFile, false));
       } else {
         out.push(
           <code key={idx++} className="md-code">
@@ -90,8 +173,20 @@ function renderInline(text: string, onOpenFile?: (target: string) => void): Reac
           </code>,
         );
       }
-    } else if (full.startsWith("**")) {
-      out.push(<strong key={idx++}>{full.slice(2, -2)}</strong>);
+    } else if (full.startsWith("**") && full.endsWith("**") && full.length > 4) {
+      const inner = full.slice(2, -2);
+      out.push(
+        <strong key={idx++}>
+          {depth < 3 ? renderInline(inner, onOpenFile, depth + 1) : inner}
+        </strong>,
+      );
+    } else if (full.startsWith("~~") && full.endsWith("~~") && full.length > 4) {
+      const inner = full.slice(2, -2);
+      out.push(
+        <del key={idx++}>
+          {depth < 3 ? renderInline(inner, onOpenFile, depth + 1) : inner}
+        </del>,
+      );
     } else if (m[2] && m[3]) {
       const label = m[2];
       const target = m[3];
@@ -108,51 +203,30 @@ function renderInline(text: string, onOpenFile?: (target: string) => void): Reac
             {label}
           </a>,
         );
-      } else if (onOpenFile && looksLikeClickableFilePath(target)) {
-        out.push(
-          <a
-            key={idx++}
-            href={target}
-            className="md-file-link"
-            title={`按住 Ctrl 点击打开 ${target}`}
-            onClick={(e) => {
-              e.preventDefault();
-              if (!hasFileJumpModifier(e)) return;
-              e.stopPropagation();
-              onOpenFile(target);
-            }}
-            onContextMenu={(e) => {
-              if (!e.ctrlKey) return;
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenFile(target);
-            }}
-          >
-            {label}
-          </a>,
-        );
+      } else if (onOpenFile && (looksLikeClickableFilePath(target) || /^file:\/\//i.test(target))) {
+        out.push(renderFileChip(target, label, idx++, onOpenFile, true));
       } else {
         out.push(
           <a
             key={idx++}
             href={target}
-            title={onOpenFile ? `按住 Ctrl 点击打开 ${target}` : undefined}
+            title={onOpenFile ? `点击打开 ${target}` : undefined}
             onClick={(e) => {
               e.preventDefault();
-              if (!hasFileJumpModifier(e)) return;
               e.stopPropagation();
               if (onOpenFile) onOpenFile(target);
-            }}
-            onContextMenu={(e) => {
-              if (!e.ctrlKey || !onOpenFile) return;
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenFile(target);
             }}
           >
             {label}
           </a>,
         );
+      }
+    } else if (/^file:\/\//i.test(full)) {
+      if (onOpenFile) {
+        const display = full.split("/").filter(Boolean).pop() || full;
+        out.push(renderFileChip(full, decodeURIComponentSafe(display), idx++, onOpenFile, true));
+      } else {
+        out.push(full);
       }
     } else if (full.startsWith("http")) {
       out.push(
@@ -167,11 +241,23 @@ function renderInline(text: string, onOpenFile?: (target: string) => void): Reac
           {full}
         </a>,
       );
+    } else if (onOpenFile && looksLikeClickableFilePath(full)) {
+      out.push(renderFileChip(full, full, idx++, onOpenFile, false));
+    } else {
+      out.push(full);
     }
     last = m.index + full.length;
   }
   if (last < text.length) out.push(text.slice(last));
   return out;
+}
+
+function decodeURIComponentSafe(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
 }
 
 function splitTableRow(line: string): string[] {
@@ -193,7 +279,7 @@ export function RichMarkdown({
   text: string;
   onOpenFile?: (target: string) => void;
 }) {
-  const lines = text.split("\n");
+  const lines = normalizeMarkdownText(text).split("\n");
   const blocks: ReactNode[] = [];
   let codeFence: { lang: string; lines: string[] } | null = null;
   let k = 0;
@@ -314,10 +400,10 @@ export function RichMarkdown({
       i = j - 1;
       continue;
     }
-    const h = /^(#{1,4})\s+(.*)$/.exec(line);
+    const h = /^\s*(#{1,6})\s+(.*)$/.exec(line);
     if (h) {
       const level = h[1]!.length;
-      const fontSize = level === 1 ? 16 : level === 2 ? 14.5 : 13.5;
+      const fontSize = level === 1 ? 16 : level === 2 ? 14.5 : level === 3 ? 13.5 : 13;
       blocks.push(
         <div key={k++} style={{ fontWeight: 800, fontSize, marginTop: 4 }}>
           {renderInline(h[2]!, onOpenFile)}
@@ -325,21 +411,24 @@ export function RichMarkdown({
       );
       continue;
     }
-    if (/^\s*[-*]\s+/.test(line)) {
+    const ul = /^(\s*)(?:[-*+•◦▪‣])\s+(.*)$/.exec(line);
+    if (ul) {
+      const indent = Math.min(3, Math.floor((ul[1]?.length ?? 0) / 2));
       blocks.push(
-        <div key={k++} className="md-li">
+        <div key={k++} className="md-li" style={indent > 0 ? { paddingLeft: indent * 14 } : undefined}>
           <span className="md-dot" />
-          <span>{renderInline(line.replace(/^\s*[-*]\s+/, ""), onOpenFile)}</span>
+          <span>{renderInline(ul[2]!, onOpenFile)}</span>
         </div>,
       );
       continue;
     }
-    const ol = /^\s*(\d+\.)\s+(.*)$/.exec(line);
+    const ol = /^(\s*)(\d+\.)\s+(.*)$/.exec(line);
     if (ol) {
+      const indent = Math.min(3, Math.floor((ol[1]?.length ?? 0) / 2));
       blocks.push(
-        <div key={k++} className="md-li">
-          <span className="md-num num">{ol[1]}</span>
-          <span>{renderInline(ol[2]!, onOpenFile)}</span>
+        <div key={k++} className="md-li" style={indent > 0 ? { paddingLeft: indent * 14 } : undefined}>
+          <span className="md-num num">{ol[2]}</span>
+          <span>{renderInline(ol[3]!, onOpenFile)}</span>
         </div>,
       );
       continue;

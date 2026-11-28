@@ -247,19 +247,77 @@ function clipChars(text: string, max: number): string {
   return arr.length > max ? `${arr.slice(0, max - 1).join("")}…` : clean;
 }
 
+function cleanPathStr(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[<("'`]+|[>)"'`]+$/g, "")
+    .replace(/[\\/]+$/, "");
+}
+
 function shortPath(raw: string): string {
-  const s = raw.trim().replace(/[\\/]+$/, "");
+  const s = cleanPathStr(raw);
   if (!s) return raw.trim();
   const parts = s.split(/[\\/]/).filter(Boolean);
   if (parts.length <= 2) return parts.join("/") || s;
   return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
 }
 
+const FILE_INPUT_KEYS = [
+  "file_path",
+  "path",
+  "Path",
+  "TargetFile",
+  "AbsolutePath",
+  "file",
+  "SearchPath",
+  "SearchDirectory",
+] as const;
+
+const PARTIAL_FILE_KEY_RE =
+  /"(?:file_path|path|Path|TargetFile|AbsolutePath|file|SearchPath|SearchDirectory)"\s*:\s*"((?:\\.|[^"])*)/i;
+
 const PARTIAL_JSON_KEY_RE =
   /"(?:file_path|path|Path|TargetFile|AbsolutePath|command|CommandLine|cmd|Command|pattern|Pattern|query|Query|url|Url|description|Prompt|prompt|toolSummary)"\s*:\s*"((?:\\.|[^"])*)/i;
 
 function unescapePartialJsonStr(raw: string): string {
-  return raw.replace(/\\"/g, '"').replace(/\\n/g, " ").replace(/\\\\/g, "\\").trim();
+  return raw.replace(/\\"/g, '"').replace(/\\n/g, " ").replace(/\\\\/g, "\\").trim().replace(/^["']+|["']+$/g, "");
+}
+
+/**
+ * Extracts the FULL (un-shortened) file path from a tool call input object or JSON string,
+ * so clicking "打开文件" opens the exact file rather than a truncated 2-segment display label.
+ */
+export function toolInputFilePath(input: unknown): string | null {
+  if (input == null) return null;
+  if (typeof input === "string") {
+    const t = input.trim();
+    if (!t) return null;
+    if (t.startsWith("{") || t.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(t) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return toolInputFilePath(parsed);
+        }
+      } catch {
+        const m = PARTIAL_FILE_KEY_RE.exec(t);
+        if (m?.[1]) {
+          const clean = cleanPathStr(unescapePartialJsonStr(m[1]));
+          return clean || null;
+        }
+      }
+    }
+    return null;
+  }
+  if (typeof input !== "object" || Array.isArray(input)) return null;
+  const o = input as Record<string, unknown>;
+  for (const k of FILE_INPUT_KEYS) {
+    const v = o[k];
+    if (typeof v === "string" && v.trim()) {
+      const clean = cleanPathStr(v);
+      if (clean) return clean;
+    }
+  }
+  return null;
 }
 
 /** Extracts a concise single-line target/argument summary from a tool call input. */
@@ -278,6 +336,8 @@ export function toolInputSummary(input: unknown, toolName?: string): string {
           return toolInputSummary(parsed, toolName);
         }
       } catch {
+        const fm = PARTIAL_FILE_KEY_RE.exec(t);
+        if (fm?.[1]) return clipChars(shortPath(unescapePartialJsonStr(fm[1])), 72);
         const m = PARTIAL_JSON_KEY_RE.exec(t);
         if (m?.[1]) return clipChars(unescapePartialJsonStr(m[1]), 96);
       }
@@ -455,7 +515,17 @@ type Intermediate =
 export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "standard"): ChatRow[] {
   const rows: ChatRow[] = [];
   const stepByCallId = new Map<string, ToolStep>();
+  const openSteps: ToolStep[] = [];
+  let sawResultSinceLastCall = false;
   let pending: Intermediate[] = [];
+
+  const finalizeOpenSteps = () => {
+    if (openSteps.length) {
+      for (const s of openSteps) s.running = false;
+      openSteps.length = 0;
+    }
+    sawResultSinceLastCall = false;
+  };
 
   const flushPending = () => {
     if (!pending.length) return;
@@ -568,6 +638,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       if (nextOutcome === "error" || nextOutcome === "dismissed") {
         continue;
       }
+      finalizeOpenSteps();
       flushPending();
       if (sw.ackOnly && !sw.model && !sw.thinking) {
         continue;
@@ -619,12 +690,34 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           break;
         }
         if (!e.text.trim() && !e.injected?.trim()) break;
+        finalizeOpenSteps();
         flushPending();
         const split = splitFiles(e.text);
+        const nextText = split.text || (split.count ? "" : e.text.trim());
+        const prevRow = rows[rows.length - 1];
+        const sameAttachments =
+          prevRow?.kind === "user" &&
+          (prevRow.attachedLines.length === 0 ||
+            split.lines.length === 0 ||
+            (prevRow.attachedLines.length === split.lines.length &&
+              prevRow.attachedLines.every((line, idx) => line === split.lines[idx])));
+        if (
+          prevRow?.kind === "user" &&
+          Math.abs((e.ts || 0) - (prevRow.ts || 0)) <= 15_000 &&
+          prevRow.text.replace(/[\s\u200B-\u200D\uFEFF]+/g, "") === nextText.replace(/[\s\u200B-\u200D\uFEFF]+/g, "") &&
+          prevRow.attachedCount === split.count &&
+          sameAttachments
+        ) {
+          // Coalesce consecutive duplicate user_message echoes emitted with different ids.
+          if (split.lines.length > prevRow.attachedLines.length) {
+            prevRow.attachedLines = split.lines;
+          }
+          break;
+        }
         rows.push({
           kind: "user",
           id: e.id,
-          text: split.text || (split.count ? "" : e.text.trim()),
+          text: nextText,
           ts: e.ts,
           pos: e.pos,
           injected: e.injected?.trim() || undefined,
@@ -635,6 +728,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       }
       case "assistant_message": {
         if (!e.text.trim()) break;
+        finalizeOpenSteps();
         flushPending();
         rows.push({
           kind: "assistant",
@@ -650,6 +744,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       case "reasoning": {
         if (!e.text.trim()) break;
         const text = e.text.trim();
+        finalizeOpenSteps();
         if (mode === "compact") {
           pending.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos });
         } else {
@@ -672,6 +767,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
         if (!cleanBody || isDismissedCommandOutput(cleanBody)) break;
         const subLower = e.subtype?.trim().toLowerCase();
         if (subLower === "compact" || subLower === "checkpoint" || subLower === "compact_boundary") {
+          finalizeOpenSteps();
           flushPending();
           rows.push({
             kind: "compact_notice",
@@ -684,6 +780,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           break;
         }
         if (e.subtype === "command_output" || e.subtype === "command_error" || parsedOut) {
+          finalizeOpenSteps();
           flushPending();
           const isError = e.subtype === "command_error" || Boolean(parsedOut?.isError) || isCommandErrorOutput(cleanBody);
           rows.push({
@@ -714,6 +811,17 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
         break;
       }
       case "tool_call": {
+        if (sawResultSinceLastCall) {
+          // Earlier tool batch already returned results and the model has moved on to a new tool call;
+          // finalize any unreturned orphan calls from that earlier batch while keeping parallel calls in the new batch intact.
+          finalizeOpenSteps();
+        }
+        const prevSameCall = stepByCallId.get(e.call_id);
+        if (prevSameCall && prevSameCall.running) {
+          prevSameCall.running = false;
+          const prevIdx = openSteps.indexOf(prevSameCall);
+          if (prevIdx >= 0) openSteps.splice(prevIdx, 1);
+        }
         const step: ToolStep = {
           id: e.id,
           callId: e.call_id,
@@ -726,6 +834,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           isError: false,
         };
         stepByCallId.set(e.call_id, step);
+        openSteps.push(step);
         pending.push({ kind: "tool", id: e.id, ts: e.ts, pos: e.pos, step });
         break;
       }
@@ -735,6 +844,8 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           existing.result = e;
           existing.running = false;
           existing.isError = Boolean(e.is_error);
+          const openIdx = openSteps.indexOf(existing);
+          if (openIdx >= 0) openSteps.splice(openIdx, 1);
         } else {
           // Orphan result whose tool_call sat before the loaded page: synthesize one paired step
           // instead of rendering a broken standalone result card.
@@ -753,9 +864,11 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           stepByCallId.set(e.call_id, step);
           pending.push({ kind: "tool", id: e.id, ts: e.ts, pos: e.pos, step });
         }
+        sawResultSinceLastCall = true;
         break;
       }
       case "turn_end": {
+        finalizeOpenSteps();
         flushPending();
         if (rows.length && rows[rows.length - 1]?.kind !== "turn_end") {
           rows.push({ kind: "turn_end", id: e.id, ts: e.ts, pos: e.pos });
@@ -774,7 +887,9 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
     if (r.kind === "assistant") {
       sawAssistantAfter = true;
     } else if (r.kind === "activity_group") {
-      if (r.running) {
+      const actualRunning = r.tools.some((t) => t.running);
+      const actualFailed = r.tools.filter((t) => t.isError).length;
+      if (r.running || actualRunning !== r.running || actualFailed !== r.failedCount) {
         Object.assign(r, buildGroupMeta(r.tools, r.thoughts, r.notes));
       }
       r.hasFollowingAssistant = sawAssistantAfter && !r.running;

@@ -1,8 +1,10 @@
 import Foundation
 
-/// Zero-stall continuous streaming voice pipeline:
-/// - Clean Path A: Mic PCM16 -> HighPass64 -> Silero VAD + ERes2NetV2-zh multi-prototype SV (NEVER denoised/TSE audio).
-/// - Audio Path B: HighPass64 -> VoxLock v2 INT8 TSE (40 ms async ring) -> DPDFNet-baseline (10 ms Vorbis STFT) -> VocalEnhancer -> 16 ms cosine residual gate -> continuous PCM16 stream.
+/// Zero-stall continuous streaming voice pipeline (Stage 2 parity with `voice_ai.rs`):
+/// - HighPass64 -> DPDFNet-baseline (10 ms Vorbis STFT) -> VoxLock v2 INT8 TSE (40 ms async ring)
+/// - Silero VAD + ERes2NetV2-zh multi-prototype SV consume the TSE-separated (or denoised) stream,
+///   falling back to clean HPF64 only when neither neural stage ran.
+/// - Decoupled residual gate + smooth onset gain + owner-gated VocalEnhancer -> continuous PCM16 stream.
 final class VoiceFilter {
   struct Options {
     let denoise: Bool
@@ -79,11 +81,20 @@ final class VoiceFilter {
   private static let speechProb: Float = 0.35
   private static let startWindows = 3   // 96 ms
   private static let endWindows = 12    // 384 ms
-  private static let earlyVoicedW = 13  // ~416 ms
-  private static let fullVoicedW = 26   // ~832 ms
-  private static let recheckStepW = 20  // ~640 ms
+  private static let earlyVoicedW = 8   // ~256 ms
+  private static let fullVoicedW = 22   // ~704 ms
+  private static let recheckStepW = 16  // ~512 ms
   private static let minEndVoicedW = 8  // ~256 ms
   private static let maxCleanSpeechSamples = voiceRate * 3 / 2 // 24,000 samples (1.5 s)
+  private static let strongNonOwnerMargin: Float = 0.06
+  private static let tseGateCloseDb: Double = -2.5
+  private static let tseGateOpenDb: Double = -1.2
+  private static let gateReleaseHoldFrames = 2
+  private static let onsetSvUncertainGain: Float = 0.45
+  private static let onsetTseUncertainGain: Float = 0.78
+  private static let onsetTseAttenGain: Float = 0.25
+  private static let onsetAttackSamples: Float = 96.0   // 6 ms fast attack back to 1.0 on owner confirm
+  private static let onsetReleaseSamples: Float = 256.0 // 16 ms smooth onset attenuation release
 
   private let m: VoiceModels
   private let o: Options
@@ -165,11 +176,15 @@ final class VoiceFilter {
   private var fullTried = false
   private var lastVadProb: Float = 0
 
-  // Smooth residual gate & rolling acoustic metrics
+  // Smooth residual gate, onset attenuation & rolling acoustic metrics
   private var gatePhase: Int = rampSamples // 256 = gain 1.0 (open), 0 = gain 0.0 (muted)
+  private var gateReleaseHold = 0
+  private var onsetGain: Float = 1.0
   private var suppressingResidual = false
   private var svConfirmedNonOwner = false
-  private var lastSvScore: Float = 1.0
+  private var svConfirmedOwner = false
+  private var lastSvScore: Float? = nil
+  private var nonOwnerStreak = 0
   private var smoothedTseAttenDb: Double = 0.0
   private var uttRawSqSum = 0.0
   private var uttTseSqSum = 0.0
@@ -280,9 +295,10 @@ final class VoiceFilter {
     earlyTried = false
     fullTried = false
     gatePhase = Self.rampSamples
+    gateReleaseHold = 0
+    onsetGain = 1.0
     suppressingResidual = false
-    svConfirmedNonOwner = false
-    lastSvScore = 1.0
+    resetUtteranceSvState()
     smoothedTseAttenDb = 0.0
     uttRawSqSum = 0
     uttTseSqSum = 0
@@ -324,16 +340,102 @@ final class VoiceFilter {
     flushOut()
   }
 
+  private func resetUtteranceSvState() {
+    svConfirmedNonOwner = false
+    svConfirmedOwner = false
+    lastSvScore = nil
+    nonOwnerStreak = 0
+  }
+
+  private var hasIdentityReference: Bool {
+    enrolledNorm != nil || sessionEmb != nil
+  }
+
+  private var hasStrongNonOwnerMargin: Bool {
+    guard svConfirmedNonOwner else { return false }
+    if let score = lastSvScore, score < o.threshold - Self.strongNonOwnerMargin {
+      return true
+    }
+    return nonOwnerStreak >= 2
+  }
+
+  private func allowVocalBoost() -> Bool {
+    guard hasSv else { return true }
+    if suppressingResidual || svConfirmedNonOwner { return false }
+    // Only boost speech confirmed as the owner (or while acquiring the very first
+    // speaker in first-speaker lock mode before any identity reference exists).
+    return svConfirmedOwner || !hasIdentityReference
+  }
+
+  private func targetOnsetGain(usedTse: Bool) -> Float {
+    guard hasSv && hasIdentityReference else { return 1.0 }
+    if suppressingResidual {
+      // Residual gate owns the smooth raised-cosine fade to 0.0; hold onsetGain
+      // steady so sample 0 of suppression stays continuous with the previous hop.
+      return onsetGain
+    }
+    if svConfirmedOwner {
+      return 1.0
+    }
+    // Unverified onset / pre-roll before SV confirms owner: gently attenuate
+    // (stronger when VoxLock TSE already reports non-target attenuation) and snap
+    // back with 6 ms attack as soon as owner is confirmed.
+    if usedTse {
+      return smoothedTseAttenDb < Self.tseGateCloseDb
+        ? Self.onsetTseAttenGain
+        : Self.onsetTseUncertainGain
+    } else {
+      return Self.onsetSvUncertainGain
+    }
+  }
+
   private func processHop() {
     hopsIn += 1
     takeSvVerdicts()
 
-    // 1. Always run HighPass64 first so SV/VAD and TSE/DPDFNet share DC-free 64 Hz clean input.
+    // 1. Always run HighPass64 first so DPDFNet, TSE, and fallback SV/VAD get DC-free 64 Hz audio.
     hpf.process(inBuf, srcOff: 0, dst: &hpfBuf, dstOff: 0, count: Self.hop)
 
-    // 2. Clean Path A: feed unmodified HPF audio to Silero VAD & ERes2NetV2-zh ring.
+    // 2. Stage 1: Run DPDFNet-baseline denoise FIRST so background noise is stripped
+    //    before VoxLock TSE and speaker verification.
+    var usedDpdf = false
+    if let d = denoiser {
+      let t0 = DispatchTime.now().uptimeNanoseconds
+      let ok = (try? d.hop(hpfBuf, off: 0, out: &dpdfOutBuf, outOff: 0)) ?? false
+      let ns = Int64(DispatchTime.now().uptimeNanoseconds - t0)
+      denoiseNs += ns
+      if ns > denoiseMaxNs { denoiseMaxNs = ns }
+      if ok {
+        usedDpdf = true
+      } else {
+        for i in 0..<Self.hop { dpdfOutBuf[i] = hpfBuf[i] }
+      }
+    } else {
+      for i in 0..<Self.hop { dpdfOutBuf[i] = hpfBuf[i] }
+    }
+
+    // 3. Stage 2: Run VoxLock TSE target extraction BEFORE VAD + ERes2NetV2 SV so overlapping
+    //    speech is separated into the target stream before speaker verification scores it.
+    let useTse = tse != nil && !tseBypassed
+    let usedTse: Bool
+    if useTse {
+      usedTse = pushAndPopTseHop(dpdfOutBuf, outTse: &tseHopBuf, outRaw: &rawAlignedHopBuf)
+    } else {
+      usedTse = false
+      for i in 0..<Self.hop {
+        tseHopBuf[i] = dpdfOutBuf[i]
+        rawAlignedHopBuf[i] = dpdfOutBuf[i]
+      }
+    }
+
+    // 4. Stage 3: Feed TSE-separated stream (or DPDFNet-denoised stream when TSE is off/bypassed,
+    //    falling back to clean HPF64 when neither neural stage ran) into Silero VAD + ERes2NetV2 SV.
     if vad != nil {
-      vadAccum.append(contentsOf: hpfBuf)
+      if usedTse || usedDpdf {
+        vadAccum.append(contentsOf: tseHopBuf)
+      } else {
+        vadAccum.append(contentsOf: hpfBuf)
+      }
       while vadAccum.count >= Vad.window {
         for i in 0..<Vad.window { cleanWin[i] = vadAccum[i] }
         vadAccum.removeFirst(Vad.window)
@@ -341,17 +443,7 @@ final class VoiceFilter {
       }
     }
 
-    // 3. Audio Path B: VoxLock TSE (if active & not bypassed) -> DPDFNet-baseline -> VocalEnhancer.
-    let useTse = tse != nil && !tseBypassed
-    if useTse {
-      pushAndPopTseHop(hpfBuf, outTse: &tseHopBuf, outRaw: &rawAlignedHopBuf)
-    } else {
-      for i in 0..<Self.hop {
-        tseHopBuf[i] = hpfBuf[i]
-        rawAlignedHopBuf[i] = hpfBuf[i]
-      }
-    }
-
+    // Measure post-TSE speech against phase-aligned denoised pre-TSE speech.
     var rawSq = 0.0
     var tseSq = 0.0
     for i in 0..<Self.hop {
@@ -362,30 +454,27 @@ final class VoiceFilter {
     }
     let hopRawRms = Float((rawSq / Double(Self.hop)).squareRoot())
     let hopTseRms = Float((tseSq / Double(Self.hop)).squareRoot())
-    if useTse && hopRawRms > 0.012 && lastVadProb >= Self.speechProb {
-      let hopAtten = 20.0 * log10(max(Double(hopTseRms), 1e-5) / max(Double(hopRawRms), 1e-5))
-      smoothedTseAttenDb = 0.78 * smoothedTseAttenDb + 0.22 * hopAtten
+    if usedTse {
+      if hopRawRms > 0.012
+        && (lastVadProb >= Self.speechProb || (hopRawRms > 0.025 && hopTseRms < hopRawRms * 0.5))
+      {
+        let hopAtten = 20.0 * log10(max(Double(hopTseRms), 1e-5) / max(Double(hopRawRms), 1e-5))
+        smoothedTseAttenDb = 0.78 * smoothedTseAttenDb + 0.22 * hopAtten
+      }
     } else if !useTse {
       smoothedTseAttenDb = 0.0
     }
 
-    if let d = denoiser {
-      let t0 = DispatchTime.now().uptimeNanoseconds
-      let ok = (try? d.hop(tseHopBuf, off: 0, out: &dpdfOutBuf, outOff: 0)) ?? false
-      let ns = Int64(DispatchTime.now().uptimeNanoseconds - t0)
-      denoiseNs += ns
-      if ns > denoiseMaxNs { denoiseMaxNs = ns }
-      if !ok {
-        for i in 0..<Self.hop { dpdfOutBuf[i] = tseHopBuf[i] }
-      }
-    } else {
-      for i in 0..<Self.hop { dpdfOutBuf[i] = tseHopBuf[i] }
-    }
+    // 5. Stage 4: Update decoupled residual gate BEFORE VocalEnhancer so unverified or
+    //    confirmed non-owner frames are never boosted by presence/AGC enhancement.
+    updateResidualGateTarget(usedTse: usedTse)
 
     if let enh = enhancer {
-      enh.process(dpdfOutBuf, into: &enhOutBuf)
+      let speechActive = vad != nil ? (lastVadProb >= Self.speechProb) : true
+      let allowBoost = speechActive && allowVocalBoost()
+      enh.process(tseHopBuf, into: &enhOutBuf, allowBoost: allowBoost)
     } else {
-      for i in 0..<Self.hop { enhOutBuf[i] = dpdfOutBuf[i] }
+      for i in 0..<Self.hop { enhOutBuf[i] = tseHopBuf[i] }
     }
 
     var enhSq = 0.0
@@ -400,11 +489,14 @@ final class VoiceFilter {
       uttAudioSamples += Self.hop
     }
 
-    // 4. Smooth 16 ms raised-cosine residual gate ONLY when non-owner is confirmed.
-    updateResidualGateTarget(useTse: useTse)
+    // 6. Apply 16 ms raised-cosine residual gate + smooth per-sample onset attenuation.
     if gatePhase < Self.rampSamples / 2 {
       hopsGated += 1
     }
+    let targetOnset = targetOnsetGain(usedTse: usedTse)
+    let attackStep: Float = 1.0 / Self.onsetAttackSamples
+    let releaseStep: Float = 1.0 / Self.onsetReleaseSamples
+    let minGain: Float = (!usedTse && o.route == "speaker") ? 0.18 : 0.0
     for i in 0..<Self.hop {
       if suppressingResidual {
         if gatePhase > 0 { gatePhase -= 1 }
@@ -419,40 +511,65 @@ final class VoiceFilter {
       } else {
         factor = 0.5 - 0.5 * cos(Float.pi * Float(gatePhase) / Float(Self.rampSamples))
       }
-      let minGain: Float = (!useTse && o.route == "speaker") ? 0.18 : 0.0
-      let g = minGain + (1.0 - minGain) * factor
-      outFloats.append(enhOutBuf[i] * g)
+      let residualGain = minGain + (1.0 - minGain) * factor
+
+      if onsetGain < targetOnset {
+        onsetGain = min(targetOnset, onsetGain + attackStep)
+      } else if onsetGain > targetOnset {
+        onsetGain = max(targetOnset, onsetGain - releaseStep)
+      }
+
+      outFloats.append(enhOutBuf[i] * residualGain * onsetGain)
     }
 
     takeSvVerdicts()
   }
 
-  private func updateResidualGateTarget(useTse: Bool) {
+  private func updateResidualGateTarget(usedTse: Bool) {
     guard hasSv else {
       suppressingResidual = false
+      gateReleaseHold = 0
       return
     }
     if !speaking || !svConfirmedNonOwner {
       suppressingResidual = false
+      gateReleaseHold = 0
       return
     }
-    if useTse {
-      // Hysteresis: engage residual gate only when VoxLock attenuated > 9 dB AND SV confirmed non-owner;
-      // release immediately if owner speaks (tseAttenDb >= -7.5 dB).
+    if usedTse {
+      // Decouple the old -9.0 dB AND deadlock:
+      // SV now scores the TSE-separated target stream, so confirmed non-owner closes
+      // the residual gate on moderate TSE attenuation (< -2.5 dB) OR a clear low-cosine
+      // / consecutive non-owner SV verdict, while keeping hysteresis + release hold to
+      // avoid chatter and a dual-talk safety margin for single borderline scores when
+      // TSE is not attenuating.
+      let strongSvReject = hasStrongNonOwnerMargin
       if suppressingResidual {
-        if smoothedTseAttenDb >= -7.5 { suppressingResidual = false }
-      } else {
-        if smoothedTseAttenDb < -9.0 { suppressingResidual = true }
+        let wantOpen = !strongSvReject && smoothedTseAttenDb >= Self.tseGateOpenDb
+        if wantOpen {
+          gateReleaseHold += 1
+          if gateReleaseHold >= Self.gateReleaseHoldFrames {
+            suppressingResidual = false
+            gateReleaseHold = 0
+          }
+        } else {
+          gateReleaseHold = 0
+        }
+      } else if strongSvReject || smoothedTseAttenDb < Self.tseGateCloseDb {
+        suppressingResidual = true
+        gateReleaseHold = 0
       }
     } else {
       suppressingResidual = true
+      gateReleaseHold = 0
     }
   }
 
-  private func pushAndPopTseHop(_ hpfHop: [Float], outTse: inout [Float], outRaw: inout [Float]) {
+  @discardableResult
+  private func pushAndPopTseHop(_ inHop: [Float], outTse: inout [Float], outRaw: inout [Float]) -> Bool {
     var shouldLaunch = false
     tseLock.lock()
-    tseInRing.append(contentsOf: hpfHop)
+    tseInRing.append(contentsOf: inHop)
     if let tse, !tseJobRunning, !_tseBypassed, (tseInRing.count - tseInRead) >= tse.requiredInputSamples {
       tseJobRunning = true
       shouldLaunch = true
@@ -476,6 +593,7 @@ final class VoiceFilter {
       tseOutRaw.removeFirst(tseOutRead)
       tseOutRead = 0
     }
+    let gotFullTse = (takeCount == Self.hop)
     if takeCount < Self.hop {
       _tseOverruns += 1
       if _tseOverruns >= 8 && !_tseBypassed {
@@ -483,11 +601,12 @@ final class VoiceFilter {
         NSLog("PocketVoice TSE overrun count=%d >= 8, bypassing TSE to keep audio smooth", _tseOverruns)
       }
       for i in takeCount..<Self.hop {
-        outTse[i] = hpfHop[i]
-        outRaw[i] = hpfHop[i]
+        outTse[i] = inHop[i]
+        outRaw[i] = inHop[i]
       }
     }
     tseLock.unlock()
+    return gotFullTse
   }
 
   private func scheduleTseStep() {
@@ -592,7 +711,8 @@ final class VoiceFilter {
         sinceCheckW = 0
         earlyTried = false
         fullTried = false
-        svConfirmedNonOwner = false
+        gateReleaseHold = 0
+        resetUtteranceSvState()
         uttRawSqSum = 0
         uttTseSqSum = 0
         uttEnhSqSum = 0
@@ -617,7 +737,13 @@ final class VoiceFilter {
       }
     }
 
-    guard hasSv else { return }
+    guard hasSv else {
+      if justEnded {
+        smoothedTseAttenDb = 0.0
+        cleanSpeechBuf.removeAll(keepingCapacity: true)
+      }
+      return
+    }
     if speaking && activeJob == 0 {
       if !earlyTried && uttVoicedW >= Self.earlyVoicedW {
         earlyTried = true
@@ -626,14 +752,16 @@ final class VoiceFilter {
         fullTried = true
         launchSvCheck(kind: .full, maxSamples: voiceRate) // up to 1.0 s
       } else if fullTried && sinceCheckW >= Self.recheckStepW {
-        launchSvCheck(kind: .recheck, maxSamples: voiceRate * 5 / 4) // up to 1.25 s
+        launchSvCheck(kind: .recheck, maxSamples: voiceRate) // 1.0 s (16,000) for faster speaker-handoff detection
       }
     } else if justEnded {
       if activeJob == 0 && !fullTried && uttVoicedW >= Self.minEndVoicedW {
         launchSvCheck(kind: .end, maxSamples: voiceRate)
       }
       suppressingResidual = false
-      svConfirmedNonOwner = false
+      gateReleaseHold = 0
+      smoothedTseAttenDb = 0.0
+      resetUtteranceSvState()
       cleanSpeechBuf.removeAll(keepingCapacity: true)
     }
   }
@@ -756,6 +884,7 @@ final class VoiceFilter {
           effectiveScore = cosine(emb, sess)
           pass = effectiveScore >= req
         } else {
+          effectiveScore = 1.0
           pass = true
         }
         if sessionEmb == nil, let emb = v.normEmb, (v.usedSamples >= voiceRate * 3 / 5 || v.kind == .end) {
@@ -769,13 +898,18 @@ final class VoiceFilter {
       if pass {
         passed += 1
         svConfirmedNonOwner = false
+        svConfirmedOwner = true
+        nonOwnerStreak = 0
         suppressingResidual = false
+        gateReleaseHold = 0
         maybeUpdateSession(v, effectiveScore: effectiveScore, firstLockMode: firstLockMode)
         maybeCaptureOwnerSample(v)
       } else {
         blocked += 1
         if speaking {
           svConfirmedNonOwner = true
+          svConfirmedOwner = false
+          nonOwnerStreak += 1
         }
       }
 

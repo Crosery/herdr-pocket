@@ -8,6 +8,7 @@ import {
   interruptComposerNow,
   resetChatQueueForTest,
   schedulePendingModelSwitch,
+  sendPromptNow,
 } from "../src/lib/chatQueue.ts";
 import { filterTerminalQueuedItems } from "../src/lib/chatQueueLogic.ts";
 import { DEMO_URL, mockApi } from "../src/lib/mock.ts";
@@ -363,6 +364,33 @@ test("injectTerminalQueuedNow promotes existing queued_terminal bubble without d
     assert.equal(outgoing[0]!.state, "sent");
     const injectedSet = new Set((state.injectedTerminalByAgent[agent.key] ?? []).map((r) => r.text));
     assert.deepEqual(filterTerminalQueuedItems(["插队消息", "下一条"], [], [], injectedSet), ["下一条"]);
+  } finally {
+    mockApi.call = origCall;
+    settingsStore.set({ ...settingsStore.get(), server: prevServer });
+  }
+});
+
+test("sendPromptNow suppresses rapid duplicate submit within 800ms to prevent twin optimistic bubbles", async () => {
+  const prevServer = settingsStore.get().server;
+  const origCall = mockApi.call;
+  let sendCount = 0;
+  settingsStore.set({ ...settingsStore.get(), server: DEMO_URL });
+  mockApi.call = (async (_to: string, method: string) => {
+    if (method === "terminal.send") sendCount += 1;
+    return { ok: true };
+  }) as typeof mockApi.call;
+  try {
+    const agent = { key: "host1/hc:dup1", deviceId: "host1" };
+    const [ok1, ok2] = await Promise.all([
+      sendPromptNow(agent, "检查这个重复提交问题", []),
+      sendPromptNow(agent, "检查这个重复提交问题", []),
+    ]);
+    assert.equal(ok1, true);
+    assert.equal(ok2, true);
+    assert.equal(sendCount, 1);
+    const outgoing = chatQueueStore.get().outgoingByAgent[agent.key] ?? [];
+    assert.equal(outgoing.length, 1);
+    assert.equal(outgoing[0]!.text, "检查这个重复提交问题");
   } finally {
     mockApi.call = origCall;
     settingsStore.set({ ...settingsStore.get(), server: prevServer });

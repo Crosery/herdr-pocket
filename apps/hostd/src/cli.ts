@@ -17,7 +17,16 @@ import { UPDATE_HELP, currentRegion, updateCommand, versionCommand, watchForUpda
 import { CONFIG_HELP, configCommand } from "./configcmd.ts";
 import { readUpstreamCache, upstreamCheckEnabled, upstreamLine, watchUpstream } from "./upstream.ts";
 import { readHookConfig } from "./portal/shims.ts";
-import { getBrowserStatus, runBrowserAct, shutdownBrowserPluginCdp } from "./browserPlugin.ts";
+import { AI_BROWSER_SKILL_GUIDE } from "./aiBrowserEngine.ts";
+import {
+  getBrowserStatus,
+  runBrowserAct,
+  runBrowserDoctor,
+  runBrowserNet,
+  runBrowserScript,
+  shutdownBrowserPluginCdp,
+  usedStandaloneBrowserEngine,
+} from "./browserPlugin.ts";
 
 const HELP = `herdr-pocket ${HOSTD_VERSION} — put this computer's herdr agents in your pocket
 
@@ -50,16 +59,23 @@ Look and talk (works with any computer on the relay)
   send <device>/<agent> <text...>
   keys <device>/<agent> <key...>     e.g. enter, esc, up, ctrl+c, y
 
-Browser (optional AI Browser plugin, off by default via plugins.aiBrowser)
-  browser status|spaces [--json]
-  browser open <url> [--space <id>] [--page <label>] [--label <text>]
-  browser snapshot [--space <id>] [--page <label>] [--json]
-  browser click|dblclick|hover <@ref|selector> [--space <id>] [--label <text>]
-  browser fill|select <@ref|selector> <value> [--space <id>] [--label <text>]
-  browser press <key> [<@ref|selector>] [--space <id>]
-  browser scroll <deltaY> [--space <id>]
-  browser handoff [--reason <text>] [--space <id>]
-  browser resume|finish [--keep p1,p2] [--space <id>]
+Browser (cross-platform built-in Chromium CDP AI Browser; enable via plugins.aiBrowser)
+  browser skill|doctor|status [--json]
+  browser run [-e <code>] [--space <id>] [--timeout <ms>]   (reads stdin when -e omitted)
+  browser open|navigate <url> [--space <id>] [--page <label>] [--label <text>]
+  browser back|forward|reload [--space <id>] [--page <label>]
+  browser snapshot [--full-page] [--diff] [--subtree <@eN>] [--max-chars N]
+  browser click|dblclick|hover <@eN|text=...|css> [--space <id>] [--page <label>]
+  browser fill|type|select <target> <value> [--space <id>] [--page <label>]
+  browser press <key> [<target>] [--space <id>] [--page <label>]
+  browser scroll <deltaY> [<target>] [--space <id>]
+  browser wait [--kind url|selector|response|function|load|human|timeout] <value>
+  browser verify [--url ...] [--title ...] [--selector ...] [--text ...]
+  browser net list|body|wait|clear [--filter <pat>] [--type XHR,Fetch] [--limit N]
+  browser eval <js> | fetch <url> [--method POST] [--body ...] | cdp <Method> [json]
+  browser screenshot [absPath] [--full-page] | tabs list|open|switch|close [arg]
+  browser dialog accept|dismiss [text] | upload <target> <file1,file2>
+  browser handoff|takeover|resume|popout|finish [--keep p1,p2] [--reason <text>]
 
 <device> is a device name or id; <agent> is a local id such as t42.
 
@@ -667,6 +683,14 @@ function ago(ms: number): string {
   return `${Math.round(s / 86400)} d ago`;
 }
 
+async function readAllStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function browserCli(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -678,10 +702,57 @@ async function browserCli(argv: string[]): Promise<void> {
       reason: { type: "string" },
       keep: { type: "string" },
       json: { type: "boolean" },
+      e: { type: "string" },
+      eval: { type: "string" },
+      timeout: { type: "string" },
+      filter: { type: "string" },
+      type: { type: "string" },
+      limit: { type: "string" },
+      kind: { type: "string" },
+      status: { type: "string" },
+      "include-buffered": { type: "boolean" },
+      "include-body": { type: "boolean" },
+      "full-page": { type: "boolean" },
+      diff: { type: "boolean" },
+      subtree: { type: "string" },
+      "max-chars": { type: "string" },
+      url: { type: "string" },
+      title: { type: "string" },
+      selector: { type: "string" },
+      text: { type: "string" },
+      method: { type: "string" },
+      body: { type: "string" },
+      headers: { type: "string" },
+      "snapshot-id": { type: "string" },
     },
   });
-  const sub = positionals[0] || "status";
+  const subRaw = positionals[0] || "status";
+  const sub = subRaw === "goto" ? "navigate" : subRaw === "nodejs" ? "run" : subRaw;
+  const timeoutMs = values.timeout ? Number(values.timeout) : undefined;
+
   try {
+    if (sub === "skill" || sub === "guide" || sub === "help") {
+      console.log(AI_BROWSER_SKILL_GUIDE);
+      return;
+    }
+
+    if (sub === "doctor") {
+      const doc = await runBrowserDoctor();
+      if (values.json) {
+        console.log(JSON.stringify(doc, null, 2));
+        return;
+      }
+      console.log(`Platform:       ${doc.platform}`);
+      console.log(`Plugin enabled: ${doc.enabled ? "yes" : "no (herdr-pocket config set plugins.aiBrowser true)"}`);
+      console.log(`Resident hostd: ${doc.resident ? "connected" : "standalone"}`);
+      console.log(`Chromium:       ${doc.chromePath ?? "(not found)"}`);
+      console.log(`Headless shell: ${doc.headlessShell ? "yes (zero focus steal)" : "no (--headless=new)"}`);
+      console.log(`Headed popout:  ${doc.headedPath ?? "(not found)"}`);
+      console.log(`Active spaces:  ${doc.spacesCount}`);
+      console.log(`Summary:        ${doc.note}`);
+      return;
+    }
+
     if (sub === "status" || sub === "spaces") {
       const status = await getBrowserStatus();
       if (values.json) {
@@ -693,28 +764,127 @@ async function browserCli(argv: string[]): Promise<void> {
         console.log("Enable with: herdr-pocket config set plugins.aiBrowser true");
         return;
       }
-      console.log(`AI Browser plugin: enabled (${status.backend}), spaces=${status.spaces.length}`);
+      console.log(
+        `AI Browser plugin: enabled (${status.backend}${status.resident ? ", resident hostd" : ", standalone"}), spaces=${status.spaces.length}${status.chromePath ? `, chrome=${status.chromePath}` : ""}`,
+      );
       for (const sp of status.spaces) {
-        console.log(`- [${sp.id}] ${sp.name} (${sp.kind}, ownership=${sp.ownership})${sp.statusText ? ` · ${sp.statusText}` : ""}`);
+        console.log(
+          `- [${sp.id}] ${sp.name} (${sp.kind}, ownership=${sp.ownership}, net=${sp.networkCount ?? 0})${sp.statusText ? ` · ${sp.statusText}` : ""}`,
+        );
         for (const pg of sp.pages) {
-          console.log(`    ${pg.active ? "*" : " "} ${pg.label}: ${pg.title || "(untitled)"} — ${pg.url}`);
+          console.log(
+            `    ${pg.active ? "*" : " "} ${pg.label}: ${pg.title || "(untitled)"} — ${pg.url}${pg.networkCount ? ` [${pg.networkCount} req]` : ""}`,
+          );
         }
+      }
+      return;
+    }
+
+    if (sub === "run") {
+      const script =
+        values.e ??
+        values.eval ??
+        (positionals.length > 1 ? positionals.slice(1).join(" ") : !process.stdin.isTTY ? await readAllStdin() : "");
+      if (!script.trim()) {
+        fail("browser run requires `-e <code>` or script piped via stdin.");
+      }
+      const res = await runBrowserScript({
+        script,
+        spaceId: values.space,
+        ...(timeoutMs && Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+      });
+      if (values.json) {
+        console.log(JSON.stringify(res, null, 2));
+        if (!res.ok) process.exitCode = 1;
+        return;
+      }
+      if (res.stdout) console.log(res.stdout);
+      if (res.stderr) console.error(res.stderr);
+      if (!res.ok) {
+        fail(res.error || "browser run failed");
+      }
+      if (res.result !== undefined && !res.stdout) {
+        console.log(typeof res.result === "string" ? res.result : JSON.stringify(res.result, null, 2));
+      }
+      return;
+    }
+
+    if (sub === "net") {
+      const netAction = positionals[1] || "list";
+      if (netAction === "wait") {
+        const pattern = positionals[2] || values.filter || "";
+        const res = await runBrowserAct({
+          op: "net_wait",
+          spaceId: values.space,
+          page: values.page,
+          filter: pattern,
+          ...(timeoutMs && Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+          includeBuffered: values["include-buffered"] ?? true,
+          includeBody: values["include-body"] ?? true,
+          ...(values.status ? { expect: { status: Number(values.status) } } : {}),
+        });
+        console.log(JSON.stringify(values.json ? res : res.response ?? res, null, 2));
+        return;
+      }
+      if (netAction !== "list" && netAction !== "body" && netAction !== "clear") {
+        fail(`unknown browser net action: ${netAction} (expected list|body|wait|clear)`);
+      }
+      const res = await runBrowserNet({
+        spaceId: values.space,
+        page: values.page,
+        action: netAction,
+        ...(netAction === "body" ? { requestId: positionals[2] } : {}),
+        ...(values.filter ? { filter: values.filter } : positionals[2] && netAction === "list" ? { filter: positionals[2] } : {}),
+        ...(values.type ? { resourceTypes: values.type.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
+        ...(values.limit ? { limit: Number(values.limit) } : {}),
+      });
+      if (values.json || netAction === "body") {
+        console.log(JSON.stringify(values.json ? res : res.body ?? res, null, 2));
+        return;
+      }
+      if (netAction === "clear") {
+        console.log(`ok cleared network buffer for ${res.spaceId}/${res.page}`);
+        return;
+      }
+      const list = res.requests ?? [];
+      console.log(`Captured ${list.length}/${res.total ?? list.length} requests on ${res.spaceId}/${res.page}:`);
+      for (const r of list) {
+        console.log(
+          `  ${r.requestId}  ${(r.method || "GET").padEnd(6)} ${String(r.status ?? "...").padStart(3)}  ${(r.resourceType || "").padEnd(10)} ${r.durationMs !== undefined ? `${r.durationMs}ms`.padStart(6) : "     -"}  ${r.url}`,
+        );
       }
       return;
     }
 
     const opMap = new Set([
       "open",
+      "navigate",
+      "back",
+      "forward",
+      "reload",
       "snapshot",
       "click",
       "dblclick",
       "hover",
       "fill",
+      "type",
       "select",
       "press",
       "scroll",
+      "drag",
+      "upload",
+      "dialog",
+      "wait",
+      "verify",
+      "eval",
+      "fetch",
+      "cdp",
+      "screenshot",
+      "tabs",
       "handoff",
+      "takeover",
       "resume",
+      "popout",
       "finish",
     ]);
     if (!opMap.has(sub)) {
@@ -728,12 +898,22 @@ async function browserCli(argv: string[]): Promise<void> {
       label: values.label,
       reason: values.reason,
       keep: values.keep ? values.keep.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+      ...(timeoutMs && Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+      ...(values["snapshot-id"] ? { snapshotId: values["snapshot-id"] } : {}),
     };
-    if (op === "open") {
+    if (op === "open" || op === "navigate") {
       params.url = positionals[1] || "about:blank";
+    } else if (op === "snapshot") {
+      if (values["full-page"]) params.scope = "full_page";
+      if (values.diff) params.diff = true;
+      if (values.subtree) {
+        params.scope = "subtree";
+        params.root = values.subtree;
+      }
+      if (values["max-chars"]) params.maxChars = Number(values["max-chars"]);
     } else if (op === "click" || op === "dblclick" || op === "hover") {
       params.target = positionals[1];
-    } else if (op === "fill" || op === "select") {
+    } else if (op === "fill" || op === "type" || op === "select") {
       params.target = positionals[1];
       params.value = positionals[2] ?? "";
     } else if (op === "press") {
@@ -742,6 +922,55 @@ async function browserCli(argv: string[]): Promise<void> {
     } else if (op === "scroll") {
       const n = Number(positionals[1] ?? "420");
       params.deltaY = Number.isFinite(n) ? n : 420;
+      if (positionals[2]) params.target = positionals[2];
+    } else if (op === "drag") {
+      params.x = Number(positionals[1]);
+      params.y = Number(positionals[2]);
+      params.toX = Number(positionals[3]);
+      params.toY = Number(positionals[4]);
+    } else if (op === "upload") {
+      params.target = positionals[1];
+      params.files = (positionals[2] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    } else if (op === "dialog") {
+      params.accept = positionals[1] !== "dismiss";
+      if (positionals[2]) params.promptText = positionals[2];
+    } else if (op === "wait") {
+      params.waitKind = (values.kind as typeof params.waitKind) || "load";
+      params.value = positionals[1];
+      if (values.filter) params.filter = values.filter;
+      if (values["include-buffered"]) params.includeBuffered = true;
+      if (values["include-body"]) params.includeBody = true;
+      if (values.status) params.expect = { status: Number(values.status) };
+    } else if (op === "verify") {
+      params.expect = {
+        ...(values.url ? { urlIncludes: values.url } : {}),
+        ...(values.title ? { titleIncludes: values.title } : {}),
+        ...(values.selector ? { selector: values.selector } : {}),
+        ...(values.text ? { textIncludes: values.text } : {}),
+      };
+    } else if (op === "eval") {
+      params.expression = positionals.slice(1).join(" ");
+    } else if (op === "fetch") {
+      params.url = positionals[1];
+      if (values.method) params.method = values.method;
+      if (values.body) params.body = values.body;
+      if (values.headers) params.headers = JSON.parse(values.headers) as Record<string, string>;
+    } else if (op === "cdp") {
+      params.cdpMethod = positionals[1];
+      if (positionals[2]) params.cdpParams = JSON.parse(positionals[2]) as Record<string, unknown>;
+    } else if (op === "screenshot") {
+      if (positionals[1]) params.path = positionals[1];
+      if (values["full-page"]) params.fullPage = true;
+    } else if (op === "tabs") {
+      const ta = positionals[1] || "list";
+      if (ta !== "list" && ta !== "open" && ta !== "switch" && ta !== "close") {
+        fail(`unknown tabs action: ${ta} (expected list|open|switch|close)`);
+      }
+      params.tabAction = ta;
+      if (ta === "open") params.url = positionals[2] || "about:blank";
+      else if (positionals[2]) params.page = positionals[2];
+    } else if (op === "popout") {
+      if (positionals[1]) params.url = positionals[1];
     }
 
     const res = await runBrowserAct(params);
@@ -753,11 +982,31 @@ async function browserCli(argv: string[]): Promise<void> {
       console.log(res.snapshot);
       return;
     }
+    if (res.value !== undefined && (op === "eval" || op === "cdp")) {
+      console.log(typeof res.value === "string" ? res.value : JSON.stringify(res.value, null, 2));
+      return;
+    }
+    if (res.response) {
+      console.log(JSON.stringify(res.response, null, 2));
+      return;
+    }
+    if (res.tabs && op === "tabs") {
+      for (const t of res.tabs) {
+        console.log(`${t.active ? "*" : " "} ${t.label}: ${t.title || "(untitled)"} — ${t.url}`);
+      }
+      return;
+    }
+    if (res.screenshotPath) {
+      console.log(`saved screenshot: ${res.screenshotPath}`);
+      return;
+    }
     console.log(
       `${res.ok ? "ok" : "paused"} space=${res.spaceId} page=${res.page} ownership=${res.ownership}${res.url ? ` url=${res.url}` : ""}${res.note ? ` · ${res.note}` : ""}`,
     );
   } finally {
-    await shutdownBrowserPluginCdp();
+    if (usedStandaloneBrowserEngine()) {
+      await shutdownBrowserPluginCdp();
+    }
   }
 }
 

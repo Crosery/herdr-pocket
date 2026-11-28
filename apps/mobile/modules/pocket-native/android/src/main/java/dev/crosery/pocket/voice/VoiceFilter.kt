@@ -1,6 +1,10 @@
 package dev.crosery.pocket.voice
 
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.log10
 
 /**
  * Abstraction over the ONNX models so [VoiceFilter] runs identically on real ONNX sessions and in
@@ -80,12 +84,17 @@ internal class ModelsBackend(
 }
 
 /**
- * Streaming call voice pipeline:
- * 1. `HighPass64` cleans DC/wind rumble once at input.
- * 2. Parallel clean HPF path feeds `Silero VAD v4` + `ERes2NetV2-zh` multi-prototype SV (never denoised/TSE audio).
- * 3. VoxLock emits the enrolled speaker's estimated waveform, not the verified input mixture.
- * 4. DPDFNet can clean the extracted waveform; do not boost quiet residual voices in owner-only mode.
- * 5. On extraction failure, owner-only mode emits silence at the same cadence instead of the mixture.
+ * Streaming call voice pipeline (Stage 1/2 parity with desktop `LiveCallProcessor`):
+ * 1. `HighPass64` cleans DC/wind rumble once at input (retained as clean fallback when neural stages are off).
+ * 2. `DPDFNet-baseline` denoise runs FIRST so stationary noise is stripped before TSE and SV.
+ * 3. `VoxLock` v2 TSE target extraction runs BEFORE VAD/SV so overlapping speech is separated first.
+ * 4. `Silero VAD v4` + `ERes2NetV2-zh` multi-prototype SV evaluate the TSE-separated stream
+ *    (or DPDFNet-denoised stream when TSE is off/bypassed; HPF fallback when neither runs).
+ * 5. Residual suppression gate updates BEFORE `VocalEnhancer` using hysteresis (`-2.5 dB` close / `-1.2 dB` open,
+ *    2-frame release hold) decoupled from the old `-9.0 dB` deadlock via strong/consecutive non-owner SV margins.
+ * 6. `VocalEnhancer` boosts strictly owner-verified active speech (`allowVocalBoost`).
+ * 7. Smooth 16 ms raised-cosine residual gate + per-sample onset attenuation (16 ms release, 6 ms attack on owner confirm).
+ * 8. On extraction failure with no SV, owner-only mode emits silence at the same cadence instead of the mixture.
  */
 class VoiceFilter internal constructor(
   internal val backend: VoiceBackend,
@@ -140,6 +149,7 @@ class VoiceFilter internal constructor(
     val requireIsolation: Boolean = enrolled != null,
     val lockFirstSpeaker: Boolean = false,
     val route: String = "speaker",
+    val enhanceVocal: Boolean = denoise,
   )
 
   data class UtteranceTelemetry(
@@ -163,7 +173,6 @@ class VoiceFilter internal constructor(
     val gen: Int,
     val job: Int,
     val kind: String,
-    val sv: SvScore,
     val embNorm: FloatArray?,
     val cleanAudio: FloatArray?,
     val usedSamples: Int,
@@ -174,23 +183,39 @@ class VoiceFilter internal constructor(
     val gen: Int,
     val kFrames: Int,
     val frames: FloatArray,
-    val rawRms: Float,
     val ms: Double,
   )
 
   companion object {
     const val HOP = Denoiser.HOP // 160 samples = 10 ms
-    private const val START_PROB = 0.45f
-    private const val SPEECH_PROB = 0.35f
-    private const val START_WINDOWS = 2 // 64 ms
-    private const val END_WINDOWS = 14 // 448 ms
-    private const val EARLY_SPEECH_SAMPLES = 7_680 // 480 ms
-    private const val RECHECK_STEP_SAMPLES = 7_680 // 480 ms
-    private const val SHORT_END_MIN_SAMPLES = 4_096 // 256 ms
-    private const val EARLY_WINDOW_SAMPLES = 12_800 // 800 ms
-    private const val RECHECK_WINDOW_SAMPLES = 20_480 // 1280 ms
-    private const val CLEAN_RING_CAP = 32_000 // 2.0 s
-    private const val SESS_MIN_SAMPLES = 14_400 // 900 ms
+    internal const val START_PROB = 0.45f
+    internal const val SPEECH_PROB = 0.35f
+    internal const val START_WINDOWS = 3 // 96 ms
+    internal const val END_WINDOWS = 12 // 384 ms
+    internal const val EARLY_VOICED_W = 8 // 256 ms (tightened from 13)
+    internal const val FULL_VOICED_W = 22 // 704 ms (tightened from 26)
+    internal const val RECHECK_STEP_W = 16 // 512 ms (tightened from 20)
+    internal const val MIN_END_VOICED_W = 8 // 256 ms
+    private const val EARLY_WINDOW_SAMPLES = VOICE_RATE * 3 / 5 // 9_600 (600 ms)
+    internal const val RECHECK_WINDOW_SAMPLES = VOICE_RATE // 16_000 (1.0 s for faster speaker handoff)
+    private const val MIN_SV_SAMPLES = VOICE_RATE / 5 // 3_200 (200 ms)
+    private const val CLEAN_RING_CAP = VOICE_RATE * 3 / 2 // 24_000 (1.5 s)
+    private const val SESS_MIN_SAMPLES = VOICE_RATE * 3 / 5 // 9_600 (600 ms)
+
+    // Residual gate hysteresis & strong non-owner SV margin (matching desktop Stage 1).
+    internal const val STRONG_NON_OWNER_MARGIN = 0.06f
+    internal const val TSE_GATE_CLOSE_DB = -2.5f
+    internal const val TSE_GATE_OPEN_DB = -1.2f
+    internal const val GATE_RELEASE_HOLD_FRAMES = 2
+    internal const val RAMP_SAMPLES = 256 // 16 ms raised-cosine residual gate
+
+    // Per-sample unverified onset attenuation (16 ms smooth release, fast 6 ms attack on owner confirm).
+    internal const val ONSET_SV_UNCERTAIN_GAIN = 0.45f
+    internal const val ONSET_TSE_UNCERTAIN_GAIN = 0.78f
+    internal const val ONSET_TSE_ATTEN_GAIN = 0.25f
+    internal const val ONSET_ATTACK_SAMPLES = 96f // 6 ms
+    internal const val ONSET_RELEASE_SAMPLES = 256f // 16 ms
+
     // Capture delivers 20 ms packets. Budget for the first full chunk and jittered mobile CPU scheduling.
     private const val TSE_PREBUFFER_HOPS = 16
     private const val TSE_RECOVERY_PREBUFFER_HOPS = 20
@@ -198,7 +223,6 @@ class VoiceFilter internal constructor(
     private const val TSE_K5_BUDGET_MS = 38.0
     private const val TSE_K8_BUDGET_MS = 60.0
     private const val TSE_MAX_BACKLOG_SAMPLES = 3_840 // 240 ms
-    private const val TSE_NON_OWNER_ATTEN_DB = -9.0f
     private const val SEND_MAX = 3200
   }
 
@@ -207,21 +231,21 @@ class VoiceFilter internal constructor(
   private val enrolledNorm = o.enrolled?.let { normalizeEmbedding(it) }
   private val prototypesNorm = o.prototypes?.map { normalizeEmbedding(it) }
 
-  private val hpf = if (o.denoise || svEnabled || tseEnabled) HighPass64() else null
+  private val hpf = if (o.denoise || o.enhanceVocal || svEnabled || tseEnabled) HighPass64() else null
   private val vadBoost = if (svEnabled || tseEnabled) QuietVadBoost() else null
-  private val enhancer = if (o.denoise && !o.requireIsolation && !o.lockFirstSpeaker) VocalEnhancer() else null
-  private val gainRamp = CosineRamp(rampSamples = 256) // 16 ms cosine ramp
+  internal val enhancer = if (o.enhanceVocal) VocalEnhancer() else null
 
   // Per-hop working buffers (single-threaded on mic thread).
   private val inBuf = FloatArray(HOP)
   private var inLen = 0
   private val hpfBuf = FloatArray(HOP)
-  private val stageIn = FloatArray(HOP)
   private val denBuf = FloatArray(HOP)
+  private val stageIn = FloatArray(HOP)
+  private val tsePreBuf = FloatArray(HOP)
   private val enhBuf = FloatArray(HOP)
   private val silentHop = FloatArray(HOP)
 
-  // Clean HPF path for Silero VAD + ERes2NetV2-zh.
+  // VAD + ERes2NetV2-zh ring fed from TSE-separated (or DPDFNet-denoised, or HPF fallback) stream.
   private val cleanVadFifo = FloatArray(Vad.WINDOW + HOP * 2)
   private var cleanVadLen = 0
   private val cleanWin512 = FloatArray(Vad.WINDOW)
@@ -229,12 +253,18 @@ class VoiceFilter internal constructor(
   private val cleanVoicedRing = FloatArray(CLEAN_RING_CAP)
   private var cleanVoicedLen = 0
 
-  // VoxLock streaming rings & state (single-threaded on mic thread except ONNX run).
+  // VoxLock streaming rings & sample-aligned pre-TSE reference ring (single-threaded on mic thread except ONNX run).
   private val voxStreamer = VoxLockStreamer()
   private val tseSynthScratch = FloatArray(VoxLockStreamer.MAX_K * VoxLockStreamer.HOP)
   private var tseOutRing = FloatArray(VOICE_RATE)
   private var tseOutRead = 0
   private var tseOutLen = 0
+  private var tsePreRing = FloatArray(VOICE_RATE)
+  private var tsePreRead = 0
+  private var tsePreLen = 0
+  private var tsePendingPre = FloatArray(VOICE_RATE)
+  private var tsePendingPreRead = 0
+  private var tsePendingPreLen = 0
   private val tseResults = ConcurrentLinkedQueue<TseRawResult>()
   @Volatile private var tseJobInFlight = false
   private var slowTseStreak = 0
@@ -250,19 +280,30 @@ class VoiceFilter internal constructor(
   var tseBypassed = false
     private set
 
-  // Utterance & SV state.
+  // Utterance, SV tracker & residual/onset gate state.
   private var resetGen = 0
-  private var speaking = false
+  internal var speaking = false
   private var startRun = 0
   private var silRun = 0
-  private var uttVoicedSamples = 0
-  private var sinceLastSvSamples = 0
+  private var uttVoicedW = 0
+  private var sinceCheckW = 0
   private var earlyChecked = false
+  private var fullChecked = false
   private var svJobSeq = 0
   private var svJobId = 0
-  private var svConfirmedNonOwner = false
+  internal var svConfirmedNonOwner = false
+  internal var svConfirmedOwner = false
+  internal var lastSvScore: Float? = null
+  internal var nonOwnerStreak = 0
   private var sessionEmb: FloatArray? = null
   private val svResults = ConcurrentLinkedQueue<SvResult>()
+
+  internal var smoothedTseAttenDb = 0f
+  internal var suppressingResidual = false
+  internal var gateReleaseHold = 0
+  private var gatePhase = RAMP_SAMPLES
+  private var lastResidualGain = 1.0f
+  internal var onsetGain = 1.0f
 
   // Auto-backfill `owner_sample.pcm` for enrolled users missing local PCM sample.
   private val captureOwnerBuf = if (o.captureMissingSample && svEnabled) FloatArray(VoiceModelManager.OWNER_SAMPLE_SAMPLES) else null
@@ -312,9 +353,14 @@ class VoiceFilter internal constructor(
   private fun primeTsePrebuffer() {
     tseOutRead = 0
     tseOutLen = 0
+    tsePreRead = 0
+    tsePreLen = 0
+    tsePendingPreRead = 0
+    tsePendingPreLen = 0
     if (tseEnabled && !tseBypassed) {
       val hops = if (tseK == VoxLockStreamer.DEFAULT_K) TSE_PREBUFFER_HOPS else TSE_RECOVERY_PREBUFFER_HOPS
       appendTseOutZeros(hops * HOP)
+      appendTsePreZeros(hops * HOP)
     }
   }
 
@@ -342,7 +388,53 @@ class VoiceFilter internal constructor(
     }
   }
 
-  private fun popTseOut(dst: FloatArray) {
+  private fun appendTsePreZeros(count: Int) {
+    if (count <= 0) return
+    ensureTsePreCapacity(count)
+    tsePreRing.fill(0f, tsePreRead + tsePreLen, tsePreRead + tsePreLen + count)
+    tsePreLen += count
+  }
+
+  private fun ensureTsePreCapacity(extra: Int) {
+    if (tsePreRead > 0 && tsePreRead + tsePreLen + extra > tsePreRing.size) {
+      System.arraycopy(tsePreRing, tsePreRead, tsePreRing, 0, tsePreLen)
+      tsePreRead = 0
+    }
+    if (tsePreLen + extra > tsePreRing.size) {
+      tsePreRing = tsePreRing.copyOf(maxOf(tsePreRing.size * 2, tsePreLen + extra))
+    }
+  }
+
+  private fun pushTsePendingPre(src: FloatArray, off: Int, count: Int) {
+    if (count <= 0) return
+    if (tsePendingPreRead > 0 && tsePendingPreRead + tsePendingPreLen + count > tsePendingPre.size) {
+      System.arraycopy(tsePendingPre, tsePendingPreRead, tsePendingPre, 0, tsePendingPreLen)
+      tsePendingPreRead = 0
+    }
+    if (tsePendingPreLen + count > tsePendingPre.size) {
+      tsePendingPre = tsePendingPre.copyOf(maxOf(tsePendingPre.size * 2, tsePendingPreLen + count))
+    }
+    System.arraycopy(src, off, tsePendingPre, tsePendingPreRead + tsePendingPreLen, count)
+    tsePendingPreLen += count
+  }
+
+  private fun transferPendingPreToTsePre(count: Int) {
+    if (count <= 0) return
+    ensureTsePreCapacity(count)
+    val take = minOf(count, tsePendingPreLen)
+    if (take > 0) {
+      System.arraycopy(tsePendingPre, tsePendingPreRead, tsePreRing, tsePreRead + tsePreLen, take)
+      tsePendingPreRead += take
+      tsePendingPreLen -= take
+      if (tsePendingPreLen == 0) tsePendingPreRead = 0
+    }
+    if (take < count) {
+      tsePreRing.fill(0f, tsePreRead + tsePreLen + take, tsePreRead + tsePreLen + count)
+    }
+    tsePreLen += count
+  }
+
+  private fun popTseOut(dst: FloatArray, preDst: FloatArray) {
     val take = minOf(HOP, tseOutLen)
     if (take > 0) {
       System.arraycopy(tseOutRing, tseOutRead, dst, 0, take)
@@ -350,12 +442,67 @@ class VoiceFilter internal constructor(
       tseOutLen -= take
       if (tseOutLen == 0) tseOutRead = 0
     }
+    val preTake = minOf(take, tsePreLen)
+    if (preTake > 0) {
+      System.arraycopy(tsePreRing, tsePreRead, preDst, 0, preTake)
+      tsePreRead += preTake
+      tsePreLen -= preTake
+      if (tsePreLen == 0) tsePreRead = 0
+    }
+    if (preTake < HOP) preDst.fill(0f, preTake, HOP)
     if (take < HOP) {
       dst.fill(0f, take, HOP)
       tseOverruns++
       if (tseChunks > 0 && tseOverruns >= 8 && !tseBypassed) {
         suspendTse("bypass_overrun", 0.0, retry = false)
       }
+    }
+  }
+
+  internal fun hasIdentityReference(): Boolean = enrolledNorm != null || sessionEmb != null
+
+  internal fun resetUtteranceSv() {
+    svConfirmedNonOwner = false
+    svConfirmedOwner = false
+    lastSvScore = null
+    nonOwnerStreak = 0
+  }
+
+  private fun effectiveThreshold(usedTse: Boolean = isTseActive): Float {
+    val speakerMargin = if (o.route == "speaker" && !usedTse) 0.05f else 0f
+    return maxOf(0.24f, o.threshold - speakerMargin)
+  }
+
+  internal fun hasStrongNonOwnerMargin(usedTse: Boolean = isTseActive): Boolean {
+    if (!svConfirmedNonOwner) return false
+    val th = effectiveThreshold(usedTse)
+    val sc = lastSvScore
+    return (sc != null && sc < th - STRONG_NON_OWNER_MARGIN) || nonOwnerStreak >= 2
+  }
+
+  internal fun allowVocalBoost(): Boolean {
+    if (!svEnabled) return !o.requireIsolation
+    if (suppressingResidual || svConfirmedNonOwner) return false
+    // Only boost speech confirmed as the owner (or while acquiring the very first
+    // speaker in first-speaker lock mode before any identity reference exists).
+    return svConfirmedOwner || !hasIdentityReference()
+  }
+
+  internal fun targetOnsetGain(usedTse: Boolean): Float {
+    if (!svEnabled || !hasIdentityReference()) return 1.0f
+    if (suppressingResidual) {
+      // Residual gate owns the smooth raised-cosine fade to 0.0; hold onsetGain
+      // steady so sample 0 of suppression stays continuous with the previous hop.
+      return onsetGain
+    }
+    if (svConfirmedOwner) return 1.0f
+    // Unverified onset / pre-roll before SV confirms owner: apply gentle attenuation
+    // (stronger if VoxLock TSE already reports non-target attenuation) and snap back
+    // with fast 6 ms attack as soon as owner is confirmed.
+    return if (usedTse) {
+      if (smoothedTseAttenDb < TSE_GATE_CLOSE_DB) ONSET_TSE_ATTEN_GAIN else ONSET_TSE_UNCERTAIN_GAIN
+    } else {
+      ONSET_SV_UNCERTAIN_GAIN
     }
   }
 
@@ -366,7 +513,6 @@ class VoiceFilter internal constructor(
     hpf?.reset()
     vadBoost?.reset()
     enhancer?.reset()
-    gainRamp.reset(1f)
     inLen = 0
     cleanVadLen = 0
     cleanVoicedLen = 0
@@ -379,12 +525,20 @@ class VoiceFilter internal constructor(
     speaking = false
     startRun = 0
     silRun = 0
-    uttVoicedSamples = 0
-    sinceLastSvSamples = 0
+    uttVoicedW = 0
+    sinceCheckW = 0
     earlyChecked = false
+    fullChecked = false
     svJobId = 0
-    svConfirmedNonOwner = false
+    resetUtteranceSv()
     svResults.clear()
+    smoothedTseAttenDb = 0f
+    lastTseAttenDb = 0f
+    suppressingResidual = false
+    gateReleaseHold = 0
+    gatePhase = RAMP_SAMPLES
+    lastResidualGain = 1.0f
+    onsetGain = 1.0f
   }
 
   /** Pushes `bytes` of 16 kHz mono PCM16 LE and immediately emits continuous processed PCM16 LE. */
@@ -408,19 +562,72 @@ class VoiceFilter internal constructor(
     hopsIn++
     val rawHopRms = rmsFloat(inBuf, 0, HOP)
 
-    // 1. Clean HPF stage.
+    // Drain any completed SV verdicts before processing.
+    drainSvResults()
+
+    // Keep clean HPF64 as fallback SV/VAD path when both neural denoise and TSE are off/bypassed.
     if (hpf != null) {
       hpf.process(inBuf, 0, hpfBuf, 0, HOP)
     } else {
       System.arraycopy(inBuf, 0, hpfBuf, 0, HOP)
     }
 
-    // 2. Drain any completed SV verdicts before processing VAD/gating.
-    drainSvResults()
+    // Stage 1: Run DPDFNet denoise FIRST so background noise is stripped before VoxLock TSE and SV.
+    var usedDpdf = false
+    if (o.denoise) {
+      val t0 = System.nanoTime()
+      usedDpdf = backend.denoise(hpfBuf, 0, denBuf, 0)
+      val ns = System.nanoTime() - t0
+      denoiseNs += ns
+      if (ns > denoiseMaxNs) denoiseMaxNs = ns
+      if (!usedDpdf) System.arraycopy(hpfBuf, 0, denBuf, 0, HOP)
+    } else {
+      System.arraycopy(hpfBuf, 0, denBuf, 0, HOP)
+    }
 
-    // 3. Clean HPF path -> Silero VAD + ERes2NetV2-zh (never denoised or TSE-processed).
+    // Stage 2: Run VoxLock TSE target extraction BEFORE VAD + ERes2NetV2 SV so overlapping
+    // speech is separated into the target stream before speaker verification scores it.
+    maybeRetryTse()
+    if (tseEnabled && !tseBypassed) {
+      drainTseResults()
+      if (!tseBypassed) {
+        voxStreamer.pushInput(denBuf, 0, HOP)
+        pushTsePendingPre(denBuf, 0, HOP)
+        if (voxStreamer.bufferedInputSamples > TSE_MAX_BACKLOG_SAMPLES && tseJobInFlight) {
+          suspendTse("bypass_backlog", voxStreamer.bufferedInputSamples * 1000.0 / VOICE_RATE, retry = true)
+        }
+        dispatchTseIfReady()
+        drainTseResults()
+      }
+    }
+    val usedTse = isTseActive
+    if (usedTse) {
+      popTseOut(stageIn, tsePreBuf)
+    } else {
+      lastRawDbfs = rmsToDbfs(rawHopRms)
+      if (o.requireIsolation && !svEnabled) {
+        lastTseDbfs = -90f
+        lastEnhDbfs = -90f
+        smoothedTseAttenDb = 0f
+        lastTseAttenDb = attenDb(0f, rawHopRms)
+        if (speaking) {
+          voicedOutHops++
+          gatedOutHops++
+        }
+        sendHop(silentHop)
+        return
+      }
+      System.arraycopy(denBuf, 0, stageIn, 0, HOP)
+      lastTseDbfs = rmsToDbfs(rmsFloat(stageIn, 0, HOP))
+      smoothedTseAttenDb = 0f
+      lastTseAttenDb = 0f
+    }
+
+    // Stage 3: Feed the TSE-separated stream (or DPDFNet-denoised stream when TSE is off/bypassed,
+    // falling back to clean HPF64 when neither ran) into Silero VAD + ERes2NetV2 SV.
     if (svEnabled || tseEnabled) {
-      System.arraycopy(hpfBuf, 0, cleanVadFifo, cleanVadLen, HOP)
+      val svInput = if (usedTse || usedDpdf) stageIn else hpfBuf
+      System.arraycopy(svInput, 0, cleanVadFifo, cleanVadLen, HOP)
       cleanVadLen += HOP
       while (cleanVadLen >= Vad.WINDOW) {
         System.arraycopy(cleanVadFifo, 0, cleanWin512, 0, Vad.WINDOW)
@@ -432,72 +639,118 @@ class VoiceFilter internal constructor(
       drainSvResults()
     }
 
-    // 4. Only the extractor can populate the owner-only uplink.
-    maybeRetryTse()
-    if (tseEnabled && !tseBypassed) {
-      drainTseResults()
-      if (!tseBypassed) {
-        voxStreamer.pushInput(hpfBuf, 0, HOP)
-        if (voxStreamer.bufferedInputSamples > TSE_MAX_BACKLOG_SAMPLES && tseJobInFlight) {
-          suspendTse("bypass_backlog", voxStreamer.bufferedInputSamples * 1000.0 / VOICE_RATE, retry = true)
-        }
-        dispatchTseIfReady()
-        drainTseResults()
+    if (usedTse) {
+      val rawRms = rmsFloat(tsePreBuf, 0, HOP)
+      val tseRms = rmsFloat(stageIn, 0, HOP)
+      if (rawRms > 0f || tseRms > 0f) {
+        lastRawDbfs = rmsToDbfs(rawRms)
+        lastTseDbfs = rmsToDbfs(tseRms)
       }
-    }
-    if (isTseActive) {
-      popTseOut(stageIn)
+      if (rawRms > 0.012f && (lastVadProb >= SPEECH_PROB || (rawRms > 0.025f && tseRms < rawRms * 0.5f))) {
+        val hopAtten = (20.0 * log10(maxOf(tseRms.toDouble(), 1e-5) / maxOf(rawRms.toDouble(), 1e-5))).toFloat()
+        smoothedTseAttenDb = 0.78f * smoothedTseAttenDb + 0.22f * hopAtten
+      }
+      lastTseAttenDb = smoothedTseAttenDb
     } else {
-      lastRawDbfs = rmsToDbfs(rawHopRms)
-      if (o.requireIsolation && !svEnabled) {
-        lastTseDbfs = -90f
-        lastEnhDbfs = -90f
-        lastTseAttenDb = attenDb(0f, rawHopRms)
-        if (speaking) {
-          voicedOutHops++
-          gatedOutHops++
-        }
-        sendHop(silentHop)
-        return
-      }
-      System.arraycopy(hpfBuf, 0, stageIn, 0, HOP)
-      lastTseDbfs = lastRawDbfs
+      smoothedTseAttenDb = 0f
       lastTseAttenDb = 0f
     }
 
-    // 5. Streaming Speech Enhancement (`DPDFNet-baseline`) + `VocalEnhancer`.
-    if (o.denoise) {
-      val t0 = System.nanoTime()
-      backend.denoise(stageIn, 0, denBuf, 0)
-      val ns = System.nanoTime() - t0
-      denoiseNs += ns
-      if (ns > denoiseMaxNs) denoiseMaxNs = ns
-      if (enhancer != null) enhancer.process(denBuf, enhBuf, HOP)
-      else System.arraycopy(denBuf, 0, enhBuf, 0, HOP)
+    // Stage 4: Update residual suppression gate BEFORE vocal enhancement so unverified or
+    // confirmed non-owner frames are never boosted by the presence enhancer.
+    updateResidualGate(usedTse)
+
+    // Stage 5: Owner-gated VocalEnhancer.
+    if (enhancer != null) {
+      val speechActive = if (svEnabled || tseEnabled) lastVadProb >= SPEECH_PROB else true
+      val allowBoost = speechActive && allowVocalBoost()
+      enhancer.process(stageIn, enhBuf, HOP, allowBoost = allowBoost)
     } else {
       System.arraycopy(stageIn, 0, enhBuf, 0, HOP)
     }
     lastEnhDbfs = rmsToDbfs(rmsFloat(enhBuf, 0, HOP))
 
-    // 6. Smooth 16 ms cosine residual gate ONLY on confirmed non-owner speech (or any speech when TSE is bypassed).
-    val muteResidual = if (svEnabled) {
-      if (isTseActive) {
-        speaking && svConfirmedNonOwner && lastTseAttenDb < TSE_NON_OWNER_ATTEN_DB
-      } else {
-        speaking && svConfirmedNonOwner
-      }
-    } else {
-      false
-    }
-    gainRamp.setTarget(if (muteResidual) 0f else 1f)
-    gainRamp.applyInPlace(enhBuf, 0, HOP)
+    // Stage 6: Smooth 16 ms raised-cosine residual gate + per-sample onset attenuation.
+    applyResidualGate(enhBuf, 0, HOP, usedTse)
 
     if (speaking) {
       voicedOutHops++
-      if (gainRamp.currentGain < 0.15f) gatedOutHops++
+      if (lastResidualGain < 0.15f) gatedOutHops++
     }
 
     sendHop(enhBuf)
+  }
+
+  internal fun updateResidualGate(usedTse: Boolean) {
+    if (!svEnabled) {
+      suppressingResidual = false
+      gateReleaseHold = 0
+      return
+    }
+    if (!speaking || !svConfirmedNonOwner) {
+      suppressingResidual = false
+      gateReleaseHold = 0
+      return
+    }
+    if (usedTse) {
+      // Decouple the old `-9.0 dB` AND deadlock:
+      // SV now scores the TSE-separated target stream, so confirmed non-owner closes
+      // the residual gate on moderate TSE attenuation (`< -2.5 dB`) OR a clear low-cosine
+      // / consecutive non-owner SV verdict, while keeping hysteresis + release hold to
+      // avoid chatter and a dual-talk safety margin for single borderline scores when
+      // TSE is not attenuating.
+      val strongSvReject = hasStrongNonOwnerMargin(usedTse = true)
+      if (suppressingResidual) {
+        val wantOpen = !strongSvReject && smoothedTseAttenDb >= TSE_GATE_OPEN_DB
+        if (wantOpen) {
+          gateReleaseHold++
+          if (gateReleaseHold >= GATE_RELEASE_HOLD_FRAMES) {
+            suppressingResidual = false
+            gateReleaseHold = 0
+          }
+        } else {
+          gateReleaseHold = 0
+        }
+      } else if (strongSvReject || smoothedTseAttenDb < TSE_GATE_CLOSE_DB) {
+        suppressingResidual = true
+        gateReleaseHold = 0
+      }
+    } else {
+      suppressingResidual = true
+      gateReleaseHold = 0
+    }
+  }
+
+  private fun applyResidualGate(buf: FloatArray, off: Int, len: Int, usedTse: Boolean) {
+    val targetOnset = targetOnsetGain(usedTse)
+    val onsetActive = abs(onsetGain - 1.0f) > 1e-4f || abs(targetOnset - 1.0f) > 1e-4f
+    if (!suppressingResidual && gatePhase >= RAMP_SAMPLES && !onsetActive) {
+      onsetGain = 1.0f
+      lastResidualGain = 1.0f
+      return
+    }
+    val attackStep = 1.0f / ONSET_ATTACK_SAMPLES
+    val releaseStep = 1.0f / ONSET_RELEASE_SAMPLES
+    var residualGain = lastResidualGain
+    for (i in 0 until len) {
+      if (suppressingResidual) {
+        if (gatePhase > 0) gatePhase--
+      } else if (gatePhase < RAMP_SAMPLES) {
+        gatePhase++
+      }
+      residualGain = when {
+        gatePhase >= RAMP_SAMPLES -> 1.0f
+        gatePhase == 0 -> 0.0f
+        else -> (0.5 - 0.5 * cos(PI * gatePhase / RAMP_SAMPLES)).toFloat()
+      }
+      if (onsetGain < targetOnset) {
+        onsetGain = minOf(onsetGain + attackStep, targetOnset)
+      } else if (onsetGain > targetOnset) {
+        onsetGain = maxOf(onsetGain - releaseStep, targetOnset)
+      }
+      buf[off + i] *= residualGain * onsetGain
+    }
+    lastResidualGain = residualGain
   }
 
   private fun onCleanVadWindow() {
@@ -505,47 +758,71 @@ class VoiceFilter internal constructor(
     val p = backend.vadProb(vadProbe512, 0)
     lastVadProb = p
     vadWindowsTotal++
-    if (p >= SPEECH_PROB) vadSpeechWindows++
+    val isVoiced = p >= SPEECH_PROB
+    if (isVoiced) {
+      vadSpeechWindows++
+      appendCleanVoiced(cleanWin512)
+    }
 
+    var justEnded = false
     if (!speaking) {
       startRun = if (p >= START_PROB) startRun + 1 else 0
       if (startRun >= START_WINDOWS) {
         speaking = true
         silRun = 0
-        uttVoicedSamples = 0
-        sinceLastSvSamples = 0
+        uttVoicedW = if (isVoiced) 1 else 0
+        sinceCheckW = 0
         earlyChecked = false
-        svConfirmedNonOwner = false
+        fullChecked = false
+        gateReleaseHold = 0
+        resetUtteranceSv()
       }
+    } else if (isVoiced) {
+      silRun = 0
+      uttVoicedW++
+      sinceCheckW++
     } else {
-      silRun = if (p < SPEECH_PROB) silRun + 1 else 0
+      silRun++
       if (silRun >= END_WINDOWS) {
         speaking = false
         startRun = 0
-        svConfirmedNonOwner = false
-        if (svEnabled && svJobId == 0 && !earlyChecked && uttVoicedSamples >= SHORT_END_MIN_SAMPLES) {
-          launchSvCheck("end", minOf(cleanVoicedLen, uttVoicedSamples))
-        }
-        cleanVoicedLen = 0
-        uttVoicedSamples = 0
-        sinceLastSvSamples = 0
-        earlyChecked = false
-        return
+        justEnded = true
       }
     }
 
-    if (p >= SPEECH_PROB) {
-      appendCleanVoiced(cleanWin512)
-      uttVoicedSamples += Vad.WINDOW
-      sinceLastSvSamples += Vad.WINDOW
-      if (svEnabled && svJobId == 0) {
-        if (!earlyChecked && uttVoicedSamples >= EARLY_SPEECH_SAMPLES) {
-          earlyChecked = true
-          launchSvCheck("early", minOf(cleanVoicedLen, EARLY_WINDOW_SAMPLES))
-        } else if (earlyChecked && sinceLastSvSamples >= RECHECK_STEP_SAMPLES) {
-          launchSvCheck("recheck", minOf(cleanVoicedLen, RECHECK_WINDOW_SAMPLES))
-        }
+    if (!svEnabled) {
+      if (justEnded) {
+        cleanVoicedLen = 0
+        smoothedTseAttenDb = 0f
+        lastTseAttenDb = 0f
       }
+      return
+    }
+
+    if (speaking && svJobId == 0) {
+      if (!earlyChecked && uttVoicedW >= EARLY_VOICED_W) {
+        earlyChecked = true
+        launchSvCheck("early", EARLY_WINDOW_SAMPLES)
+      } else if (!fullChecked && uttVoicedW >= FULL_VOICED_W) {
+        fullChecked = true
+        launchSvCheck("full", RECHECK_WINDOW_SAMPLES)
+      } else if (fullChecked && sinceCheckW >= RECHECK_STEP_W) {
+        launchSvCheck("recheck", RECHECK_WINDOW_SAMPLES)
+      }
+    } else if (justEnded) {
+      if (svJobId == 0 && !fullChecked && uttVoicedW >= MIN_END_VOICED_W) {
+        launchSvCheck("end", RECHECK_WINDOW_SAMPLES)
+      }
+      suppressingResidual = false
+      gateReleaseHold = 0
+      smoothedTseAttenDb = 0f
+      lastTseAttenDb = 0f
+      resetUtteranceSv()
+      cleanVoicedLen = 0
+      uttVoicedW = 0
+      sinceCheckW = 0
+      earlyChecked = false
+      fullChecked = false
     }
   }
 
@@ -559,38 +836,27 @@ class VoiceFilter internal constructor(
     cleanVoicedLen += Vad.WINDOW
   }
 
-  private fun launchSvCheck(kind: String, sampleCount: Int) {
+  private fun launchSvCheck(kind: String, maxSamples: Int) {
     if (!svEnabled) return
     val enrolled = enrolledNorm
     val lockFirst = o.lockFirstSpeaker && enrolled == null
     if (enrolled == null && !lockFirst) return
-    if (sampleCount <= 0 || cleanVoicedLen < sampleCount) return
+    val sampleCount = minOf(cleanVoicedLen, maxSamples)
+    if (sampleCount < MIN_SV_SAMPLES) return
     val slice = FloatArray(sampleCount)
     System.arraycopy(cleanVoicedRing, cleanVoicedLen - sampleCount, slice, 0, sampleCount)
     val id = ++svJobSeq
     svJobId = id
-    sinceLastSvSamples = 0
+    sinceCheckW = 0
     val gen = resetGen
-    val protos = prototypesNorm
-    val sess = sessionEmb
-    val speakerMargin = if (o.route == "speaker" && !isTseActive) 0.05f else 0f
-    val th = maxOf(0.24f, o.threshold - speakerMargin)
     val keepForSample = captureOwnerBuf != null && !ownerSampleDelivered
+    val sessMissing = sessionEmb == null
     worker(Runnable {
       val t0 = System.nanoTime()
-      var sv = SvScore(-1f, -1f, -1f, -1f, -1f)
       var norm: FloatArray? = null
       try {
         val raw = backend.embed(slice, 0, slice.size)
         norm = normalizeEmbedding(raw)
-        sv = when {
-          enrolled != null -> scoreVoiceprint(norm, enrolled, protos, sess, th)
-          sess != null -> {
-            val sc = cosine(norm, sess)
-            SvScore(rawMean = sc, maxProto = sc, combined = sc, sessionCos = sc, effective = sc)
-          }
-          else -> SvScore(rawMean = 1f, maxProto = 1f, combined = 1f, sessionCos = 1f, effective = 1f)
-        }
       } catch (_: Throwable) {
       }
       val ms = (System.nanoTime() - t0) / 1_000_000
@@ -599,9 +865,8 @@ class VoiceFilter internal constructor(
           gen = gen,
           job = id,
           kind = kind,
-          sv = sv,
           embNorm = norm,
-          cleanAudio = if (keepForSample && (enrolled != null || sess == null)) slice else null,
+          cleanAudio = if (keepForSample && (enrolled != null || sessMissing)) slice else null,
           usedSamples = sampleCount,
           ms = ms,
         ),
@@ -615,83 +880,124 @@ class VoiceFilter internal constructor(
       if (r.gen != resetGen) continue
       if (r.job == svJobId) svJobId = 0
       val embNorm = r.embNorm ?: continue
-      checks++
-      checkMsSum += r.ms
-      if (r.ms > checkMsMax) checkMsMax = r.ms
+      applySvEmbedding(
+        rawEmb = embNorm,
+        usedSamples = r.usedSamples,
+        kind = r.kind,
+        usedTse = isTseActive,
+        cleanAudio = r.cleanAudio,
+        ms = r.ms,
+      )
+    }
+  }
 
-      val speakerMargin = if (o.route == "speaker" && !isTseActive) 0.05f else 0f
-      val effectiveThreshold = maxOf(0.24f, o.threshold - speakerMargin)
-      val firstLockMode = enrolledNorm == null && o.lockFirstSpeaker
-      var effectiveScore = r.sv.effective
-      var pass = if (firstLockMode) {
-        val cur = sessionEmb
-        if (cur == null) {
-          true
-        } else {
-          effectiveScore = cosine(embNorm, cur)
-          effectiveScore >= effectiveThreshold
-        }
+  internal fun applySvEmbedding(
+    rawEmb: FloatArray,
+    usedSamples: Int,
+    kind: String = "early",
+    usedTse: Boolean = isTseActive,
+    cleanAudio: FloatArray? = null,
+    ms: Long = 0L,
+  ) {
+    val embNorm = normalizeEmbedding(rawEmb)
+    if (embNorm.isEmpty()) return
+    checks++
+    checkMsSum += ms
+    if (ms > checkMsMax) checkMsMax = ms
+
+    val effTh = effectiveThreshold(usedTse)
+    val req = if (kind == "end") maxOf(0.24f, effTh - 0.03f) else maxOf(0.24f, effTh - 0.01f)
+    val enrolled = enrolledNorm
+    val firstLockMode = enrolled == null && o.lockFirstSpeaker
+
+    val sv: SvScore
+    val effectiveScore: Float
+    var pass: Boolean
+
+    if (enrolled != null) {
+      sv = scoreVoiceprint(embNorm, enrolled, prototypesNorm, sessionEmb, effTh)
+      effectiveScore = sv.effective
+      pass = effectiveScore >= req
+    } else if (firstLockMode) {
+      val cur = sessionEmb
+      if (cur == null) {
+        sv = SvScore(1f, 1f, 1f, 1f, 1f)
+        effectiveScore = 1f
+        pass = true
       } else {
-        effectiveScore >= effectiveThreshold
+        val sc = cosine(embNorm, cur)
+        sv = SvScore(rawMean = sc, maxProto = sc, combined = sc, sessionCos = sc, effective = sc)
+        effectiveScore = sc
+        pass = effectiveScore >= req
       }
-      if (firstLockMode && sessionEmb == null && (r.usedSamples >= SESS_MIN_SAMPLES || r.kind == "end")) {
+      if (sessionEmb == null && (usedSamples >= SESS_MIN_SAMPLES || kind == "end")) {
         sessionEmb = embNorm
         pass = true
       }
-
-      if (pass) {
-        passed++
-        svConfirmedNonOwner = false
-        // Safe session adaptation on clean, non-overlapping high-confidence owner speech.
-        val cleanNonOverlap = !isTseActive || lastTseAttenDb >= -5.0f
-        if (!firstLockMode && cleanNonOverlap && r.usedSamples >= SESS_MIN_SAMPLES && r.sv.combined >= maxOf(o.threshold + 0.08f, 0.46f)) {
-          val cur = sessionEmb
-          sessionEmb = if (cur == null) {
-            embNorm
-          } else {
-            normalizeEmbedding(FloatArray(cur.size) { 0.80f * cur[it] + 0.20f * embNorm[it] })
-          }
-        } else if (firstLockMode && cleanNonOverlap && r.usedSamples >= SESS_MIN_SAMPLES && sessionEmb != null && effectiveScore >= maxOf(o.threshold + 0.08f, 0.46f)) {
-          val cur = sessionEmb!!
-          sessionEmb = normalizeEmbedding(FloatArray(cur.size) { 0.80f * cur[it] + 0.20f * embNorm[it] })
-        }
-        // Backfill missing `owner_sample.pcm` once >= 3.0s of high-confidence clean speech is verified.
-        val capBuf = captureOwnerBuf
-        if (capBuf != null && !ownerSampleDelivered && r.cleanAudio != null && r.sv.combined >= o.threshold + 0.10f) {
-          val copyN = minOf(r.cleanAudio.size, capBuf.size - captureOwnerLen)
-          if (copyN > 0) {
-            System.arraycopy(r.cleanAudio, r.cleanAudio.size - copyN, capBuf, captureOwnerLen, copyN)
-            captureOwnerLen += copyN
-          }
-          if (captureOwnerLen >= capBuf.size) {
-            ownerSampleDelivered = true
-            onOwnerSampleCaptured(capBuf.copyOf())
-          }
-        }
-      } else {
-        blocked++
-        if (speaking) svConfirmedNonOwner = true
-      }
-
-      onUtterance(
-        UtteranceTelemetry(
-          kind = r.kind,
-          pass = pass,
-          svScore = effectiveScore,
-          svRaw = r.sv.rawMean,
-          svProto = r.sv.maxProto,
-          svSess = r.sv.sessionCos,
-          svMs = r.ms,
-          usedMs = r.usedSamples * 1000L / VOICE_RATE,
-          vadProb = lastVadProb,
-          rawDbfs = lastRawDbfs,
-          tseDbfs = lastTseDbfs,
-          enhDbfs = lastEnhDbfs,
-          tseAttenDb = lastTseAttenDb,
-          enhGainDb = enhancer?.lastGainDb ?: 0f,
-        ),
-      )
+    } else {
+      return
     }
+
+    lastSvScore = effectiveScore
+
+    if (pass) {
+      passed++
+      svConfirmedNonOwner = false
+      nonOwnerStreak = 0
+      if (speaking) svConfirmedOwner = true
+      // Safe session adaptation on clean, non-overlapping high-confidence owner speech.
+      val cleanNonOverlap = !usedTse || smoothedTseAttenDb >= -6.0f
+      if (!firstLockMode && cleanNonOverlap && usedSamples >= SESS_MIN_SAMPLES && sv.combined >= maxOf(o.threshold + 0.08f, 0.46f)) {
+        val cur = sessionEmb
+        sessionEmb = if (cur == null) {
+          embNorm
+        } else {
+          normalizeEmbedding(FloatArray(cur.size) { 0.80f * cur[it] + 0.20f * embNorm[it] })
+        }
+      } else if (firstLockMode && cleanNonOverlap && usedSamples >= SESS_MIN_SAMPLES && sessionEmb != null && effectiveScore >= maxOf(o.threshold + 0.08f, 0.46f)) {
+        val cur = sessionEmb!!
+        sessionEmb = normalizeEmbedding(FloatArray(cur.size) { 0.80f * cur[it] + 0.20f * embNorm[it] })
+      }
+      // Backfill missing `owner_sample.pcm` once >= 3.0s of high-confidence clean speech is verified.
+      val capBuf = captureOwnerBuf
+      if (capBuf != null && !ownerSampleDelivered && cleanAudio != null && sv.combined >= o.threshold + 0.10f) {
+        val copyN = minOf(cleanAudio.size, capBuf.size - captureOwnerLen)
+        if (copyN > 0) {
+          System.arraycopy(cleanAudio, cleanAudio.size - copyN, capBuf, captureOwnerLen, copyN)
+          captureOwnerLen += copyN
+        }
+        if (captureOwnerLen >= capBuf.size) {
+          ownerSampleDelivered = true
+          onOwnerSampleCaptured(capBuf.copyOf())
+        }
+      }
+    } else {
+      blocked++
+      if (speaking) {
+        svConfirmedNonOwner = true
+        svConfirmedOwner = false
+        nonOwnerStreak++
+      }
+    }
+
+    onUtterance(
+      UtteranceTelemetry(
+        kind = kind,
+        pass = pass,
+        svScore = effectiveScore,
+        svRaw = sv.rawMean,
+        svProto = sv.maxProto,
+        svSess = sv.sessionCos,
+        svMs = ms,
+        usedMs = usedSamples * 1000L / VOICE_RATE,
+        vadProb = lastVadProb,
+        rawDbfs = lastRawDbfs,
+        tseDbfs = lastTseDbfs,
+        enhDbfs = lastEnhDbfs,
+        tseAttenDb = lastTseAttenDb,
+        enhGainDb = enhancer?.lastGainDb ?: 0f,
+      ),
+    )
   }
 
   private fun suspendTse(action: String, ms: Double, retry: Boolean) {
@@ -702,6 +1008,8 @@ class VoiceFilter internal constructor(
     tseNeedsReset = true
     voxStreamer.reset()
     primeTsePrebuffer()
+    smoothedTseAttenDb = 0f
+    lastTseAttenDb = 0f
     if (retry && o.requireIsolation && !tseRetried) tseRetryAtHop = hopsIn + TSE_RETRY_DELAY_HOPS
     onOverload(action, ms)
   }
@@ -716,7 +1024,13 @@ class VoiceFilter internal constructor(
     // Do not replay buffered speech from before the failure.
     backend.reset()
     enhancer?.reset()
-    gainRamp.reset(1f)
+    suppressingResidual = false
+    gateReleaseHold = 0
+    gatePhase = RAMP_SAMPLES
+    lastResidualGain = 1.0f
+    onsetGain = 1.0f
+    smoothedTseAttenDb = 0f
+    lastTseAttenDb = 0f
     primeTsePrebuffer()
     onOverload("retry_k8", 0.0)
   }
@@ -739,10 +1053,10 @@ class VoiceFilter internal constructor(
             if (resetState) backend.resetTse()
             backend.tseChunk(wavCopy, prep.wavLen, kRun, framesOut)
             val ms = (System.nanoTime() - t0) / 1_000_000.0
-            tseResults.add(TseRawResult(gen = gen, kFrames = kRun, frames = framesOut, rawRms = prep.rawRms, ms = ms))
+            tseResults.add(TseRawResult(gen = gen, kFrames = kRun, frames = framesOut, ms = ms))
           } catch (_: Throwable) {
             val ms = (System.nanoTime() - t0) / 1_000_000.0
-            tseResults.add(TseRawResult(gen = gen, kFrames = kRun, frames = FloatArray(0), rawRms = prep.rawRms, ms = ms))
+            tseResults.add(TseRawResult(gen = gen, kFrames = kRun, frames = FloatArray(0), ms = ms))
           } finally {
             tseJobInFlight = false
           }
@@ -767,15 +1081,12 @@ class VoiceFilter internal constructor(
       }
       val count = voxStreamer.completeStep(r.frames, r.kFrames, tseSynthScratch)
       appendTseOut(tseSynthScratch, count)
-      val tseRms = rmsFloat(tseSynthScratch, 0, count)
+      transferPendingPreToTsePre(count)
       val audioMs = r.kFrames * VoxLockStreamer.HOP * 1000.0 / VOICE_RATE
       tseChunks++
       tseMsSum += r.ms
       if (r.ms > tseMsMax) tseMsMax = r.ms
       tseAudioMsSum += audioMs
-      lastRawDbfs = rmsToDbfs(r.rawRms)
-      lastTseDbfs = rmsToDbfs(tseRms)
-      lastTseAttenDb = attenDb(tseRms, r.rawRms)
 
       val budget = if (r.kFrames <= VoxLockStreamer.DEFAULT_K) TSE_K5_BUDGET_MS else TSE_K8_BUDGET_MS
       if (r.ms > 150.0) {

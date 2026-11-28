@@ -29,7 +29,7 @@ import { useLocalHostDeviceId } from "../lib/fonts";
 import { native } from "../lib/native";
 import { RichMarkdown } from "../lib/markdown";
 import { looksLikeClickableFilePath } from "../lib/openFileTarget";
-import { prettyMaybeJson, type ChatRow, type ToolCategory, type ToolStep } from "../lib/chatFold";
+import { prettyMaybeJson, toolInputFilePath, type ChatRow, type ToolCategory, type ToolStep } from "../lib/chatFold";
 import { rpcCall } from "../lib/relay";
 import { PocketCheckbox } from "./PocketUI";
 import { subLabel } from "./SubagentNav";
@@ -465,9 +465,12 @@ const ToolStepItem = memo(function ToolStepItem({
     [step.input, step.name],
   );
   const fileTarget = useMemo(() => {
-    if (!onOpenFile || (step.category !== "read" && step.category !== "edit") || !step.summary) return null;
-    return extractTargetFromLine(step.summary);
-  }, [onOpenFile, step.category, step.summary]);
+    if (!onOpenFile || (step.category !== "read" && step.category !== "edit")) return null;
+    const full = toolInputFilePath(step.input);
+    if (full && looksLikeClickableFilePath(full)) return full;
+    if (full && /^(?:\/|~\/|[A-Za-z]:[\\/])/.test(full)) return full;
+    return step.summary ? extractTargetFromLine(step.summary) : null;
+  }, [onOpenFile, step.category, step.input, step.summary]);
   const toolImages = useMemo(
     () =>
       step.category === "read" || step.category === "edit" || step.result?.output

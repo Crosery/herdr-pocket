@@ -1,0 +1,20 @@
+import type { PluginManifest } from "@herdr-pocket/protocol";
+
+export const manifest: PluginManifest = {
+  id: "uniflo",
+  scope: "assistant",
+  category: "tools",
+  name: "Uniflo",
+  summary: "检索各 AI 工具的历史会话、上下文与用量",
+  defaultEnabled: true,
+  tools: [
+    "search_sessions",
+    "list_sessions",
+    "read_session",
+    "resume_session",
+    "usage",
+  ],
+  icon: "database",
+};
+
+export default manifest;

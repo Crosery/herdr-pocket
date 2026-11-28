@@ -65,7 +65,7 @@ const NAV_GROUPS: Array<{ label: string; items: Item[] }> = [
     items: [
       { id: "voice", title: "语音唤醒与声纹", subtitle: "本地降噪、人声增强、声纹过滤与实时试听", keys: "降噪 主动降噪 人声 响度 清晰度 声纹 耳返 试听 过滤 通话 voice", icon: Mic },
       { id: "assistant", title: "小羊助理", subtitle: "多端同步，模型、服务商与提示词改完即时生效", keys: "文字模型 服务商 扫描 音色 提示词 assistant model provider", icon: Sparkles },
-      { id: "plugins", title: "插件中心", subtitle: "按需开启的浏览器、Webhook 与巡检能力", keys: "浏览器 Webhook 巡检 plugin", icon: Blocks },
+      { id: "plugins", title: "插件中心", subtitle: "小羊工具包与 Herdr Pocket 扩展能力", keys: "Herdr Uniflo 浏览器 Webhook 巡检 plugin", icon: Blocks },
     ],
   },
   {

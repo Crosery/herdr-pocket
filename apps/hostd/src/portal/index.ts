@@ -16,7 +16,8 @@ import type {
   RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
 import { stateDir } from "@herdr-pocket/update";
-import { CdpBrowserPool } from "./cdpBrowser.ts";
+import type { AiBrowserEngine } from "../aiBrowserEngine.ts";
+import { CdpBrowserPool, type CdpSession } from "./cdpBrowser.ts";
 import {
   defaultQueryEgoTaskSpaces,
   ownershipToEgoPhase,
@@ -228,12 +229,124 @@ export class PortalManager {
   private inputMoveQueued = new Map<string, PortalInputAction>();
   private capsCache: { value: HostPortalCapabilities; at: number } | null = null;
   private capsInFlight: Promise<HostPortalCapabilities> | null = null;
+  private aiBrowserEngine: AiBrowserEngine | null = null;
+  private aiBrowserSessionByPortal = new Map<string, CdpSession | null>();
+  private aiBrowserNetEmitAt = new Map<string, number>();
 
   constructor(deps: PortalManagerDeps) {
     this.deps = deps;
     const sDir = deps.stateDir ?? stateDir();
     this.browser = new CdpBrowserPool(`${sDir}/portal-chrome`);
     this.capture = new OsCaptureDriver(deps.captureDeps);
+  }
+
+  private resolveBrowserSession(portalId: string): CdpSession | undefined {
+    const item = this.items.get(portalId);
+    if (item?.aiBrowserSpaceId && this.aiBrowserEngine) {
+      return this.aiBrowserEngine.getActiveSession(item.aiBrowserSpaceId) ?? undefined;
+    }
+    return this.browser.get(portalId);
+  }
+
+  bindAiBrowserEngine(engine: AiBrowserEngine): void {
+    this.aiBrowserEngine = engine;
+    engine.setHooks({
+      onSpaceChanged: (space, session, agentKey) => {
+        const portalId = `ptl-aib-${space.id}`;
+        engine.setSpacePortalId(space.id, portalId);
+        const activePg = space.pages.find((p) => p.active) ?? space.pages[0];
+        const phaseLabel =
+          space.ownership === "agentHandoff"
+            ? "等你接管"
+            : space.ownership === "agentWorking"
+              ? "AI 操作中"
+              : "已接管";
+        const subtitle = [space.statusText || phaseLabel, activePg?.url].filter(Boolean).join(" · ");
+        const nextUrl = activePg?.url || "about:blank";
+        const nextTitle = space.name || activePg?.title || "AI 浏览器";
+        const nextNet = space.networkCount ?? 0;
+
+        const existing = this.items.get(portalId);
+        if (!existing) {
+          const item: PortalItem = {
+            id: portalId,
+            hostId: this.deps.hostId(),
+            ...(agentKey ? { agentKey } : {}),
+            kind: "browser",
+            title: nextTitle,
+            subtitle,
+            url: nextUrl,
+            canInteract: true,
+            createdAt: space.createdAt ?? Date.now(),
+            updatedAt: Date.now(),
+            aiBrowserSpaceId: space.id,
+            aiBrowserPageLabel: space.activePage,
+            aiBrowserOwnership: space.ownership,
+            ...(space.statusText ? { aiBrowserStatusText: space.statusText } : {}),
+            aiBrowserNetworkCount: nextNet,
+            ...(space.cursor ? { aiBrowserCursor: space.cursor } : {}),
+          };
+          this.items.set(portalId, item);
+          this.pruneItems();
+          this.aiBrowserSessionByPortal.set(portalId, session);
+          this.emitEvent("opened", item);
+          this.attachBrowserWatchersForPortal(portalId);
+          return;
+        }
+
+        const prevSession = this.aiBrowserSessionByPortal.get(portalId) ?? null;
+        const sessionChanged = prevSession !== session;
+        const structuralChanged =
+          sessionChanged ||
+          existing.title !== nextTitle ||
+          existing.url !== nextUrl ||
+          existing.aiBrowserPageLabel !== space.activePage ||
+          existing.aiBrowserOwnership !== space.ownership ||
+          existing.aiBrowserStatusText !== space.statusText ||
+          existing.aiBrowserCursor?.at !== space.cursor?.at;
+
+        if (!structuralChanged) {
+          const now = Date.now();
+          const lastNetAt = this.aiBrowserNetEmitAt.get(portalId) ?? 0;
+          if (existing.aiBrowserNetworkCount === nextNet || now - lastNetAt < 350) {
+            return;
+          }
+          this.aiBrowserNetEmitAt.set(portalId, now);
+        }
+
+        existing.title = nextTitle;
+        existing.subtitle = subtitle;
+        existing.url = nextUrl;
+        if (agentKey && !existing.agentKey) existing.agentKey = agentKey;
+        existing.aiBrowserPageLabel = space.activePage;
+        existing.aiBrowserOwnership = space.ownership;
+        existing.aiBrowserStatusText = space.statusText;
+        existing.aiBrowserNetworkCount = nextNet;
+        existing.aiBrowserCursor = space.cursor;
+        existing.updatedAt = Date.now();
+
+        if (sessionChanged) {
+          this.aiBrowserSessionByPortal.set(portalId, session);
+          this.attachBrowserWatchersForPortal(portalId);
+          if (session) {
+            void session.captureOnce().then((frame) => {
+              if (!frame) return;
+              const bound = frame.portalId === portalId ? frame : { ...frame, portalId };
+              this.emitPortalFrame(existing, bound);
+            }).catch(() => {});
+          }
+        }
+        this.emitEvent("updated", existing);
+      },
+      onSpaceClosed: (spaceId) => {
+        const portalId = `ptl-aib-${spaceId}`;
+        this.aiBrowserSessionByPortal.delete(portalId);
+        this.aiBrowserNetEmitAt.delete(portalId);
+        if (this.items.has(portalId)) {
+          this.closePortal(portalId);
+        }
+      },
+    });
   }
 
   async startHookAndShims(): Promise<{ shimsDir: string; browserShim: string; execWrapper?: string; port: number } | null> {
@@ -523,27 +636,32 @@ export class PortalManager {
     if (!w?.portalId) return;
     w.offBrowser?.();
     w.offBrowser = undefined;
-    const sess = this.browser.get(w.portalId);
+    const sess = this.resolveBrowserSession(w.portalId);
     if (sess) {
       const portalId = w.portalId;
+      void sess.updateScreencastConfig({
+        maxWidth: w.effectiveMaxWidth,
+        quality: w.effectiveQuality,
+      });
       let initialSync = true;
       w.offBrowser = sess.onFrame((frame) => {
+        const boundFrame = frame.portalId === portalId ? frame : { ...frame, portalId };
         const item = this.items.get(portalId);
         if (item) {
-          if (frame.url && frame.url !== item.url) {
-            item.url = frame.url;
-            item.subtitle = frame.url;
+          if (boundFrame.url && boundFrame.url !== item.url) {
+            item.url = boundFrame.url;
+            if (!item.aiBrowserSpaceId) item.subtitle = boundFrame.url;
           }
-          if (frame.title && frame.title !== item.title) {
-            item.title = frame.title;
+          if (!item.aiBrowserSpaceId && boundFrame.title && boundFrame.title !== item.title) {
+            item.title = boundFrame.title;
           }
-          item.width = frame.width;
-          item.height = frame.height;
+          item.width = boundFrame.width;
+          item.height = boundFrame.height;
           if (item.streamError) this.syncItemStreamError(item, undefined);
         }
         const deliver = () => {
           if (this.streamWatchers.get(wId) !== w) return;
-          this.sendFrameToWatcher(w, frame, false);
+          this.sendFrameToWatcher(w, boundFrame, false);
         };
         if (initialSync) setImmediate(deliver);
         else deliver();
@@ -729,6 +847,8 @@ export class PortalManager {
     this.autoWindowMeta.delete(portalId);
     this.inputMoveInFlight.delete(portalId);
     this.inputMoveQueued.delete(portalId);
+    this.aiBrowserSessionByPortal.delete(portalId);
+    this.aiBrowserNetEmitAt.delete(portalId);
     const existing = this.items.get(portalId);
     this.browser.close(portalId);
     if (!existing) return;
@@ -759,8 +879,8 @@ export class PortalManager {
     const item = this.items.get(portalId) ?? null;
     if (!item) return { frame: null, item: null };
     if (item.kind === "browser") {
-      let sess = this.browser.get(portalId);
-      if (!sess && item.url) {
+      let sess = this.resolveBrowserSession(portalId);
+      if (!sess && !item.aiBrowserSpaceId && item.url) {
         try {
           await this.reviveBrowserSession(item);
           sess = this.browser.get(portalId);
@@ -769,14 +889,15 @@ export class PortalManager {
           return { frame: null, item };
         }
       }
-      const frame = sess ? await sess.captureOnce() : null;
+      const rawFrame = sess ? await sess.captureOnce() : null;
+      const frame = rawFrame && rawFrame.portalId !== portalId ? { ...rawFrame, portalId } : rawFrame;
       if (frame) {
         if (frame.url && frame.url !== item.url) {
           item.url = frame.url;
-          item.subtitle = frame.url;
+          if (!item.aiBrowserSpaceId) item.subtitle = frame.url;
           item.updatedAt = Date.now();
         }
-        if (frame.title && frame.title !== item.title) {
+        if (!item.aiBrowserSpaceId && frame.title && frame.title !== item.title) {
           item.title = frame.title;
         }
         item.width = frame.width;
@@ -991,7 +1112,7 @@ export class PortalManager {
             w.slowStreak = 0;
           }
           if (abrChanged && item.kind === "browser") {
-            void this.browser.get(portalId)?.updateScreencastConfig({
+            void this.resolveBrowserSession(portalId)?.updateScreencastConfig({
               maxWidth: w.effectiveMaxWidth,
               quality: w.effectiveQuality,
             });
@@ -1025,7 +1146,7 @@ export class PortalManager {
         if (item.kind === "window") {
           this.startWindowWatcherLoop(streamId, w);
         } else if (item.kind === "browser") {
-          void this.browser.get(portalId)?.updateScreencastConfig({
+          void this.resolveBrowserSession(portalId)?.updateScreencastConfig({
             maxWidth: w.effectiveMaxWidth,
             quality: w.effectiveQuality,
           });
@@ -1044,7 +1165,7 @@ export class PortalManager {
 
     if (input.type === "clipboard") {
       if (item.kind === "browser") {
-        const sess = this.browser.get(portalId);
+        const sess = this.resolveBrowserSession(portalId);
         if (sess && input.action === "set" && input.text) {
           await sess.dispatchInput({ type: "text", text: input.text });
           return { url: item.url, title: item.title };
@@ -1059,6 +1180,13 @@ export class PortalManager {
     }
 
     if (item.kind === "browser") {
+      if (item.aiBrowserSpaceId && this.aiBrowserEngine) {
+        const res = await this.aiBrowserEngine.dispatchPortalInput(item.aiBrowserSpaceId, input);
+        if (res.url) item.url = res.url;
+        item.updatedAt = Date.now();
+        this.syncItemStreamError(item, undefined);
+        return res;
+      }
       let sess = this.browser.get(portalId);
       if (!sess && item.url) {
         try {
@@ -1181,7 +1309,7 @@ export class PortalManager {
       this.attachBrowserToWatcher(streamId);
       const item = this.items.get(pid);
       if (item?.kind === "browser") {
-        const sess = this.browser.get(pid);
+        const sess = this.resolveBrowserSession(pid);
         if (sess) {
           void sess.updateScreencastConfig({ maxWidth, quality });
         }
@@ -1678,6 +1806,10 @@ export class PortalManager {
     immediate?: boolean;
   }): Promise<PortalItem | null> {
     const hints = Array.isArray(opts.appHint) ? opts.appHint : opts.appHint ? [opts.appHint] : [];
+    const isBrowserHint = hints.some((h) => {
+      const low = h.toLowerCase();
+      return BROWSER_WINDOW_HINTS.some((bh) => low.includes(bh) || bh.includes(low));
+    });
     const delays = opts.immediate ? [0, 300, 900, 1700] : [250, 800, 1600];
     let lastHit: RemoteWindowInfo | undefined;
     let lastPermNote: string | null = null;
@@ -1685,7 +1817,8 @@ export class PortalManager {
     for (let i = 0; i < delays.length; i += 1) {
       const ms = delays[i]!;
       if (ms > 0) await delayMs(ms);
-      const strictFresh = Boolean(opts.beforeIds || opts.beforeTitles) && i < delays.length - 1;
+      // Never fall back to hijacking an untouched pre-existing browser window when we have a baseline.
+      const strictFresh = Boolean(opts.beforeIds || opts.beforeTitles) && (isBrowserHint || i < delays.length - 1);
       const wins = await this.capture.listWindows().catch(() => []);
       const hit = this.matchWindowByHint(wins, hints, opts.beforeIds, opts.beforeTitles, strictFresh, opts.titleHint);
       if (!hit) continue;

@@ -103,7 +103,9 @@
 /* /btw Sidechannel Floating Drawer --------------------------------------------------------------------- */
 
 .btw-drawer {
-  margin: 0 14px 6px;
+  width: min(calc(100% - 40px), calc(48rem - 40px));
+  max-width: calc(48rem - 40px);
+  margin: 0 auto 8px;
   border-radius: 16px;
   border: 1px solid var(--line-pink);
   background: var(--surface);
@@ -111,6 +113,26 @@
   overflow: hidden;
   flex-shrink: 0;
   min-width: 0;
+}
+
+.t3-composer-shell .btw-drawer {
+  width: 100%;
+  max-width: 100%;
+  margin: 0 0 8px;
+}
+
+@media (max-width: 700px) {
+  .btw-drawer {
+    width: min(calc(100% - 24px), calc(48rem - 24px));
+    max-width: calc(48rem - 24px);
+    margin: 0 auto 6px;
+  }
+
+  .t3-composer-shell .btw-drawer {
+    width: 100%;
+    max-width: 100%;
+    margin: 0 0 6px;
+  }
 }
 
 :root[data-theme="dark"] .btw-drawer {
@@ -236,7 +258,7 @@
   flex-direction: column;
   gap: 10px;
   padding: 10px 14px 12px;
-  max-height: min(320px, 44vh);
+  max-height: min(260px, 36vh);
   overflow-y: auto;
   overscroll-behavior: contain;
 }

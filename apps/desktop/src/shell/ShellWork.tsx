@@ -8,6 +8,7 @@ import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
 import { PortalTabPane } from "../components/PortalTabPane";
+import { AiBrowserTabPane } from "../components/AiBrowserTabPane";
 import { PortalViewerModal } from "../components/PortalViewerModal";
 import { serverLabel } from "../components/Sidebar";
 import { SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
@@ -81,6 +82,7 @@ import {
   moveTabPaneToEdge,
   moveTabRelative,
   openAgentTab,
+  openAiBrowserTab,
   openFileTab,
   openSettingsFrame,
   openWebTab,
@@ -499,7 +501,9 @@ const TabChip = memo(function TabChip({
                   ? `${primaryContent.path} (${primaryContent.staged ? "已暂存" : "工作区"})`
                   : primaryContent.kind === "portal"
                     ? primaryContent.title
-                    : primaryContent.url
+                    : primaryContent.kind === "ai-browser"
+                      ? `${primaryContent.title}（AI 浏览器）`
+                      : primaryContent.url
       }
       onClick={() => {
         if (!isRenaming) setActiveTab(tab.id);
@@ -529,6 +533,8 @@ const TabChip = memo(function TabChip({
         <GitBranch size={14} />
       ) : primaryContent.kind === "portal" ? (
         <PanelTop size={14} />
+      ) : primaryContent.kind === "ai-browser" ? (
+        <Sparkles size={14} style={{ color: "var(--primary)" }} />
       ) : (
         <Globe size={14} />
       )}
@@ -1043,6 +1049,26 @@ export const ShellTabs = memo(function ShellTabs({ onNewTerminal, onNewAgent, pa
         <Popup x={newMenu.x} y={newMenu.y} onClose={() => setNewMenu(null)} dataTour="tabs-new-popup">
           <MenuItem label="新建终端" icon={Terminal} keys={shortcutText("newAgent")} onClick={() => (setNewMenu(null), onNewTerminal())} />
           <MenuItem label="新建 Agent…" icon={Plus} onClick={() => (setNewMenu(null), onNewAgent())} />
+          <MenuItem
+            label="新建 AI 浏览器"
+            icon={Sparkles}
+            onClick={() => {
+              setNewMenu(null);
+              const spaceHost = selectedSpace?.includes("\u0000") ? selectedSpace.split("\u0000")[0] : "";
+              const localId = localHostIdStore.get();
+              const targetHost =
+                (spaceHost && devices[spaceHost]?.kind === "host" && devices[spaceHost]?.online ? spaceHost : "") ||
+                (localId && devices[localId]?.online ? localId : "") ||
+                Object.values(devices).find((d) => d.kind === "host" && d.online)?.id ||
+                Object.values(devices).find((d) => d.kind === "host")?.id ||
+                "";
+              if (!targetHost) {
+                toast("请先连接至少一台主机或进入演示模式", true);
+                return;
+              }
+              openAiBrowserTab(targetHost, "ai-1", "AI 浏览器", { spaceKey: selectedSpace });
+            }}
+          />
           <MenuItem label="打开网页" icon={Globe} onClick={() => (setNewMenu(null), openWebTab(homePage || "about:blank", undefined, { spaceKey: selectedSpace }))} />
           {native.available() ? (
             <MenuItem label="打开本地文件…" icon={FolderOpen} onClick={() => { setNewMenu(null); void openPickedLocalFile(); }} />
@@ -1417,6 +1443,11 @@ function PaneHead({
     icon = <PanelTop size={14} />;
     name = content.title;
     sub = agent ? spacedTitle(agent) : "实时预览合集";
+    subTitle = sub;
+  } else if (content.kind === "ai-browser") {
+    icon = <Sparkles size={14} style={{ color: "var(--primary)" }} />;
+    name = content.title || "AI 浏览器";
+    sub = `内置跨平台 Chromium · ${content.spaceId}`;
     subTitle = sub;
   } else {
     icon = <Globe size={14} />;
@@ -2283,6 +2314,23 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
                 onExpandModal={(pid, hid) => {
                   setExpandedPortalModal({ hostId: hid, portalId: pid, agent });
                 }}
+              />
+            </PocketErrorBoundary>
+          ) : content.kind === "ai-browser" ? (
+            <PocketErrorBoundary resetKey={paneKey} title="AI 浏览器加载出错">
+              <AiBrowserTabPane
+                hostId={content.hostId}
+                spaceId={content.spaceId}
+                portalId={content.portalId}
+                title={content.title}
+                onSplitBeside={() => {
+                  const s = shellStore.get();
+                  const agentTab = s.tabs.find((t) => t.kind === "agent");
+                  if (agentTab && agentTab.kind === "agent") {
+                    splitActivePaneWithContent("left", { kind: "agent", agentKey: agentTab.agentKey });
+                  }
+                }}
+                onClosedSpace={() => closeTab(tabId)}
               />
             </PocketErrorBoundary>
           ) : content.kind === "web" ? (
@@ -3642,7 +3690,9 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   }, [realtimeReady]);
   const focusedTabContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
   const agent = useAgent(
-    focusedTabContent && focusedTabContent.kind !== "web" ? (focusedTabContent.agentKey ?? null) : null,
+    focusedTabContent && focusedTabContent.kind !== "web" && focusedTabContent.kind !== "ai-browser"
+      ? (focusedTabContent.agentKey ?? null)
+      : null,
   );
 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);

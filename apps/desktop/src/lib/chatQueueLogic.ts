@@ -109,6 +109,62 @@ function unescapeShellPath(s: string): string {
   return s.replace(/\\([ ()[\]'"])/g, "$1");
 }
 
+function normalizeFuzzyText(s: string): string {
+  return s
+    .replace(/[\s\u200B-\u200D\uFEFF\u2060\u00AD]+/g, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'");
+}
+
+function approxSameLongText(aRaw: string, bRaw: string): boolean {
+  const a = normalizeFuzzyText(aRaw);
+  const b = normalizeFuzzyText(bRaw);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const minLen = Math.min(a.length, b.length);
+  const maxLen = Math.max(a.length, b.length);
+  if (minLen < 24 || minLen / maxLen < 0.85) return false;
+  if (a.includes(b) || b.includes(a)) return true;
+  const head = Math.min(18, Math.floor(minLen * 0.35));
+  const tail = Math.min(18, Math.floor(minLen * 0.35));
+  return a.slice(0, head) === b.slice(0, head) && a.slice(-tail) === b.slice(-tail);
+}
+
+function rowHasUploadedPath(row: Extract<ChatRow, { kind: "user" }>, uploadedPaths?: readonly string[]): boolean {
+  if (!uploadedPaths?.length) return false;
+  const hay = unescapeShellPath(transcriptForm(row));
+  for (const p of uploadedPaths) {
+    const clean = p.trim();
+    if (!clean) continue;
+    if (hay.includes(clean)) return true;
+    const base = clean.split(/[\\/]/).pop();
+    if (base && base.length >= 8 && hay.includes(base) && /\.(?:png|jpe?g|webp|gif|pdf|txt|md|json|csv|mp4|mov)$/i.test(base)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function outgoingMatchesUserRow(row: Extract<ChatRow, { kind: "user" }>, send: OutgoingSendLike): boolean {
+  const said = transcriptForm(row);
+  if (outgoingMatchesUserText(said, send)) return true;
+  const pathHit = rowHasUploadedPath(row, send.uploadedPaths);
+  if (pathHit) {
+    // Unique per-upload temp paths (e.g. `.../files/t19g/image-147.png`) identify the exact send even if PTY shifted text.
+    if (!send.text.trim() || !row.text.trim() || approxSameLongText(row.text, send.text)) return true;
+    // Even for short captions, sharing the exact uploaded temp path within the echo window proves it's the same turn.
+    if (send.uploadedPaths?.some((p) => hayContainsUniqueUpload(said, p))) return true;
+  }
+  if (approxSameLongText(row.text, send.text)) return true;
+  return false;
+}
+
+function hayContainsUniqueUpload(said: string, path: string): boolean {
+  const clean = path.trim();
+  if (!clean) return false;
+  return unescapeShellPath(said).includes(clean);
+}
+
 function outgoingMatchesUserText(said: string, send: OutgoingSendLike): boolean {
   const hasFiles = send.attachedCount > 0 || Boolean(send.uploadedPaths?.length);
   if (sameMessage(said, send.text, hasFiles)) return true;
@@ -159,12 +215,27 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
       ({ r, i }) =>
         !claimed.has(i) &&
         ((r.ts ?? 0) === 0 || (r.ts ?? 0) >= send.ts - ECHO_SLACK_MS) &&
-        (outgoingMatchesUserText(transcriptForm(r), send) ||
+        (outgoingMatchesUserRow(r, send) ||
           (isAttachmentOnly && !r.text.trim())),
     );
     if (userHit) {
       hitIdx = userHit.i;
-    } else if (isSlash) {
+    } else if (send.state === "sent" || send.state === "queued_terminal") {
+      // If a duplicate optimistic copy was created for an already-claimed persisted user turn within ±15s,
+      // reconcile it cleanly instead of leaving a ghost duplicate bubble for 3 minutes.
+      const dupClaimed = users.find(
+        ({ r, i }) =>
+          claimed.has(i) &&
+          ((r.ts ?? 0) === 0 || Math.abs((r.ts ?? 0) - send.ts) <= 15_000) &&
+          outgoingMatchesUserRow(r, send),
+      );
+      if (dupClaimed) {
+        matchedIds.push(send.id);
+        matchedRowIdx.set(send.id, dupClaimed.i);
+        continue;
+      }
+    }
+    if (hitIdx < 0 && isSlash) {
       hitIdx = rows.findIndex((r, i) => {
         if (claimed.has(i)) return false;
         const ts = rowTs(r);

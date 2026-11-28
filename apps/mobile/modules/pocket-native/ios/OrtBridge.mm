@@ -1,5 +1,6 @@
 #import "OrtBridge.h"
 
+#include <dlfcn.h>
 #include <vector>
 
 #if __has_include(<onnxruntime/onnxruntime_c_api.h>)
@@ -10,10 +11,51 @@
 #include "onnxruntime_c_api.h"
 #endif
 
+#if __has_include(<onnxruntime/coreml_provider_factory.h>)
+#include <onnxruntime/coreml_provider_factory.h>
+#define POCKET_HAS_ORT_COREML_HEADER 1
+#elif __has_include(<coreml_provider_factory.h>)
+#include <coreml_provider_factory.h>
+#define POCKET_HAS_ORT_COREML_HEADER 1
+#elif __has_include("coreml_provider_factory.h")
+#include "coreml_provider_factory.h"
+#define POCKET_HAS_ORT_COREML_HEADER 1
+#else
+#define POCKET_HAS_ORT_COREML_HEADER 0
+#endif
+
 static NSString * const kOrtBridgeErrorDomain = @"PocketNative.ONNXRuntime";
 
 static const OrtApi *Ort(void) {
   return OrtGetApiBase()->GetApi(ORT_API_VERSION);
+}
+
+static BOOL TryAppendCoreMLProvider(const OrtApi *api, OrtSessionOptions *opts, NSString **outReason) {
+#if POCKET_HAS_ORT_COREML_HEADER
+  // COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE == 0x004 in coreml_provider_factory.h
+  // (0x008 is COREML_FLAG_ONLY_ALLOW_STATIC_INPUT_SHAPES, which excludes dynamic-shape graphs).
+  const uint32_t flags = static_cast<uint32_t>(COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE);
+  OrtStatus *st = OrtSessionOptionsAppendExecutionProvider_CoreML(opts, flags);
+#else
+  using AppendCoreMLFn = OrtStatus *(*)(OrtSessionOptions *, uint32_t);
+  AppendCoreMLFn fn = reinterpret_cast<AppendCoreMLFn>(
+      dlsym(RTLD_DEFAULT, "OrtSessionOptionsAppendExecutionProvider_CoreML"));
+  if (!fn) {
+    if (outReason) *outReason = @"OrtSessionOptionsAppendExecutionProvider_CoreML symbol unavailable";
+    return NO;
+  }
+  static constexpr uint32_t kCoreMLFlagOnlyEnableDeviceWithANE = 0x004u;
+  OrtStatus *st = fn(opts, kCoreMLFlagOnlyEnableDeviceWithANE);
+#endif
+  if (st != nullptr) {
+    const char *msg = api->GetErrorMessage(st);
+    if (outReason) {
+      *outReason = msg ? [NSString stringWithUTF8String:msg] : @"CoreML EP attach failed";
+    }
+    api->ReleaseStatus(st);
+    return NO;
+  }
+  return YES;
 }
 
 static BOOL CheckOrtStatus(const OrtApi *api, OrtStatus *status, NSError **error) {
@@ -280,12 +322,25 @@ static size_t ElementByteWidth(ONNXTensorElementDataType t) {
   OrtSession *_session;
 }
 @property (nonatomic, strong) ORTEnv *retainedEnv;
+@property (nonatomic, readwrite) BOOL usingCoreML;
 @end
 
 @implementation ORTSession
 - (nullable instancetype)initWithEnv:(ORTEnv *)env
                            modelPath:(NSString *)modelPath
                       sessionOptions:(nullable ORTSessionOptions *)sessionOptions
+                               error:(NSError * _Nullable * _Nullable)error {
+  return [self initWithEnv:env
+                 modelPath:modelPath
+            sessionOptions:sessionOptions
+              preferCoreML:NO
+                     error:error];
+}
+
+- (nullable instancetype)initWithEnv:(ORTEnv *)env
+                           modelPath:(NSString *)modelPath
+                      sessionOptions:(nullable ORTSessionOptions *)sessionOptions
+                        preferCoreML:(BOOL)preferCoreML
                                error:(NSError * _Nullable * _Nullable)error {
   self = [super init];
   if (!self) return nil;
@@ -295,14 +350,54 @@ static size_t ElementByteWidth(ONNXTensorElementDataType t) {
     return nil;
   }
   OrtSessionOptions *defaultOpts = nullptr;
-  const OrtSessionOptions *useOpts = sessionOptions ? sessionOptions->_options : nullptr;
-  if (!useOpts) {
+  const OrtSessionOptions *baseOpts = sessionOptions ? sessionOptions->_options : nullptr;
+  if (!baseOpts) {
     if (!CheckOrtStatus(api, api->CreateSessionOptions(&defaultOpts), error)) {
       return nil;
     }
-    useOpts = defaultOpts;
+    baseOpts = defaultOpts;
   }
-  OrtStatus *st = api->CreateSession(env->_env, modelPath.UTF8String, useOpts, &_session);
+
+  _usingCoreML = NO;
+  if (preferCoreML) {
+    OrtSessionOptions *coremlOpts = nullptr;
+    OrtStatus *cloneSt = api->CloneSessionOptions(baseOpts, &coremlOpts);
+    if (cloneSt != nullptr) {
+      const char *msg = api->GetErrorMessage(cloneSt);
+      NSLog(@"PocketVoice ORT CoreML clone options failed (%s), falling back to CPU for %@",
+            msg ? msg : "unknown", modelPath.lastPathComponent);
+      api->ReleaseStatus(cloneSt);
+    } else if (coremlOpts != nullptr) {
+      NSString *appendErr = nil;
+      if (TryAppendCoreMLProvider(api, coremlOpts, &appendErr)) {
+        OrtSession *coremlSession = nullptr;
+        OrtStatus *createSt = api->CreateSession(env->_env, modelPath.UTF8String, coremlOpts, &coremlSession);
+        if (createSt == nullptr && coremlSession != nullptr) {
+          api->ReleaseSessionOptions(coremlOpts);
+          if (defaultOpts) api->ReleaseSessionOptions(defaultOpts);
+          _session = coremlSession;
+          _retainedEnv = env;
+          _usingCoreML = YES;
+          return self;
+        }
+        if (createSt != nullptr) {
+          const char *msg = api->GetErrorMessage(createSt);
+          NSLog(@"PocketVoice ORT CoreML session failed (%s), falling back to CPU for %@",
+                msg ? msg : "unknown", modelPath.lastPathComponent);
+          api->ReleaseStatus(createSt);
+        }
+        if (coremlSession != nullptr) {
+          api->ReleaseSession(coremlSession);
+        }
+      } else {
+        NSLog(@"PocketVoice ORT CoreML EP attach skipped (%@), falling back to CPU for %@",
+              appendErr ?: @"unavailable", modelPath.lastPathComponent);
+      }
+      api->ReleaseSessionOptions(coremlOpts);
+    }
+  }
+
+  OrtStatus *st = api->CreateSession(env->_env, modelPath.UTF8String, baseOpts, &_session);
   if (defaultOpts) api->ReleaseSessionOptions(defaultOpts);
   if (!CheckOrtStatus(api, st, error)) {
     return nil;

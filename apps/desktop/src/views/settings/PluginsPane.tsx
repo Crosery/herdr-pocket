@@ -1,47 +1,105 @@
-import { useEffect, useState } from "react";
-import { Blocks, FolderSearch, Globe, Plus, ShieldCheck, Sparkles, Trash2, Webhook } from "lucide-react";
-import type { AssistantPluginId, AssistantWebhookTool } from "@herdr-pocket/protocol";
+import { useEffect, useState, type CSSProperties } from "react";
+import {
+  BookOpen,
+  Database,
+  FolderSearch,
+  Globe,
+  MousePointerClick,
+  Plus,
+  Terminal,
+  Trash2,
+  Webhook,
+} from "lucide-react";
+import type { AssistantPluginId, AssistantWebhookTool, PocketPluginId } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketCard, PocketInput, PocketSwitch, useToast } from "../../components/PocketUI";
-import { assistantStore, loadAssistantSettings, updateAssistantSettings } from "../../lib/assistant";
-import { isTauri } from "../../lib/bridge";
+import {
+  assistantStore,
+  loadAssistantSettings,
+  resolveAssistantPlugins,
+  updateAssistantSettings,
+} from "../../lib/assistant";
+import { localHostIdStore } from "../../lib/fonts";
 import { setConfig, useClientConfig } from "../../lib/config";
-import { settingsStore } from "../../lib/store";
+import { liveStore, settingsStore } from "../../lib/store";
+import { closeSettingsFrame, openAiBrowserTab } from "../../shell/shellStore";
 import { PaneTitle, SetHeading, SetRow } from "./rows";
+
+const TAG_STYLE: CSSProperties = {
+  fontSize: "calc(11px * var(--ts, 1))",
+  color: "var(--muted)",
+  background: "var(--surface-2)",
+  border: "1px solid var(--divider)",
+  borderRadius: 5,
+  padding: "1px 6px",
+  lineHeight: 1.45,
+};
 
 const XIAOYANG_PLUGINS: Array<{
   id: AssistantPluginId;
   title: string;
-  toolName: string;
   about: string;
+  tags: string[];
   icon: typeof Globe;
 }> = [
   {
+    id: "herdr",
+    title: "Herdr",
+    about: "空间、终端与会话管理",
+    tags: ["list_agents", "herdr_do", "+11"],
+    icon: Terminal,
+  },
+  {
+    id: "uniflo",
+    title: "Uniflo",
+    about: "会话历史、检索与用量查询",
+    tags: ["search_sessions", "usage", "+3"],
+    icon: Database,
+  },
+  {
     id: "browser",
-    title: "小羊网页协作",
-    toolName: "browser_act",
-    about: "允许小羊在你的 AI 浏览空间打开网页、读取结构化 @ref 并演示点击；登录、密码或验证码会自动停下交还给你。",
-    icon: Globe,
+    title: "AI 浏览器操作",
+    about: "网页浏览、操作与接口抓包",
+    tags: ["browser_act", "browser_run", "browser_net"],
+    icon: MousePointerClick,
   },
   {
     id: "workspace",
-    title: "代码与 Git 只读巡检",
-    toolName: "inspect_workspace",
-    about: "无需开启完整对话终端即可只读查看仓库 Git 状态、差异与文件内容（单次最多读取 8 KB）。",
+    title: "代码与 Git",
+    about: "文件读取、搜索与 Git 状态",
+    tags: ["inspect_workspace"],
     icon: FolderSearch,
   },
   {
     id: "webfetch",
-    title: "公开网页查阅",
-    toolName: "fetch_webpage",
-    about: "抓取公开 HTTP/HTTPS 网页正文供小羊阅读参考，内置 SSRF 阻断（禁止访问本机与内网地址）。",
-    icon: Sparkles,
+    title: "网页阅读",
+    about: "抓取公开网页并提取正文",
+    tags: ["fetch_webpage"],
+    icon: BookOpen,
   },
   {
     id: "webhooks",
-    title: "自定义 Webhook 工具桥接",
-    toolName: "webhook_*",
-    about: "将你自己的 HTTP POST 自动化端点以零依赖工具的形式接入小羊（开启“动手前先问”时需你确认）。",
+    title: "Webhook",
+    about: "通知外部服务",
+    tags: ["webhook_*"],
     icon: Webhook,
+  },
+];
+
+const POCKET_PLUGINS: Array<{
+  id: PocketPluginId;
+  title: string;
+  categoryLabel: string;
+  cli: string;
+  about: string;
+  icon: typeof Globe;
+}> = [
+  {
+    id: "ai-browser",
+    title: "AI 浏览器",
+    categoryLabel: "操作流",
+    cli: "herdr-pocket browser",
+    about: "内置跨平台浏览器，提供页面操作流、主标签画面与接口抓包",
+    icon: Globe,
   },
 ];
 
@@ -60,10 +118,6 @@ function slugifyHookId(raw: string, existing: AssistantWebhookTool[]): string {
   return `${base.slice(0, 20)}_${i}`;
 }
 
-/**
- * Plugin Center (`插件中心`): all optional plugins are disabled by default (zero bloat,
- * zero external dependencies) and appear only when the user chooses to enable them.
- */
 export function PluginsPane() {
   const toast = useToast();
   const cfg = useClientConfig();
@@ -81,17 +135,14 @@ export function PluginsPane() {
     void loadAssistantSettings().catch(() => undefined);
   }, [server]);
 
-  const plugins = assistantSettings.plugins ?? {};
+  const plugins = resolveAssistantPlugins(assistantSettings.plugins);
   const webhooks = assistantSettings.webhooks ?? [];
-  const enabledCount =
-    (cfg.plugins.aiBrowser ? 1 : 0) +
-    Object.values(plugins).filter(Boolean).length;
 
   const toggleAiBrowser = async (next: boolean) => {
-    setSavingKey("aiBrowser");
+    setSavingKey("ai-browser");
     try {
       await setConfig("plugins.aiBrowser", next);
-      toast(next ? "已启用本机 AI 浏览器协作插件" : "已关闭 AI 浏览器协作插件");
+      toast(next ? "已启用 AI 浏览器" : "已关闭 AI 浏览器");
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -99,15 +150,31 @@ export function PluginsPane() {
     }
   };
 
+  const handleOpenAiBrowser = () => {
+    const localId = localHostIdStore.get();
+    const devs = liveStore.get().devices;
+    const hostId =
+      (localId && devs[localId]?.online ? localId : "") ||
+      Object.values(devs).find((d) => d.kind === "host" && d.online)?.id ||
+      Object.values(devs).find((d) => d.kind === "host")?.id ||
+      "";
+    if (!hostId) {
+      toast("请先连接至少一台主机或进入演示模式", true);
+      return;
+    }
+    closeSettingsFrame();
+    openAiBrowserTab(hostId, "ai-1", "AI 浏览器", { focus: true });
+  };
+
   const toggleAssistantPlugin = async (id: AssistantPluginId, next: boolean) => {
     if (!server) {
-      toast("请先连接中继或进入演示模式再调整小羊插件", true);
+      toast("请先连接中继或进入演示模式", true);
       return;
     }
     setSavingKey(id);
     try {
       await updateAssistantSettings({ plugins: { ...plugins, [id]: next } });
-      toast(next ? "已启用小羊插件" : "已关闭小羊插件");
+      toast(next ? "已启用插件" : "已关闭插件");
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -119,7 +186,7 @@ export function PluginsPane() {
     const name = hookName.trim();
     const url = hookUrl.trim();
     if (!name || !url) {
-      toast("请填写 Webhook 名称与公开 HTTPS/HTTP URL", true);
+      toast("请填写名称与 HTTP/HTTPS URL", true);
       return;
     }
     try {
@@ -152,7 +219,7 @@ export function PluginsPane() {
       setHookUrl("");
       setHookSecret("");
       setAddingHook(false);
-      toast(`已添加工具「${name}」`);
+      toast(`已添加「${name}」`);
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -165,7 +232,7 @@ export function PluginsPane() {
     try {
       const next = webhooks.filter((w) => w.id !== id);
       await updateAssistantSettings({ webhooks: next });
-      toast("已移除 Webhook 工具");
+      toast("已移除 Webhook");
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -175,115 +242,43 @@ export function PluginsPane() {
 
   return (
     <div className="pane">
-      <PaneTitle
-        title="插件中心"
-        about="按需开启 · 默认全部关闭 · 零外部依赖；未启用时零后台驻留、零额外上下文占用"
-      />
+      <PaneTitle title="插件中心" />
 
-      <PocketCard className="plugins-hero-card">
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-            <span
-              style={{
-                width: 34,
-                height: 34,
-                borderRadius: 10,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                background: "var(--accent-soft)",
-                color: "var(--primary)",
-                flex: "none",
-              }}
-            >
-              <Blocks size={18} />
-            </span>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 700, fontSize: "calc(13.5px * var(--ts, 1))", color: "var(--ink)" }}>
-                零负担可选能力扩展
-              </div>
-              <div style={{ fontSize: "calc(12px * var(--ts, 1))", color: "var(--muted)", marginTop: 2 }}>
-                不要求安装 Playwright/Puppeteer 等三方包；只在你明确启用后才注册对应桥接与工具。
-              </div>
-            </div>
-          </div>
-          <PocketBadge tone={enabledCount > 0 ? "pink" : "neutral"}>
-            已启用 {enabledCount} / 5
-          </PocketBadge>
-        </div>
-      </PocketCard>
-
-      <SetHeading>本机桌面与内置浏览器插件</SetHeading>
-      <SetRow
-        title={
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-            <span>AI 浏览器协作与虚拟光标</span>
-            <PocketBadge tone="lav">本机内置</PocketBadge>
-          </span>
-        }
-        about={
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <span>
-              启用后在侧边内置浏览器开启 AI 空间隔离、@ref 页面结构快照、粉色虚拟光标指示与“我来接管 / 交还 AI”状态栏。关闭时不监听任何本地端口、不注入页面脚本。
-            </span>
-            {isTauri() ? (
-              <code
-                className="mono"
-                style={{
-                  display: "block",
-                  padding: "6px 10px",
-                  borderRadius: 8,
-                  background: "var(--surface-2)",
-                  border: "1px solid var(--divider)",
-                  fontSize: "calc(11.5px * var(--ts, 1))",
-                  color: "var(--ink)",
-                }}
-              >
-                herdr-pocket browser open https://example.com · herdr-pocket browser snapshot
-              </code>
-            ) : null}
-          </div>
-        }
-      >
-        <PocketSwitch
-          checked={cfg.plugins.aiBrowser}
-          disabled={savingKey === "aiBrowser"}
-          label="AI 浏览器协作与虚拟光标"
-          onCheckedChange={(v) => void toggleAiBrowser(v)}
-        />
-      </SetRow>
-
-      <SetHeading>小羊助理工具插件（跨端同步）</SetHeading>
+      <SetHeading>小羊助理插件</SetHeading>
       {!server ? (
-        <div className="faint" style={{ padding: "8px 0 12px" }}>
-          连接中继或进入演示模式后，即可管理跨设备共享的小羊助理插件开关。
+        <div className="faint" style={{ padding: "4px 0 8px" }}>
+          连接中继或进入演示模式后可调整小羊插件开关。
         </div>
       ) : null}
 
       {XIAOYANG_PLUGINS.map((item) => {
         const Icon = item.icon;
-        const checked = Boolean(plugins[item.id]);
+        const checked = plugins[item.id];
         return (
           <SetRow
             key={item.id}
             title={
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <Icon size={14} style={{ color: "var(--primary)", flex: "none" }} />
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
+                <Icon size={15} style={{ color: "var(--primary)", flex: "none" }} />
                 <span>{item.title}</span>
-                <code className="mono" style={{ fontSize: "calc(11px * var(--ts, 1))", color: "var(--muted)" }}>
-                  {item.toolName}
-                </code>
+                {item.tags.map((tag) => (
+                  <code key={tag} className="mono" style={TAG_STYLE}>
+                    {tag}
+                  </code>
+                ))}
               </span>
             }
             about={
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <span>{item.about}</span>
-                {item.id === "browser" && checked && !cfg.plugins.aiBrowser ? (
+              item.id === "browser" && checked && !cfg.plugins.aiBrowser ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  <span>{item.about}</span>
                   <span style={{ color: "var(--blush-text)", fontWeight: 600 }}>
-                    提示：当前这台电脑的「AI 浏览器协作与虚拟光标」仍处于关闭状态，请在上方同步开启。
+                    需同时开启下方「AI 浏览器」插件。
                   </span>
-                ) : null}
-              </div>
+                </div>
+              ) : (
+                item.about
+              )
             }
           >
             <PocketSwitch
@@ -299,13 +294,12 @@ export function PluginsPane() {
       {(plugins.webhooks || webhooks.length > 0) && server ? (
         <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <span style={{ fontSize: "calc(12.5px * var(--ts, 1))", fontWeight: 600, color: "var(--ink)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-              <ShieldCheck size={14} style={{ color: "var(--primary)" }} />
-              已配置的 Webhook 工具（{webhooks.length}/16）
+            <span style={{ fontSize: "calc(12.5px * var(--ts, 1))", fontWeight: 600, color: "var(--ink)" }}>
+              Webhook 列表（{webhooks.length}/16）
             </span>
             <PocketButton size="sm" variant="soft" onClick={() => setAddingHook((v) => !v)}>
               <Plus size={13} />
-              <span>{addingHook ? "收起表单" : "新增 Webhook"}</span>
+              <span>{addingHook ? "收起" : "新增 Webhook"}</span>
             </PocketButton>
           </div>
 
@@ -315,31 +309,36 @@ export function PluginsPane() {
                 <PocketInput
                   value={hookName}
                   onChange={(e) => setHookName(e.target.value)}
-                  placeholder="工具名称（例如：触发测试部署 / 写入 Notion 日报）"
+                  placeholder="名称（如：触发部署）"
                 />
                 <PocketInput
                   value={hookDesc}
                   onChange={(e) => setHookDesc(e.target.value)}
-                  placeholder="工具说明（告诉小羊什么时候应该调用它）"
+                  placeholder="用途说明（可选）"
                 />
                 <PocketInput
                   value={hookUrl}
                   onChange={(e) => setHookUrl(e.target.value)}
-                  placeholder="公开地址（例如：https://hooks.example.com/trigger）"
+                  placeholder="https://hooks.example.com/trigger"
                   spellCheck={false}
                 />
                 <PocketInput
                   value={hookSecret}
                   onChange={(e) => setHookSecret(e.target.value)}
-                  placeholder="X-Webhook-Secret 请求头密钥（可选，服务端脱敏保存）"
+                  placeholder="X-Webhook-Secret（可选）"
                   spellCheck={false}
                 />
                 <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
                   <PocketButton size="sm" variant="ghost" onClick={() => setAddingHook(false)}>
                     取消
                   </PocketButton>
-                  <PocketButton size="sm" variant="primary" disabled={savingKey === "webhooks"} onClick={() => void addWebhook()}>
-                    保存工具
+                  <PocketButton
+                    size="sm"
+                    variant="primary"
+                    disabled={savingKey === "webhooks"}
+                    onClick={() => void addWebhook()}
+                  >
+                    保存
                   </PocketButton>
                 </div>
               </div>
@@ -352,7 +351,7 @@ export function PluginsPane() {
                 <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <strong style={{ color: "var(--ink)", fontSize: "calc(13px * var(--ts, 1))" }}>{w.name}</strong>
-                    <code className="mono" style={{ fontSize: "calc(11px * var(--ts, 1))", color: "var(--muted)" }}>
+                    <code className="mono" style={TAG_STYLE}>
                       webhook_{w.id}
                     </code>
                     {w.secretHeader ? <PocketBadge tone="mint">已设密钥</PocketBadge> : null}
@@ -376,6 +375,42 @@ export function PluginsPane() {
           ))}
         </div>
       ) : null}
+
+      <SetHeading>Herdr Pocket 插件</SetHeading>
+      {POCKET_PLUGINS.map((item) => {
+        const Icon = item.icon;
+        const checked = cfg.plugins.aiBrowser;
+        return (
+          <SetRow
+            key={item.id}
+            title={
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
+                <Icon size={15} style={{ color: "var(--primary)", flex: "none" }} />
+                <span>{item.title}</span>
+                <PocketBadge tone="lav">{item.categoryLabel}</PocketBadge>
+                <code className="mono" style={TAG_STYLE}>
+                  {item.cli}
+                </code>
+              </span>
+            }
+            about={item.about}
+          >
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+              {checked ? (
+                <PocketButton size="sm" variant="soft" onClick={handleOpenAiBrowser}>
+                  打开标签
+                </PocketButton>
+              ) : null}
+              <PocketSwitch
+                checked={checked}
+                disabled={savingKey === item.id}
+                label={item.title}
+                onCheckedChange={(v) => void toggleAiBrowser(v)}
+              />
+            </div>
+          </SetRow>
+        );
+      })}
     </div>
   );
 }

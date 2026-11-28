@@ -199,15 +199,22 @@ export function selectMatchingEgoSpaceWindow(
   }
 
   // Priority 3: untitled/generic "ego lite" window or single non-conflicting Ego Lite window.
+  // Never hijack an existing user/other-space browser window when multiple spaces exist or a named
+  // TaskSpace / specific tab title was requested but has not appeared in any OS window title yet.
+  const hasOtherSpaces = allSpaces.some((s) =>
+    target.spaceId !== undefined
+      ? s.id !== target.spaceId
+      : s.createdBy === "user" || (Boolean(targetName) && normalizeTitleToken(s.name) !== targetName),
+  );
   const eligible = egoWins.filter((w) => !windowMatchesAnyToken(w.title.toLowerCase(), otherExclusiveTitles));
   const genericSingle = eligible.filter((w) => {
     const wt = normalizeTitleToken(w.title);
     return wt === "ego lite" || wt === "";
   });
-  if (genericSingle.length === 1) {
+  if (genericSingle.length === 1 && !hasOtherSpaces) {
     return genericSingle[0];
   }
-  if (egoWins.length === 1 && eligible.length === 1) {
+  if (egoWins.length === 1 && eligible.length === 1 && !hasOtherSpaces && !targetName && myTabTitles.length === 0) {
     return eligible[0];
   }
   return undefined;

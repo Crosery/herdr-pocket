@@ -89,6 +89,8 @@ export const SAFE_AGAIN = new Set<RpcMethod>([
   "portal.fileTicket",
   "portal.dirList",
   "portal.bundleHtml",
+  "browser.status",
+  "browser.net",
 ]);
 
 export type WebRtcSignaler = (offer: WebRtcOfferParams) => Promise<WebRtcAnswerResult>;

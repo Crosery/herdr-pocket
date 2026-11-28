@@ -157,6 +157,7 @@ const SAFE_AGAIN = new Set<RpcMethod>([
   "session.events", "session.children", "spaces.list", "host.info", "agent.seen", "agent.ports",
   "herdr.layout", "folders.list", "sessions.list", "sessions.search", "sessions.read", "sessions.usage", "harness.icons",
   "tools.check", "tools.updateStatus", "files.readChunk", "portal.list", "portal.frame", "portal.fileTicket", "portal.dirList", "portal.bundleHtml",
+  "browser.status", "browser.net",
 ]);
 
 /** React Native's WebSocket also takes request headers (the DOM typing doesn't know). */

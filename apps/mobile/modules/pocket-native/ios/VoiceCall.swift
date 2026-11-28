@@ -16,11 +16,24 @@ private struct CallError: LocalizedError {
   var errorDescription: String? { message }
 }
 
+/// Returns the currently active iOS 15+ system microphone mode (`AVCaptureDevice.activeMicrophoneMode`).
+func currentIosMicMode() -> String {
+  if #available(iOS 15.0, *) {
+    switch AVCaptureDevice.activeMicrophoneMode {
+    case .voiceIsolation: return "voiceIsolation"
+    case .standard: return "standard"
+    case .wideSpectrum: return "wideSpectrum"
+    @unknown default: return "unknown"
+    }
+  }
+  return "unknown"
+}
+
 /**
  * One voice call to the relay's /v1/assistant/live, the iOS side of VoiceCall.kt.
  * Audio never passes through JavaScript: the microphone goes straight through the
- * zero-stall native pipeline (`VoxLock -> DPDFNet-baseline -> VocalEnhancer`) to the
- * socket, speech straight to the speaker, and playback receipts follow what was
+ * zero-stall native pipeline (`DPDFNet-baseline -> VoxLock TSE -> Silero VAD + ERes2NetV2 SV -> VocalEnhancer -> residual gate`)
+ * to the socket, speech straight to the speaker, and playback receipts follow what was
  * actually heard (MOSS-Live playback.* events).
  */
 final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
@@ -229,6 +242,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
           )
         }
 
+        let coreMLActive = loaded?.coreMLActive ?? false
         self.micQueue.async { [weak self] in
           guard let self else { return }
           self.voiceModels = loaded
@@ -236,7 +250,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
           self.modelsLoaded = true
           self.q.async {
             if self.ended { return }
-            self.emitInitTelemetry(filter: createdFilter, loadMs: loadMs, enrollMs: enrollMs)
+            self.emitInitTelemetry(filter: createdFilter, loadMs: loadMs, enrollMs: enrollMs, coreMLActive: coreMLActive)
           }
         }
       }
@@ -244,7 +258,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       micQueue.async { [weak self] in
         self?.modelsLoaded = true
       }
-      emitInitTelemetry(filter: nil, loadMs: 0, enrollMs: 0)
+      emitInitTelemetry(filter: nil, loadMs: 0, enrollMs: 0, coreMLActive: false)
     }
 
     guard let url = wsUrl(server, "/v1/assistant/live") else {
@@ -455,7 +469,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     }
   }
 
-  private func emitInitTelemetry(filter f: VoiceFilter?, loadMs: Int64, enrollMs: Int64) {
+  private func emitInitTelemetry(filter f: VoiceFilter?, loadMs: Int64, enrollMs: Int64, coreMLActive: Bool) {
     lastRoute = currentAudioRoute()
     let svEnabled = f?.svEnabled ?? false
     let tseEnabled = f?.tseEnabled ?? false
@@ -470,6 +484,8 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       "stage": "init",
       "platform": "ios",
       "route": lastRoute,
+      "ios_mic_mode": currentIosMicMode(),
+      "coreml_active": coreMLActive,
       "models": activeModels,
       "denoise_enabled": denoiseActive,
       "denoise_model": denoiseActive ? "dpdfnet_baseline" : "none",
@@ -493,6 +509,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     emitTelemetry([
       "stage": "utterance",
       "route": lastRoute,
+      "ios_mic_mode": currentIosMicMode(),
       "kind": r.kind,
       "pass": r.pass,
       "sv_score": finiteDouble(r.svScore, digits: 4),
@@ -523,6 +540,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     emitTelemetry([
       "stage": "periodic",
       "route": lastRoute,
+      "ios_mic_mode": currentIosMicMode(),
       "frames_in": framesIn,
       "frames_out": framesOut,
       "ws_gap_max_ms": gapMax,
@@ -556,6 +574,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       "stage": "summary",
       "platform": "ios",
       "route": lastRoute,
+      "ios_mic_mode": currentIosMicMode(),
       "duration_ms": max(0, monoMs() - startedAtMs),
       "frames_in": framesIn,
       "frames_out": framesOut,
@@ -774,7 +793,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
           pendingInitTelemetryJson = nil
           ws?.send(.string(pendingInit)) { _ in }
         }
-        PocketBus.emit("onCall", ["state": "ready"])
+        PocketBus.emit("onCall", ["state": "ready", "ios_mic_mode": currentIosMicMode()])
       case "error", "closed":
         let message = str("message")
         end(message.isEmpty ? "通话结束了" : message)
@@ -874,6 +893,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       "max_target_ms": Int64(playout.maxTargetMs),
       "underruns": -1,
       "stops": stops,
+      "ios_mic_mode": currentIosMicMode(),
     ]
     if let f = filter {
       if f.hopsIn > 0 {

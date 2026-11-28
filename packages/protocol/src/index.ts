@@ -499,7 +499,8 @@ export function splitFiles(message: string): { text: string; lines: string[]; co
   return { text: cleaned.join("\n").trim(), lines, count };
 }
 
-const foldMessageText = (s: string) => s.replace(/\s+/g, "");
+const foldMessageText = (s: string) =>
+  s.replace(/[\s\u200B-\u200D\uFEFF\u2060\u00AD]+/g, "");
 
 /** Whether a conversation copy matches what was typed/sent, ignoring attached picture marks and PTY whitespace shifts. */
 export function sameMessage(said: string, sent: string, hasFiles?: boolean): boolean {
@@ -927,12 +928,13 @@ export interface RpcMethods {
     params: { agent: string; action?: "list" | "stop"; pid?: number; port?: number };
     result: { ports: AgentListeningPort[] };
   };
-  /** Sync spaces bidirectionally between `herdr` TUI and `herdr-core`, or migrate TUI sessions into `herdr-core`. */
+  /** Sync spaces and agents bidirectionally between `herdr` TUI and `herdr-core`, or migrate TUI sessions into `herdr-core`. */
   "spaces.sync": {
-    params: { mode?: "sync" | "migrate"; herdrSpace?: string };
+    params: { mode?: "sync" | "migrate" | "spaces_only"; herdrSpace?: string; syncAgents?: boolean };
     result: {
       syncedToCore: number;
       syncedToHerdr: number;
+      syncedAgentsToHerdr?: number;
       migratedAgents: number;
       herdrAvailable: boolean;
       spaces: SpaceInfo[];
@@ -1039,7 +1041,7 @@ export interface RpcMethods {
     params: { serverName?: string };
     result: { available: boolean; spaces: PortalEgoSpaceState[] };
   };
-  /** Optional zero-dependency AI Browser plugin status (disabled by default via `plugins.aiBrowser`). */
+  /** Optional built-in AI Browser status (disabled by default via `plugins.aiBrowser`). */
   "browser.status": {
     params: Record<string, never>;
     result: {
@@ -1047,9 +1049,12 @@ export interface RpcMethods {
       backend: "desktop" | "cdp" | "none";
       spaces: BrowserSpaceSummary[];
       activeSpaceId?: string;
+      chromePath?: string;
+      resident?: boolean;
+      platform?: string;
     };
   };
-  /** Optional zero-dependency AI Browser plugin actions (`plugins.aiBrowser` must be enabled). */
+  /** Optional built-in AI Browser actions (`plugins.aiBrowser` must be enabled). */
   "browser.act": {
     params: {
       spaceId?: string;
@@ -1059,21 +1064,137 @@ export interface RpcMethods {
       target?: string;
       value?: string;
       key?: string;
+      deltaX?: number;
       deltaY?: number;
       label?: string;
       reason?: string;
       keep?: string[];
+      snapshotId?: string;
+      scope?: "viewport" | "full_page" | "subtree";
+      root?: string;
+      diff?: boolean;
+      maxChars?: number;
+      expression?: string;
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+      cdpMethod?: string;
+      cdpParams?: Record<string, unknown>;
+      waitKind?: "url" | "selector" | "response" | "function" | "load" | "human" | "timeout";
+      timeoutMs?: number;
+      includeBuffered?: boolean;
+      includeBody?: boolean;
+      requestId?: string;
+      filter?: string;
+      resourceTypes?: string[];
+      limit?: number;
+      tabAction?: "list" | "open" | "switch" | "close";
+      files?: string[];
+      accept?: boolean;
+      promptText?: string;
+      path?: string;
+      fullPage?: boolean;
+      expect?: {
+        urlIncludes?: string;
+        titleIncludes?: string;
+        selector?: string;
+        textIncludes?: string;
+        notTextIncludes?: string;
+        responseUrl?: string;
+        status?: number;
+      };
+      cookies?: Array<{
+        name: string;
+        value: string;
+        domain?: string;
+        path?: string;
+        url?: string;
+        secure?: boolean;
+        httpOnly?: boolean;
+        sameSite?: "Strict" | "Lax" | "None";
+        expires?: number;
+      }>;
+      x?: number;
+      y?: number;
+      toX?: number;
+      toY?: number;
+      agentKey?: string;
     };
     result: {
       ok: boolean;
       spaceId: string;
       page: string;
+      targetId?: string;
+      portalId?: string;
       url?: string;
       title?: string;
       ownership: BrowserSpaceOwnership;
       handoffReason?: string;
       snapshot?: string;
+      snapshotId?: string;
+      popups?: Array<{ label: string; targetId: string; url: string }>;
+      dialog?: { type: string; message: string; defaultPrompt?: string };
+      value?: unknown;
+      response?: {
+        ok: boolean;
+        status: number;
+        statusText: string;
+        url: string;
+        headers: Record<string, string>;
+        body: string;
+        fromCache?: boolean;
+        requestId?: string;
+        json?: unknown;
+      };
+      requests?: BrowserNetworkEntry[];
+      networkBody?: BrowserNetworkBodyResult;
+      screenshotPath?: string;
+      screenshotBase64?: string;
+      verified?: { satisfied: boolean; reason: string; actual?: Record<string, unknown> };
+      tabs?: BrowserSpacePageSummary[];
+      doctor?: Record<string, unknown>;
+      cursor?: BrowserCursorOverlay;
+      code?: string;
       note?: string;
+    };
+  };
+  /** Multi-step AI Browser script execution (parity with `ego-browser nodejs`). */
+  "browser.run": {
+    params: {
+      script: string;
+      spaceId?: string;
+      timeoutMs?: number;
+      agentKey?: string;
+    };
+    result: {
+      ok: boolean;
+      stdout: string;
+      stderr: string;
+      result?: unknown;
+      spaceId?: string;
+      portalId?: string;
+      durationMs: number;
+      timedOut?: boolean;
+      error?: string;
+    };
+  };
+  /** Built-in AI Browser CDP network inspection (`list`, `body`, `clear`). */
+  "browser.net": {
+    params: {
+      spaceId?: string;
+      page?: string;
+      action: "list" | "body" | "clear";
+      requestId?: string;
+      filter?: string;
+      resourceTypes?: string[];
+      limit?: number;
+    };
+    result: {
+      spaceId: string;
+      page: string;
+      requests?: BrowserNetworkEntry[];
+      body?: BrowserNetworkBodyResult;
+      total?: number;
     };
   };
 }
@@ -1082,23 +1203,96 @@ export type BrowserSpaceOwnership = "user" | "agentWorking" | "agentHandoff";
 
 export type BrowserActOp =
   | "open"
+  | "navigate"
+  | "back"
+  | "forward"
+  | "reload"
   | "snapshot"
   | "click"
   | "dblclick"
   | "hover"
   | "fill"
+  | "type"
   | "select"
   | "press"
   | "scroll"
+  | "drag"
+  | "upload"
+  | "dialog"
+  | "wait"
+  | "verify"
+  | "eval"
+  | "fetch"
+  | "cdp"
+  | "screenshot"
+  | "tabs"
+  | "net_list"
+  | "net_body"
+  | "net_wait"
+  | "net_clear"
   | "handoff"
+  | "takeover"
   | "resume"
-  | "finish";
+  | "finish"
+  | "popout"
+  | "import_cookies"
+  | "doctor";
+
+export interface BrowserCursorOverlay {
+  x: number;
+  y: number;
+  viewportW: number;
+  viewportH: number;
+  box?: { x: number; y: number; width: number; height: number };
+  label?: string;
+  op?: string;
+  at: number;
+}
+
+export interface BrowserNetworkEntry {
+  requestId: string;
+  seq: number;
+  method: string;
+  url: string;
+  resourceType?: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  startedAt: number;
+  durationMs?: number;
+  encodedDataLength?: number;
+  fromCache?: boolean;
+  failed?: boolean;
+  errorText?: string;
+  completed: boolean;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  postData?: string;
+}
+
+export interface BrowserNetworkBodyResult {
+  requestId: string;
+  url: string;
+  status?: number;
+  mimeType?: string;
+  base64Encoded: boolean;
+  body: string;
+  truncated?: boolean;
+  json?: unknown;
+}
 
 export interface BrowserSpacePageSummary {
   label: string;
   title: string;
   url: string;
   active?: boolean;
+  targetId?: string;
+  portalId?: string;
+  openedBy?: "agent" | "user" | "popup";
+  networkCount?: number;
+  canGoBack?: boolean;
+  canGoForward?: boolean;
+  snapshotId?: string;
 }
 
 export interface BrowserSpaceSummary {
@@ -1109,6 +1303,13 @@ export interface BrowserSpaceSummary {
   statusText?: string;
   handoffReason?: string;
   activePage?: string;
+  portalId?: string;
+  hostId?: string;
+  networkCount?: number;
+  cursor?: BrowserCursorOverlay;
+  headed?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
   pages: BrowserSpacePageSummary[];
 }
 
@@ -1201,6 +1402,12 @@ export interface PortalItem {
   url?: string;
   windowId?: string;
   egoSpace?: PortalEgoSpaceState;
+  aiBrowserSpaceId?: string;
+  aiBrowserPageLabel?: string;
+  aiBrowserOwnership?: BrowserSpaceOwnership;
+  aiBrowserStatusText?: string;
+  aiBrowserNetworkCount?: number;
+  aiBrowserCursor?: BrowserCursorOverlay;
   mime?: string;
   size?: number;
   width?: number;
@@ -1726,7 +1933,34 @@ export interface RpcError {
  */
 export type AssistantConfirm = "never" | "always";
 
-export type AssistantPluginId = "browser" | "workspace" | "webfetch" | "webhooks";
+export type AssistantPluginId =
+  | "herdr"
+  | "uniflo"
+  | "browser"
+  | "workspace"
+  | "webfetch"
+  | "webhooks";
+
+export type PocketPluginId = "ai-browser";
+export type PluginScope = "assistant" | "pocket";
+export type PluginCategory = "tools" | "cli" | "workflow";
+
+export interface PluginManifest {
+  id: string;
+  scope: PluginScope;
+  category: PluginCategory;
+  name: string;
+  summary: string;
+  defaultEnabled: boolean;
+  /** Tool names exposed to Xiaoyang when `scope === "assistant"`. */
+  tools?: string[];
+  /** CLI commands exposed under `herdr-pocket` when `scope === "pocket"`. */
+  cli?: string[];
+  /** Client config key when `scope === "pocket"` (e.g. `"plugins.aiBrowser"`). */
+  configKey?: string;
+  /** Semantic icon identifier (no emoji). */
+  icon: string;
+}
 
 export interface AssistantWebhookTool {
   id: string;
@@ -1738,7 +1972,7 @@ export interface AssistantWebhookTool {
 
 export interface AssistantSettings {
   confirm: AssistantConfirm;
-  /** Optional Xiaoyang tool plugins, all disabled (false) by default for zero context overhead. */
+  /** Xiaoyang tool-pack plugin states (`herdr`/`uniflo` default true; others default false). */
   plugins?: Partial<Record<AssistantPluginId, boolean>>;
   /** User-configured HTTP POST webhook tools active when `plugins.webhooks` is enabled. */
   webhooks?: AssistantWebhookTool[];

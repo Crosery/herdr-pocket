@@ -266,6 +266,227 @@ async function findWorkspaceFileBySuffix(
   return pick ? { realRoot, real: pick.real, rel: pick.rel } : null;
 }
 
+const SMART_RESOLVE_CACHE_TTL_MS = 30_000;
+const SMART_RESOLVE_CACHE_MAX = 256;
+const smartResolveCache = new Map<string, { at: number; hit: { realRoot: string; real: string; rel: string } }>();
+
+/**
+ * Strips accidental quotes, brackets, zero-width spaces, embedded hard-wrap newlines,
+ * `file://` schemes, and `#L12-L20` / `:12` line suffixes from a requested file path.
+ */
+export function sanitizeRequestedFilePath(raw: string): string {
+  let clean = raw
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[\r\n]+/g, "")
+    .trim()
+    .replace(/^[<("'`\u201c\u2018]+|[>)"'`\u201d\u2019.,;!?]+$/g, "");
+  if (/^file:\/\//i.test(clean)) {
+    clean = clean.slice("file://".length);
+    if (clean.startsWith("localhost/")) clean = clean.slice("localhost".length);
+    try {
+      clean = decodeURIComponent(clean);
+    } catch {
+      // keep raw path if percent-encoding is malformed
+    }
+  }
+  clean = clean.replace(/#L\d+(?:-L?\d+)?$/i, "");
+  const colon = /:(\d+)(?::\d+)?$/.exec(clean);
+  if (colon) {
+    const prefix = clean.slice(0, colon.index);
+    if (prefix && !/^[A-Za-z]$/.test(prefix)) clean = prefix;
+  }
+  return clean.trim();
+}
+
+function defaultAgentArtifactRoots(): string[] {
+  const home = homedir();
+  const candidates = [
+    join(home, ".gemini", "antigravity-cli", "brain"),
+    join(home, ".gemini", "antigravity", "brain"),
+    join(home, ".local", "state", "herdr-core", "default", "files"),
+    join(home, ".claude"),
+    join(home, ".codex"),
+  ];
+  return candidates;
+}
+
+async function searchArtifactRootsBySuffix(
+  artifactRoots: string[],
+  allowedRealRoots: string[],
+  suffixes: string[],
+  realPrivates: string[],
+): Promise<{ realRoot: string; real: string; rel: string } | null> {
+  const cleanSuffixes = [...new Set(suffixes.map((s) => s.replace(/\\/g, "/").replace(/^\/+/, "")).filter(Boolean))];
+  if (!cleanSuffixes.length) return null;
+
+  // Tier 2A: O(1) direct join probe across known artifact roots (instant <1ms for `<uuid>/<file>`).
+  for (const base of artifactRoots) {
+    const realBase = await realpath(base).catch(() => null);
+    if (!realBase) continue;
+    const allowedParent = allowedRealRoots.find((r) => inside(r, realBase));
+    if (!allowedParent) continue;
+    for (const sfx of cleanSuffixes) {
+      const parts = sfx.split("/").filter((p) => p && p !== ".");
+      if (!parts.length || parts.includes("..") || parts.some(isPrivateName)) continue;
+      const real = await realpath(join(realBase, ...parts)).catch(() => null);
+      if (!real || !inside(allowedParent, real)) continue;
+      const st = await stat(real).catch(() => null);
+      if (!st?.isFile()) continue;
+      const relParts = relative(allowedParent, real).split(sep).filter(Boolean);
+      if (relParts.some(isPrivateName) || isPrivateName(basename(real))) continue;
+      if (realPrivates.some((dir) => inside(dir, real))) continue;
+      return { realRoot: allowedParent, real, rel: relParts.join("/") || basename(real) };
+    }
+  }
+
+  // Tier 2B: Bounded shallow BFS (depth <= 3) in artifact/brain dirs for bare filenames or truncated paths.
+  const lowerSuffixes = cleanSuffixes.map((s) => s.toLowerCase());
+  let best: { priority: number; mtimeMs: number; realRoot: string; real: string; rel: string } | null = null;
+  for (const base of artifactRoots) {
+    const realBase = await realpath(base).catch(() => null);
+    if (!realBase) continue;
+    const allowedParent = allowedRealRoots.find((r) => inside(r, realBase));
+    if (!allowedParent) continue;
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: realBase, depth: 0 }];
+    let visited = 0;
+    while (queue.length > 0 && visited < 4000) {
+      const cur = queue.shift()!;
+      const dirents = await readdir(cur.dir, { withFileTypes: true }).catch(() => null);
+      if (!dirents) continue;
+      for (const d of dirents) {
+        visited += 1;
+        if (visited > 4000) break;
+        if (isPrivateName(d.name) || d.name === ".system_generated" || IGNORED_WORKSPACE_DIRS.has(d.name)) continue;
+        const full = join(cur.dir, d.name);
+        if (d.isDirectory()) {
+          if (cur.depth + 1 <= 3) queue.push({ dir: full, depth: cur.depth + 1 });
+          continue;
+        }
+        if (!d.isFile()) continue;
+        const fullNorm = full.replace(/\\/g, "/").toLowerCase();
+        let matchedPriority = -1;
+        for (let si = 0; si < lowerSuffixes.length; si++) {
+          const ls = lowerSuffixes[si]!;
+          if (fullNorm === ls || fullNorm.endsWith(`/${ls}`)) {
+            matchedPriority = si;
+            break;
+          }
+        }
+        if (matchedPriority < 0) continue;
+        const real = await realpath(full).catch(() => null);
+        if (!real || !inside(allowedParent, real)) continue;
+        const relParts = relative(allowedParent, real).split(sep).filter(Boolean);
+        if (relParts.some(isPrivateName) || isPrivateName(basename(real))) continue;
+        if (realPrivates.some((dir) => inside(dir, real))) continue;
+        const st = await stat(real).catch(() => null);
+        if (!st?.isFile()) continue;
+        if (!best || matchedPriority < best.priority || (matchedPriority === best.priority && st.mtimeMs > best.mtimeMs)) {
+          best = {
+            priority: matchedPriority,
+            mtimeMs: st.mtimeMs,
+            realRoot: allowedParent,
+            real,
+            rel: relParts.join("/") || basename(real),
+          };
+        }
+      }
+    }
+  }
+  return best ? { realRoot: best.realRoot, real: best.real, rel: best.rel } : null;
+}
+
+/**
+ * Smart, fast, security-preserving file locator:
+ * 1) Sanitizes stray quotes/newlines/`file://` schemes.
+ * 2) Tries exact `resolveInside` (O(1)).
+ * 3) Probes known Agent artifact/brain roots (O(1) direct join, then depth<=3 search).
+ * 4) Falls back to workspace suffix & trailing-segment matching inside `root`.
+ * Always enforces `PRIVATE_NAME` and `privateDirs` boundaries.
+ */
+export async function smartResolveFile(
+  root: string | undefined,
+  rawPath: string,
+  o: FilesOptions = {},
+): Promise<{ realRoot: string; real: string; rel: string }> {
+  const clean = sanitizeRequestedFilePath(rawPath);
+  if (!clean) throw new FilesError("bad_request", "需要 path");
+
+  try {
+    return await resolveInside(root, clean, o);
+  } catch (err) {
+    if (!(err instanceof FilesError) || err.code !== "not_found") {
+      throw err;
+    }
+
+    const cacheKey = `${root ?? ""}\0${clean}\0${(o.extraRoots ?? []).join("|")}`;
+    const cached = smartResolveCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < SMART_RESOLVE_CACHE_TTL_MS) {
+      const stillThere = await stat(cached.hit.real).catch(() => null);
+      if (stillThere?.isFile()) return cached.hit;
+      smartResolveCache.delete(cacheKey);
+    }
+
+    const realRoot = root && isAbsolute(root) ? await realpath(root).catch(() => null) : null;
+    const resolvedExtras: string[] = [];
+    for (const extra of o.extraRoots ?? []) {
+      if (!extra) continue;
+      const expanded = expandHome(extra);
+      if (!isAbsolute(expanded)) continue;
+      const r = await realpath(expanded).catch(() => null);
+      if (r) resolvedExtras.push(r);
+    }
+    const allowedRoots = [...(realRoot ? [realRoot] : []), ...resolvedExtras];
+    const realPrivates = await Promise.all((o.privateDirs ?? []).map((dir) => realpath(dir).catch(() => dir)));
+
+    const rawNorm = clean.replace(/\\/g, "/");
+    const rootNorm = root?.replace(/\\/g, "/").replace(/\/+$/, "") ?? "";
+    const realRootNorm = realRoot?.replace(/\\/g, "/").replace(/\/+$/, "") ?? "";
+
+    // Build prioritized suffix candidates from most specific to basename.
+    const candidates: string[] = [];
+    if (rootNorm && rawNorm.startsWith(`${rootNorm}/`)) candidates.push(rawNorm.slice(rootNorm.length + 1));
+    if (realRootNorm && rawNorm.startsWith(`${realRootNorm}/`)) candidates.push(rawNorm.slice(realRootNorm.length + 1));
+    if (!/^(\/|~\/|~|[A-Za-z]:)/.test(rawNorm)) {
+      candidates.push(rawNorm.replace(/^\.\//, ""));
+    }
+    const segments = rawNorm.split("/").filter((p) => p && p !== "." && p !== "..");
+    if (segments.length >= 3) candidates.push(segments.slice(-3).join("/"));
+    if (segments.length >= 2) candidates.push(segments.slice(-2).join("/"));
+    if (segments.length >= 1) candidates.push(segments[segments.length - 1]!);
+
+    const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
+    const putCache = (hit: { realRoot: string; real: string; rel: string }) => {
+      if (smartResolveCache.size >= SMART_RESOLVE_CACHE_MAX) {
+        const oldest = smartResolveCache.keys().next().value;
+        if (oldest) smartResolveCache.delete(oldest);
+      }
+      smartResolveCache.set(cacheKey, { at: Date.now(), hit });
+      return hit;
+    };
+
+    // Fast path 1: direct/shallow match in known agent artifact & brain directories (when covered by extraRoots).
+    if (resolvedExtras.length > 0) {
+      const artifactHit = await searchArtifactRootsBySuffix(
+        [...defaultAgentArtifactRoots(), ...resolvedExtras.filter((r) => r !== homedir())],
+        allowedRoots,
+        uniqueCandidates,
+        realPrivates,
+      );
+      if (artifactHit) return putCache(artifactHit);
+    }
+
+    // Fast path 2: workspace suffix search (most specific candidate first).
+    if (realRoot) {
+      for (const sfx of uniqueCandidates) {
+        const hit = await findWorkspaceFileBySuffix(realRoot, sfx, o);
+        if (hit) return putCache(hit);
+      }
+    }
+
+    throw err;
+  }
+}
+
 const byName = (a: string, b: string) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }) || (a < b ? -1 : a > b ? 1 : 0);
 
 export async function listFiles(
@@ -337,30 +558,7 @@ export async function readFileSlice(
   o: FilesOptions = {},
 ): Promise<RpcResult<"files.read">> {
   if (typeof p.path !== "string" || !p.path) throw new FilesError("bad_request", "需要 path");
-  let resolved: { realRoot: string; real: string; rel: string };
-  try {
-    resolved = await resolveInside(root, p.path, o);
-  } catch (err) {
-    if (err instanceof FilesError && err.code === "not_found" && root && isAbsolute(root)) {
-      const realRoot = await realpath(root).catch(() => null);
-      if (realRoot) {
-        const rawNorm = p.path.replace(/\\/g, "/");
-        let suffix = rawNorm;
-        const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
-        const realRootNorm = realRoot.replace(/\\/g, "/").replace(/\/+$/, "");
-        if (rawNorm.startsWith(`${rootNorm}/`)) suffix = rawNorm.slice(rootNorm.length + 1);
-        else if (rawNorm.startsWith(`${realRootNorm}/`)) suffix = rawNorm.slice(realRootNorm.length + 1);
-        else if (/^(\/|~\/|~|[A-Za-z]:)/.test(rawNorm)) suffix = "";
-        const hit = suffix ? await findWorkspaceFileBySuffix(realRoot, suffix, o) : null;
-        if (hit) resolved = hit;
-        else throw err;
-      } else {
-        throw err;
-      }
-    } else {
-      throw err;
-    }
-  }
+  const resolved = await smartResolveFile(root, p.path, o);
   const { real, rel } = resolved;
   const st = await stat(real);
   if (st.isDirectory()) throw new FilesError("bad_request", "这是一个目录，用 files.list 看");

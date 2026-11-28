@@ -2,6 +2,7 @@ import type {
   AssistantConfigChange,
   AssistantConfigView,
   AssistantItem,
+  AssistantPluginId,
   AssistantSettings,
   AssistantState,
   ModelTestResult,
@@ -15,6 +16,36 @@ import type {
 import { createStore, settingsStore } from "./store";
 import { getActiveToken, restRequest } from "./relay";
 import { isMockServer, mockApi } from "./mock";
+
+export const DEFAULT_ASSISTANT_PLUGINS: Record<AssistantPluginId, boolean> = {
+  herdr: true,
+  uniflo: true,
+  browser: false,
+  workspace: false,
+  webfetch: false,
+  webhooks: false,
+};
+
+export function resolveAssistantPlugins(
+  raw?: Partial<Record<AssistantPluginId, boolean>>,
+): Record<AssistantPluginId, boolean> {
+  return {
+    herdr: raw?.herdr !== false,
+    uniflo: raw?.uniflo !== false,
+    browser: raw?.browser === true,
+    workspace: raw?.workspace === true,
+    webfetch: raw?.webfetch === true,
+    webhooks: raw?.webhooks === true,
+  };
+}
+
+function normalizeAssistantSettings(s?: AssistantSettings): AssistantSettings {
+  return {
+    confirm: s?.confirm ?? "never",
+    plugins: resolveAssistantPlugins(s?.plugins),
+    ...(s?.webhooks ? { webhooks: s.webhooks } : {}),
+  };
+}
 
 export interface AssistantStoreState {
   items: AssistantItem[];
@@ -38,7 +69,7 @@ export const assistantStore = createStore<AssistantStoreState>({
   voice: false,
   model: null,
   reminders: [],
-  settings: { confirm: "never" },
+  settings: normalizeAssistantSettings(),
   loaded: false,
   error: null,
   unread: 0,
@@ -79,7 +110,7 @@ export function applyAssistantState(s: AssistantState): void {
     voice: s.voice,
     model: s.model ?? null,
     reminders: s.reminders,
-    settings: s.settings ?? { confirm: "never" },
+    settings: normalizeAssistantSettings(s.settings),
     loaded: true,
     error: null,
   });
@@ -272,11 +303,11 @@ export async function saveAssistantPrompt(id: PromptId, body: { text?: string; r
 export async function loadAssistantSettings(): Promise<AssistantSettings> {
   const server = settingsStore.get().server;
   if (server && isMockServer(server)) {
-    const cur = mockApi.assistantSettings();
+    const cur = normalizeAssistantSettings(mockApi.assistantSettings());
     assistantStore.set({ settings: cur });
     return cur;
   }
-  const s = await assistantApi<AssistantSettings>("/v1/assistant/settings");
+  const s = normalizeAssistantSettings(await assistantApi<AssistantSettings>("/v1/assistant/settings"));
   assistantStore.set({ settings: s });
   return s;
 }
@@ -284,11 +315,19 @@ export async function loadAssistantSettings(): Promise<AssistantSettings> {
 export async function updateAssistantSettings(patch: Partial<AssistantSettings>): Promise<AssistantSettings> {
   const server = settingsStore.get().server;
   if (server && isMockServer(server)) {
-    const next = mockApi.saveAssistantSettings(patch);
+    const prev = assistantStore.get().settings;
+    const saved = normalizeAssistantSettings(mockApi.saveAssistantSettings(patch));
+    const next: AssistantSettings = {
+      ...saved,
+      plugins: resolveAssistantPlugins({
+        ...resolveAssistantPlugins(prev.plugins),
+        ...(patch.plugins ?? {}),
+      }),
+    };
     assistantStore.set({ settings: next });
     return next;
   }
-  const next = await assistantApi<AssistantSettings>("/v1/assistant/settings", { body: patch });
+  const next = normalizeAssistantSettings(await assistantApi<AssistantSettings>("/v1/assistant/settings", { body: patch }));
   assistantStore.set({ settings: next });
   return next;
 }

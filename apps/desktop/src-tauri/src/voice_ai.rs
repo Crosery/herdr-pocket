@@ -635,6 +635,24 @@ mod ort {
     pub const ALLOCATOR_ARENA: i32 = 1;
     pub const MEM_DEFAULT: i32 = 0;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ExecutionProvider {
+        /// Pure CPU execution provider (preferred for tiny 10 ms stateful recurrent models).
+        Cpu,
+        /// Prefer Apple CoreML Execution Provider (ANE-only) on macOS for heavy neural models,
+        /// with guaranteed automatic fallback to CPU EP on non-macOS, Intel Macs without ANE,
+        /// missing symbol, or `CreateSession` failure.
+        CoreMlPreferred,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    pub const COREML_FLAG_USE_NONE: u32 = 0x000;
+    /// `COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE` from ONNX Runtime `coreml_provider_factory.h`:
+    /// activates CoreML EP only on ANE-equipped Macs (Apple Silicon) while keeping Intel Macs on CPU.
+    #[cfg(target_os = "macos")]
+    pub const COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE: u32 = 0x004;
+
     // Exact slot indices from ONNX Runtime `onnxruntime_c_api.h` (stable since API v7/v10..v24).
     const IDX_GET_ERROR_CODE: usize = 1;
     const IDX_GET_ERROR_MESSAGE: usize = 2;
@@ -885,6 +903,26 @@ mod ort {
                 Err(msg)
             }
         }
+
+        #[cfg(target_os = "macos")]
+        fn append_coreml_ep(
+            &self,
+            opts: *mut OrtSessionOptions,
+            flags: u32,
+        ) -> Result<(), String> {
+            let Some(sym) = (unsafe {
+                self._lib
+                    .symbol("OrtSessionOptionsAppendExecutionProvider_CoreML")
+            }) else {
+                return Err(
+                    "OrtSessionOptionsAppendExecutionProvider_CoreML symbol not exported".into(),
+                );
+            };
+            let append_fn: unsafe extern "C" fn(*mut OrtSessionOptions, u32) -> *mut OrtStatus =
+                unsafe { std::mem::transmute(sym) };
+            let st = unsafe { append_fn(opts, flags) };
+            self.check_status(st)
+        }
     }
 
     struct SessionInner {
@@ -1053,11 +1091,10 @@ mod ort {
     }
 
     impl Session {
-        pub fn create(
-            rt: &Arc<OrtRuntime>,
-            model_path: &Path,
+        fn build_session_options<'a>(
+            rt: &'a OrtRuntime,
             intra_threads: i32,
-        ) -> Result<Self, String> {
+        ) -> Result<OptionsGuard<'a>, String> {
             let mut opts_raw: *mut OrtSessionOptions = std::ptr::null_mut();
             let create_opts: unsafe extern "system" fn(*mut *mut OrtSessionOptions) -> *mut OrtStatus =
                 unsafe { std::mem::transmute(rt.slot(IDX_CREATE_SESSION_OPTIONS)) };
@@ -1090,7 +1127,14 @@ mod ort {
                 let cv = CString::new(v).unwrap();
                 let _ = rt.check_status(unsafe { add_cfg(opts.raw, ck.as_ptr(), cv.as_ptr()) });
             }
+            Ok(opts)
+        }
 
+        fn create_raw_session(
+            rt: &OrtRuntime,
+            model_path: &Path,
+            opts: &OptionsGuard<'_>,
+        ) -> Result<*mut OrtSession, String> {
             let mut session_raw: *mut OrtSession = std::ptr::null_mut();
             let create_sess: unsafe extern "system" fn(
                 *const OrtEnv,
@@ -1117,6 +1161,103 @@ mod ort {
                 unsafe { create_sess(rt.env, cpath.as_ptr(), opts.raw, &mut session_raw) }
             };
             rt.check_status(st)?;
+            Ok(session_raw)
+        }
+
+        pub fn create(
+            rt: &Arc<OrtRuntime>,
+            model_path: &Path,
+            intra_threads: i32,
+        ) -> Result<Self, String> {
+            Self::create_with_ep(rt, model_path, intra_threads, ExecutionProvider::Cpu)
+        }
+
+        pub fn create_with_ep(
+            rt: &Arc<OrtRuntime>,
+            model_path: &Path,
+            intra_threads: i32,
+            ep: ExecutionProvider,
+        ) -> Result<Self, String> {
+            #[cfg(target_os = "macos")]
+            let session_raw = if ep == ExecutionProvider::CoreMlPreferred {
+                let model_label = model_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model.onnx");
+                let coreml_session = match Self::build_session_options(rt, intra_threads) {
+                    Ok(coreml_opts) => {
+                        match rt.append_coreml_ep(
+                            coreml_opts.raw,
+                            COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE,
+                        ) {
+                            Ok(()) => match Self::create_raw_session(rt, model_path, &coreml_opts) {
+                                Ok(raw) => {
+                                    logging::info(
+                                        "voice.ai",
+                                        "ORT CoreML EP attached (ANE)",
+                                        serde_json::json!({
+                                            "model": model_label,
+                                            "flags": COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE,
+                                            "intraThreads": intra_threads,
+                                        }),
+                                    );
+                                    Some(raw)
+                                }
+                                Err(err) => {
+                                    logging::warn(
+                                        "voice.ai",
+                                        "ORT CoreML EP CreateSession failed; falling back to CPU EP",
+                                        serde_json::json!({
+                                            "model": model_label,
+                                            "error": err,
+                                        }),
+                                    );
+                                    None
+                                }
+                            },
+                            Err(err) => {
+                                logging::info(
+                                    "voice.ai",
+                                    "ORT CoreML EP unavailable; using CPU EP",
+                                    serde_json::json!({
+                                        "model": model_label,
+                                        "reason": err,
+                                    }),
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        logging::warn(
+                            "voice.ai",
+                            "ORT CoreML SessionOptions init failed; falling back to CPU EP",
+                            serde_json::json!({
+                                "model": model_label,
+                                "error": err,
+                            }),
+                        );
+                        None
+                    }
+                };
+                match coreml_session {
+                    Some(raw) => raw,
+                    None => {
+                        let cpu_opts = Self::build_session_options(rt, intra_threads)?;
+                        Self::create_raw_session(rt, model_path, &cpu_opts)?
+                    }
+                }
+            } else {
+                let cpu_opts = Self::build_session_options(rt, intra_threads)?;
+                Self::create_raw_session(rt, model_path, &cpu_opts)?
+            };
+
+            #[cfg(not(target_os = "macos"))]
+            let session_raw = {
+                let _ = ep;
+                let cpu_opts = Self::build_session_options(rt, intra_threads)?;
+                Self::create_raw_session(rt, model_path, &cpu_opts)?
+            };
 
             let mut sess = Self {
                 inner: Arc::new(SessionInner {
@@ -2104,7 +2245,9 @@ pub mod dsp {
                 }
                 let rms = (sq / (chunk.len().max(1) as f64)).sqrt() as f32;
                 if !allow_boost {
-                    self.noise_rms = 0.92 * self.noise_rms + 0.08 * rms;
+                    if rms < 0.025 {
+                        self.noise_rms = 0.92 * self.noise_rms + 0.08 * rms;
+                    }
                 } else if rms < self.noise_rms {
                     self.noise_rms = 0.88 * self.noise_rms + 0.12 * rms;
                 } else if rms < self.noise_rms * 1.8 {
@@ -2372,7 +2515,7 @@ pub mod dsp {
 
 mod models {
     use super::dsp::{vorbis_window_320, Fbank, Fft320};
-    use super::ort::{DpdfConfig, OrtRuntime, Session, Value};
+    use super::ort::{DpdfConfig, ExecutionProvider, OrtRuntime, Session, Value};
     use super::*;
 
     pub struct LoadedModels {
@@ -2421,6 +2564,8 @@ mod models {
             None
         };
 
+        // Keep tiny 10 ms recurrent stateful streaming models (DPDFNet & Silero VAD) on CPU EP
+        // to avoid CoreML/ANE per-frame dispatch overhead and dynamic state issues.
         let dpdf = dpdf_path
             .as_deref()
             .map(|p| Session::create(&rt, p, 1))
@@ -2434,14 +2579,18 @@ mod models {
             .map(|n| n.get().min(2) as i32)
             .unwrap_or(1)
             .max(1);
+        // Accelerate heavy neural models (ERes2NetV2 SV & VoxLock TSE) via macOS CoreML EP (ANE)
+        // with automatic fallback to CPU EP.
         let speaker = sv_path
             .as_deref()
-            .map(|p| Session::create(&rt, p, workers))
+            .map(|p| Session::create_with_ep(&rt, p, workers, ExecutionProvider::CoreMlPreferred))
             .transpose()?;
         let tse_enroll = if te_path.is_some() && tc_path.is_some() {
             te_path
                 .as_deref()
-                .map(|p| Session::create(&rt, p, workers))
+                .map(|p| {
+                    Session::create_with_ep(&rt, p, workers, ExecutionProvider::CoreMlPreferred)
+                })
                 .transpose()?
         } else {
             None
@@ -2449,7 +2598,9 @@ mod models {
         let tse_chunk = if tse_enroll.is_some() {
             tc_path
                 .as_deref()
-                .map(|p| Session::create(&rt, p, workers))
+                .map(|p| {
+                    Session::create_with_ep(&rt, p, workers, ExecutionProvider::CoreMlPreferred)
+                })
                 .transpose()?
         } else {
             None
@@ -5101,14 +5252,63 @@ pub fn process_recording_with_config(samples: &[i16], cfg: &VoiceAiConfig) -> Pr
         None
     };
 
-    // Path A: Clean HPF voiceprint verification (NEVER denoised/TSE audio).
+    // Path A: Run DPDFNet denoise + VoxLock TSE target extraction FIRST so SV evaluates
+    // the separated target stream (or denoised stream when TSE is off) instead of raw overlap.
+    let mut audio_buf = clean_hpf.clone();
+    dsp::HighPass80::default().process_in_place(&mut audio_buf);
+
+    let mut used_dpdf = false;
+    if cfg.denoise {
+        if let Some(ref m) = loaded {
+            if let (Some(dpdf_sess), Some(dpdf_cfg)) = (m.dpdf.as_ref(), m.dpdf_cfg.as_ref()) {
+                let mut denoiser = models::Denoiser::new(&m.rt, dpdf_sess, dpdf_cfg);
+                if let Ok(enhanced) = denoiser.process_buffer(&audio_buf) {
+                    audio_buf = enhanced;
+                    used_dpdf = true;
+                }
+            }
+        }
+    }
+
+    let mut used_tse = false;
+    let mut tse_atten_db = 0.0f64;
+    let mut tse_out_rms = 0.0f32;
+    if want_tse {
+        if let (Some(ref m), Some(owner_sample)) = (&loaded, load_owner_sample()) {
+            if let (Some(te), Some(tc)) = (m.tse_enroll.as_ref(), m.tse_chunk.as_ref()) {
+                if let Ok((enr, _)) = models::VoxLockEnrollment::compute(&m.rt, te, &owner_sample)
+                {
+                    let enr = Arc::new(enr);
+                    if let Ok(mut ext) = models::TargetExtractor::new(&m.rt, tc, &enr) {
+                        if let Ok(extracted) = ext.process_buffer(&audio_buf) {
+                            let in_rms = dsp::rms(&audio_buf).max(1e-5);
+                            let out_rms = dsp::rms(&extracted).max(1e-5);
+                            tse_atten_db =
+                                20.0 * (f64::from(out_rms) / f64::from(in_rms)).log10();
+                            tse_out_rms = out_rms;
+                            audio_buf = extracted;
+                            used_tse = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Path B: Verify owner voiceprint on the TSE-separated (or DPDFNet-denoised) stream,
+    // falling back to clean HPF when neither neural stage ran.
     let mut sv_passed = true;
     let mut sv_score = 1.0f32;
     if want_sv {
         if let (Some(ref m), Some(vp)) = (&loaded, enrolled_vp) {
             if let Some(sp_sess) = m.speaker.as_ref() {
                 let speaker = models::Speaker::new(&m.rt, sp_sess);
-                let speech_slice = extract_voiced_speech(&clean_hpf, m);
+                let sv_source: &[f32] = if used_tse || used_dpdf {
+                    &audio_buf
+                } else {
+                    &clean_hpf
+                };
+                let speech_slice = extract_voiced_speech(sv_source, m);
                 if speech_slice.len() >= VOICE_RATE / 4 {
                     if let Ok(raw_emb) = speaker.embed(&speech_slice) {
                         let norm = dsp::normalize_embedding(&raw_emb);
@@ -5129,59 +5329,21 @@ pub fn process_recording_with_config(samples: &[i16], cfg: &VoiceAiConfig) -> Pr
         }
     }
 
-    // Path B: Optional VoxLock TSE -> DPDFNet / Pure-Rust DSP -> VocalEnhancer.
-    let mut audio_buf = clean_hpf.clone();
-    dsp::HighPass80::default().process_in_place(&mut audio_buf);
-
-    let mut used_tse = false;
-    if want_tse {
-        if let (Some(ref m), Some(owner_sample)) = (&loaded, load_owner_sample()) {
-            if let (Some(te), Some(tc)) = (m.tse_enroll.as_ref(), m.tse_chunk.as_ref()) {
-                if let Ok((enr, _)) = models::VoxLockEnrollment::compute(&m.rt, te, &owner_sample)
-                {
-                    let enr = Arc::new(enr);
-                    if let Ok(mut ext) = models::TargetExtractor::new(&m.rt, tc, &enr) {
-                        if let Ok(extracted) = ext.process_buffer(&audio_buf) {
-                            let in_rms = dsp::rms(&audio_buf).max(1e-5);
-                            let out_rms = dsp::rms(&extracted).max(1e-5);
-                            let atten_db = 20.0 * (f64::from(out_rms) / f64::from(in_rms)).log10();
-                            // If VoxLock completely attenuated the signal and SV rejected clean path, reject.
-                            if !sv_passed && atten_db < -12.0 && out_rms < 0.004 {
-                                return ProcessOutcome::RejectNonOwner {
-                                    reason: "未检测到本人声纹，已忽略环境人声".into(),
-                                    score: sv_score,
-                                };
-                            }
-                            audio_buf = extracted;
-                            used_tse = true;
-                        }
-                    }
-                }
-            }
+    if want_sv && !sv_passed {
+        let should_reject = !used_tse
+            || tse_atten_db < LiveCallProcessor::TSE_GATE_CLOSE_DB
+            || sv_score < cfg.threshold - SvTracker::STRONG_NON_OWNER_MARGIN
+            || tse_out_rms < 0.004;
+        if should_reject {
+            return ProcessOutcome::RejectNonOwner {
+                reason: "未检测到本人声纹，已忽略环境人声".into(),
+                score: sv_score,
+            };
         }
     }
 
-    if want_sv && !sv_passed && !used_tse {
-        return ProcessOutcome::RejectNonOwner {
-            reason: "未检测到本人声纹，已忽略环境人声".into(),
-            score: sv_score,
-        };
-    }
-
-    let mut used_dpdf = false;
-    if cfg.denoise {
-        if let Some(ref m) = loaded {
-            if let (Some(dpdf_sess), Some(dpdf_cfg)) = (m.dpdf.as_ref(), m.dpdf_cfg.as_ref()) {
-                let mut denoiser = models::Denoiser::new(&m.rt, dpdf_sess, dpdf_cfg);
-                if let Ok(enhanced) = denoiser.process_buffer(&audio_buf) {
-                    audio_buf = enhanced;
-                    used_dpdf = true;
-                }
-            }
-        }
-        if !used_dpdf {
-            audio_buf = dsp::SpectralNoiseGate::default().process_buffer(&audio_buf);
-        }
+    if cfg.denoise && !used_dpdf {
+        audio_buf = dsp::SpectralNoiseGate::default().process_buffer(&audio_buf);
     }
 
     if cfg.enhance_vocal {
@@ -5332,9 +5494,14 @@ struct SvTracker {
     threshold: f32,
     session_emb: Option<Vec<f32>>,
     sv_confirmed_non_owner: bool,
+    sv_confirmed_owner: bool,
+    last_score: Option<f32>,
+    non_owner_streak: usize,
 }
 
 impl SvTracker {
+    const STRONG_NON_OWNER_MARGIN: f32 = 0.06;
+
     fn new(
         enrolled: Option<&VoiceprintRecord>,
         first_lock_mode: bool,
@@ -5356,7 +5523,29 @@ impl SvTracker {
             threshold: clamp_threshold(threshold),
             session_emb: None,
             sv_confirmed_non_owner: false,
+            sv_confirmed_owner: false,
+            last_score: None,
+            non_owner_streak: 0,
         }
+    }
+
+    fn reset_utterance(&mut self) {
+        self.sv_confirmed_non_owner = false;
+        self.sv_confirmed_owner = false;
+        self.last_score = None;
+        self.non_owner_streak = 0;
+    }
+
+    fn has_identity_reference(&self) -> bool {
+        self.enrolled.is_some() || self.session_emb.is_some()
+    }
+
+    fn has_strong_non_owner_margin(&self) -> bool {
+        self.sv_confirmed_non_owner
+            && (self
+                .last_score
+                .is_some_and(|s| s < self.threshold - Self::STRONG_NON_OWNER_MARGIN)
+                || self.non_owner_streak >= 2)
     }
 
     fn apply_result(
@@ -5390,8 +5579,11 @@ impl SvTracker {
             } else {
                 sv.blended
             };
+            self.last_score = Some(effective_score);
             if effective_score >= req {
                 self.sv_confirmed_non_owner = false;
+                self.sv_confirmed_owner = true;
+                self.non_owner_streak = 0;
                 if used_samples >= VOICE_RATE * 3 / 5
                     && sv.blended >= (self.threshold + 0.08).max(0.46)
                     && !(tse_active && smoothed_tse_atten_db < -6.0)
@@ -5400,6 +5592,8 @@ impl SvTracker {
                 }
             } else if speaking {
                 self.sv_confirmed_non_owner = true;
+                self.sv_confirmed_owner = false;
+                self.non_owner_streak = self.non_owner_streak.saturating_add(1);
             }
             return;
         }
@@ -5407,8 +5601,11 @@ impl SvTracker {
         if self.first_lock_mode {
             if let Some(ref sess) = self.session_emb {
                 let sc = dsp::cosine(&norm, sess);
+                self.last_score = Some(sc);
                 if sc >= req {
                     self.sv_confirmed_non_owner = false;
+                    self.sv_confirmed_owner = true;
+                    self.non_owner_streak = 0;
                     if used_samples >= VOICE_RATE * 3 / 5
                         && sc >= (self.threshold + 0.08).max(0.46)
                         && !(tse_active && smoothed_tse_atten_db < -6.0)
@@ -5417,9 +5614,14 @@ impl SvTracker {
                     }
                 } else if speaking {
                     self.sv_confirmed_non_owner = true;
+                    self.sv_confirmed_owner = false;
+                    self.non_owner_streak = self.non_owner_streak.saturating_add(1);
                 }
             } else {
                 self.sv_confirmed_non_owner = false;
+                self.sv_confirmed_owner = true;
+                self.last_score = Some(1.0);
+                self.non_owner_streak = 0;
                 if used_samples >= VOICE_RATE * 3 / 5 || is_end {
                     self.session_emb = Some(norm);
                 }
@@ -5671,6 +5873,8 @@ pub struct LiveCallProcessor {
     smoothed_tse_atten_db: f64,
     suppressing_residual: bool,
     gate_phase: usize,
+    gate_release_hold: usize,
+    onset_gain: f32,
     sync_offline: bool,
 }
 
@@ -5680,12 +5884,20 @@ impl LiveCallProcessor {
     const SPEECH_PROB: f32 = 0.35;
     const START_WINDOWS: usize = 3;
     const END_WINDOWS: usize = 12;
-    const EARLY_VOICED_W: usize = 13;
-    const FULL_VOICED_W: usize = 26;
-    const RECHECK_STEP_W: usize = 20;
+    const EARLY_VOICED_W: usize = 8;
+    const FULL_VOICED_W: usize = 22;
+    const RECHECK_STEP_W: usize = 16;
     const MIN_END_VOICED_W: usize = 8;
     const MAX_CLEAN_SPEECH_SAMPLES: usize = VOICE_RATE * 3 / 2;
     const RAMP_SAMPLES: usize = 256;
+    const TSE_GATE_CLOSE_DB: f64 = -2.5;
+    const TSE_GATE_OPEN_DB: f64 = -1.2;
+    const GATE_RELEASE_HOLD_FRAMES: usize = 2;
+    const ONSET_SV_UNCERTAIN_GAIN: f32 = 0.45;
+    const ONSET_TSE_UNCERTAIN_GAIN: f32 = 0.78;
+    const ONSET_TSE_ATTEN_GAIN: f32 = 0.25;
+    const ONSET_ATTACK_SAMPLES: f32 = 96.0;
+    const ONSET_RELEASE_SAMPLES: f32 = 256.0;
 
     pub fn new() -> Self {
         Self::with_config(load_config())
@@ -5857,6 +6069,8 @@ impl LiveCallProcessor {
             smoothed_tse_atten_db: 0.0,
             suppressing_residual: false,
             gate_phase: Self::RAMP_SAMPLES,
+            gate_release_hold: 0,
+            onset_gain: 1.0,
             sync_offline,
         }
     }
@@ -5875,6 +6089,44 @@ impl LiveCallProcessor {
 
     pub fn is_suppressing(&self) -> bool {
         self.suppressing_residual
+    }
+
+    fn allow_vocal_boost(&self) -> bool {
+        if !self.has_sv {
+            return true;
+        }
+        if self.suppressing_residual || self.sv_tracker.sv_confirmed_non_owner {
+            return false;
+        }
+        // Only boost speech confirmed as the owner (or while acquiring the very first
+        // speaker in first-speaker lock mode before any identity reference exists).
+        self.sv_tracker.sv_confirmed_owner || !self.sv_tracker.has_identity_reference()
+    }
+
+    fn target_onset_gain(&self, used_tse: bool) -> f32 {
+        if !self.has_sv || !self.sv_tracker.has_identity_reference() {
+            return 1.0;
+        }
+        if self.suppressing_residual {
+            // Residual gate owns the smooth raised-cosine fade to 0.0; hold onset_gain
+            // steady so sample 0 of suppression stays continuous with the previous frame.
+            return self.onset_gain;
+        }
+        if self.sv_tracker.sv_confirmed_owner {
+            return 1.0;
+        }
+        // Unverified onset / pre-roll before SV confirms owner: apply gentle attenuation
+        // (stronger if VoxLock TSE already reports non-target attenuation) and snap back
+        // with fast attack as soon as owner is confirmed.
+        if used_tse {
+            if self.smoothed_tse_atten_db < Self::TSE_GATE_CLOSE_DB {
+                Self::ONSET_TSE_ATTEN_GAIN
+            } else {
+                Self::ONSET_TSE_UNCERTAIN_GAIN
+            }
+        } else {
+            Self::ONSET_SV_UNCERTAIN_GAIN
+        }
     }
 
     pub fn engine_label(&self) -> String {
@@ -5916,38 +6168,19 @@ impl LiveCallProcessor {
         }
 
         self.poll_sv_results();
+
+        // Keep clean HPF64 as fallback SV/VAD path when both neural denoise and TSE are off/unready.
         let mut clean_hpf = [0.0f32; 320];
         self.hpf64.process_slice(&in_f32, &mut clean_hpf);
-        if self.vad.is_some() || self.has_sv || self.tse.is_some() {
-            self.feed_clean_vad(&clean_hpf);
-        }
 
         let mut audio_buf = in_f32;
         self.hpf80.process_in_place(&mut audio_buf);
 
-        let mut raw_aligned = audio_buf;
-        let tse_in = audio_buf;
-        let used_tse = if let Some(ref tse) = self.tse {
-            tse.push_and_pop_320(&tse_in, &mut audio_buf, &mut raw_aligned, self.sync_offline)
-        } else {
-            false
-        };
-        if used_tse && self.last_vad_prob >= Self::SPEECH_PROB {
-            let raw_rms = dsp::rms(&raw_aligned);
-            if raw_rms > 0.012 {
-                let tse_rms = dsp::rms(&audio_buf);
-                let hop_atten = 20.0
-                    * (f64::from(tse_rms.max(1e-5)) / f64::from(raw_rms.max(1e-5))).log10();
-                self.smoothed_tse_atten_db =
-                    0.78 * self.smoothed_tse_atten_db + 0.22 * hop_atten;
-            }
-        } else if !used_tse {
-            self.smoothed_tse_atten_db = 0.0;
-        }
-
+        // Stage 1: Run DPDFNet denoise (or pure-Rust noise gate fallback) FIRST so background
+        // noise is stripped before VoxLock TSE and speaker verification.
+        let mut used_dpdf = false;
         if self.cfg.denoise {
             let mut denoised = [0.0f32; 320];
-            let mut used_dpdf = false;
             if let Some(ref mut d) = self.denoiser {
                 if d.hop(&audio_buf[..160], &mut denoised[..160]).is_ok()
                     && d.hop(&audio_buf[160..320], &mut denoised[160..320]).is_ok()
@@ -5964,14 +6197,56 @@ impl LiveCallProcessor {
             audio_buf = denoised;
         }
 
+        // Stage 2: Run VoxLock TSE target extraction BEFORE VAD + ERes2NetV2 SV so overlapping
+        // speech is separated into the target stream before speaker verification scores it.
+        let mut raw_aligned = audio_buf;
+        let tse_in = audio_buf;
+        let used_tse = if let Some(ref tse) = self.tse {
+            tse.push_and_pop_320(&tse_in, &mut audio_buf, &mut raw_aligned, self.sync_offline)
+        } else {
+            false
+        };
+
+        // Stage 3: Feed the TSE-separated stream (or DPDFNet-denoised stream when TSE is off,
+        // falling back to clean HPF64 when neither ran) into Silero VAD + ERes2NetV2 SV.
+        if self.vad.is_some() || self.has_sv || self.tse.is_some() {
+            let sv_input = if used_tse || used_dpdf {
+                audio_buf
+            } else {
+                clean_hpf
+            };
+            self.feed_clean_vad(&sv_input);
+        }
+
+        if used_tse {
+            let raw_rms = dsp::rms(&raw_aligned);
+            let tse_rms = dsp::rms(&audio_buf);
+            if raw_rms > 0.012
+                && (self.last_vad_prob >= Self::SPEECH_PROB
+                    || (raw_rms > 0.025 && tse_rms < raw_rms * 0.5))
+            {
+                let hop_atten = 20.0
+                    * (f64::from(tse_rms.max(1e-5)) / f64::from(raw_rms.max(1e-5))).log10();
+                self.smoothed_tse_atten_db =
+                    0.78 * self.smoothed_tse_atten_db + 0.22 * hop_atten;
+            }
+        } else {
+            self.smoothed_tse_atten_db = 0.0;
+        }
+
+        // Stage 4: Update residual suppression gate BEFORE vocal enhancement so unverified or
+        // confirmed non-owner frames are never boosted by the 1.5-3.8 kHz presence enhancer.
+        self.update_residual_gate(used_tse);
+
         if self.cfg.enhance_vocal {
-            let allow_boost = if self.vad.is_some() {
+            let speech_active = if self.vad.is_some() {
                 self.last_vad_prob >= Self::SPEECH_PROB
             } else if self.cfg.denoise {
                 self.noise_gate.last_speech_active()
             } else {
                 true
             };
+            let allow_boost = speech_active && self.allow_vocal_boost();
             self.enhancer.process_in_place_gated(&mut audio_buf, allow_boost);
         } else if self.cfg.denoise {
             for s in &mut audio_buf {
@@ -5979,8 +6254,7 @@ impl LiveCallProcessor {
             }
         }
 
-        self.update_residual_gate(used_tse);
-        self.apply_residual_gate(&mut audio_buf);
+        self.apply_residual_gate(&mut audio_buf, used_tse);
 
         let mut out_pcm = [0i16; 320];
         for (dst, &s) in out_pcm.iter_mut().zip(audio_buf.iter()) {
@@ -5990,8 +6264,8 @@ impl LiveCallProcessor {
         (out_pcm, rms_level(&audio_buf))
     }
 
-    fn feed_clean_vad(&mut self, clean_hpf: &[f32; 320]) {
-        self.vad_accum.extend_from_slice(clean_hpf);
+    fn feed_clean_vad(&mut self, sv_frame: &[f32; 320]) {
+        self.vad_accum.extend_from_slice(sv_frame);
         while self.vad_accum.len() >= models::Vad::WINDOW {
             let win: Vec<f32> = self.vad_accum.drain(..models::Vad::WINDOW).collect();
             let mut boosted = [0.0f32; models::Vad::WINDOW];
@@ -6027,7 +6301,8 @@ impl LiveCallProcessor {
                     self.since_check_w = 0;
                     self.early_tried = false;
                     self.full_tried = false;
-                    self.sv_tracker.sv_confirmed_non_owner = false;
+                    self.gate_release_hold = 0;
+                    self.sv_tracker.reset_utterance();
                 }
             } else if is_voiced {
                 self.sil_run = 0;
@@ -6057,7 +6332,7 @@ impl LiveCallProcessor {
                     self.full_tried = true;
                     self.launch_sv_check(VOICE_RATE, false);
                 } else if self.full_tried && self.since_check_w >= Self::RECHECK_STEP_W {
-                    self.launch_sv_check(Self::MAX_CLEAN_SPEECH_SAMPLES, false);
+                    self.launch_sv_check(VOICE_RATE, false);
                 }
             } else if just_ended {
                 if !self.sv_in_flight && !self.full_tried && self.utt_voiced_w >= Self::MIN_END_VOICED_W
@@ -6065,7 +6340,9 @@ impl LiveCallProcessor {
                     self.launch_sv_check(VOICE_RATE, true);
                 }
                 self.suppressing_residual = false;
-                self.sv_tracker.sv_confirmed_non_owner = false;
+                self.gate_release_hold = 0;
+                self.smoothed_tse_atten_db = 0.0;
+                self.sv_tracker.reset_utterance();
                 self.clean_speech_buf.clear();
             }
         }
@@ -6127,29 +6404,54 @@ impl LiveCallProcessor {
     fn update_residual_gate(&mut self, used_tse: bool) {
         if !self.has_sv {
             self.suppressing_residual = false;
+            self.gate_release_hold = 0;
             return;
         }
         if !self.speaking || !self.sv_tracker.sv_confirmed_non_owner {
             self.suppressing_residual = false;
+            self.gate_release_hold = 0;
             return;
         }
         if used_tse {
+            // Decouple the old `-9.0 dB` AND deadlock:
+            // SV now scores the TSE-separated target stream, so confirmed non-owner closes
+            // the residual gate on moderate TSE attenuation (`< -2.5 dB`) OR a clear low-cosine
+            // / consecutive non-owner SV verdict, while keeping hysteresis + release hold to
+            // avoid chatter and a dual-talk safety margin for single borderline scores when
+            // TSE is not attenuating.
+            let strong_sv_reject = self.sv_tracker.has_strong_non_owner_margin();
             if self.suppressing_residual {
-                if self.smoothed_tse_atten_db >= -7.5 {
-                    self.suppressing_residual = false;
+                let want_open = !strong_sv_reject
+                    && self.smoothed_tse_atten_db >= Self::TSE_GATE_OPEN_DB;
+                if want_open {
+                    self.gate_release_hold += 1;
+                    if self.gate_release_hold >= Self::GATE_RELEASE_HOLD_FRAMES {
+                        self.suppressing_residual = false;
+                        self.gate_release_hold = 0;
+                    }
+                } else {
+                    self.gate_release_hold = 0;
                 }
-            } else if self.smoothed_tse_atten_db < -9.0 {
+            } else if strong_sv_reject || self.smoothed_tse_atten_db < Self::TSE_GATE_CLOSE_DB {
                 self.suppressing_residual = true;
+                self.gate_release_hold = 0;
             }
         } else {
             self.suppressing_residual = true;
+            self.gate_release_hold = 0;
         }
     }
 
-    fn apply_residual_gate(&mut self, audio_buf: &mut [f32; 320]) {
-        if !self.suppressing_residual && self.gate_phase >= Self::RAMP_SAMPLES {
+    fn apply_residual_gate(&mut self, audio_buf: &mut [f32; 320], used_tse: bool) {
+        let target_onset = self.target_onset_gain(used_tse);
+        let onset_active =
+            (self.onset_gain - 1.0).abs() > 1e-4 || (target_onset - 1.0).abs() > 1e-4;
+        if !self.suppressing_residual && self.gate_phase >= Self::RAMP_SAMPLES && !onset_active {
+            self.onset_gain = 1.0;
             return;
         }
+        let attack_step = 1.0 / Self::ONSET_ATTACK_SAMPLES;
+        let release_step = 1.0 / Self::ONSET_RELEASE_SAMPLES;
         for sample in audio_buf.iter_mut() {
             if self.suppressing_residual {
                 if self.gate_phase > 0 {
@@ -6158,7 +6460,7 @@ impl LiveCallProcessor {
             } else if self.gate_phase < Self::RAMP_SAMPLES {
                 self.gate_phase += 1;
             }
-            let gain = if self.gate_phase >= Self::RAMP_SAMPLES {
+            let residual_gain = if self.gate_phase >= Self::RAMP_SAMPLES {
                 1.0
             } else if self.gate_phase == 0 {
                 0.0
@@ -6168,7 +6470,14 @@ impl LiveCallProcessor {
                         / (Self::RAMP_SAMPLES as f32))
                         .cos()
             };
-            *sample *= gain;
+
+            if self.onset_gain < target_onset {
+                self.onset_gain = (self.onset_gain + attack_step).min(target_onset);
+            } else if self.onset_gain > target_onset {
+                self.onset_gain = (self.onset_gain - release_step).max(target_onset);
+            }
+
+            *sample *= residual_gain * self.onset_gain;
         }
     }
 }
@@ -7074,5 +7383,287 @@ mod tests {
             out_energy < in_energy,
             "LiveCallProcessor must actually process and attenuate stationary noise (in={in_energy}, out={out_energy})"
         );
+    }
+
+    fn enrolled_test_config(enhance_vocal: bool) -> VoiceAiConfig {
+        let mut cfg = VoiceAiConfig::default();
+        cfg.denoise = false;
+        cfg.enhance_vocal = enhance_vocal;
+        cfg.filter = true;
+        cfg.threshold = 0.40;
+        cfg.voiceprint = Some(VoiceprintRecord {
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            prototypes: vec![vec![1.0, 0.0, 0.0, 0.0]],
+            model_version: VOICEPRINT_MODEL_VERSION.into(),
+            has_sample: false,
+            route: None,
+            snr_db: None,
+            seconds: 5.0,
+            consistency: 0.9,
+            lowest: 0.85,
+            created_at: 0,
+        });
+        cfg
+    }
+
+    #[test]
+    fn residual_gate_closes_on_non_owner_at_moderate_tse_attenuation_and_strong_sv() {
+        let mut proc = LiveCallProcessor::with_config_and_ort(enrolled_test_config(false), false);
+        proc.has_sv = true;
+        proc.speaking = true;
+
+        // 1) Borderline non-owner score (~0.35 < 0.39) + moderate TSE attenuation (-4.0 dB,
+        //    strictly above the old -9.0 dB deadlock) MUST close the residual gate.
+        proc.smoothed_tse_atten_db = -4.0;
+        proc.sv_tracker
+            .apply_result(&[0.35, 0.9367, 0.0, 0.0], 16_000, false, true, true, -4.0);
+        assert!(proc.sv_tracker.sv_confirmed_non_owner);
+        proc.update_residual_gate(true);
+        assert!(
+            proc.is_suppressing(),
+            "expected residual gate to close at -4.0 dB TSE attenuation (above old -9.0 dB deadlock)"
+        );
+
+        // Hysteresis + release hold: rising slightly to -1.8 dB (below -1.2 dB open threshold)
+        // must keep the gate closed without chattering.
+        proc.smoothed_tse_atten_db = -1.8;
+        proc.update_residual_gate(true);
+        assert!(proc.is_suppressing(), "expected hysteresis to prevent chatter at -1.8 dB");
+
+        // Rising above -1.2 dB opens smoothly only after release-hold frames when SV score is borderline.
+        proc.smoothed_tse_atten_db = -0.8;
+        proc.update_residual_gate(true);
+        assert!(proc.is_suppressing(), "expected 1st release frame to hold against chatter");
+        proc.update_residual_gate(true);
+        assert!(!proc.is_suppressing(), "expected gate to release after hold when non-strong & >= -1.2 dB");
+
+        // 2) Dual-talk safety margin: a single borderline SV miss (~0.36) with minimal TSE
+        //    attenuation (-1.0 dB) stays open to avoid chopping owner during dual-talk.
+        proc.sv_tracker.reset_utterance();
+        proc.smoothed_tse_atten_db = -1.0;
+        proc.sv_tracker
+            .apply_result(&[0.36, 0.933, 0.0, 0.0], 16_000, false, true, true, -1.0);
+        proc.update_residual_gate(true);
+        assert!(
+            !proc.is_suppressing(),
+            "single borderline SV miss with -1.0 dB TSE attenuation should keep dual-talk safety margin open"
+        );
+
+        // Second consecutive non-owner SV verdict confirms non-owner and closes the gate even at -1.0 dB.
+        proc.sv_tracker
+            .apply_result(&[0.36, 0.933, 0.0, 0.0], 16_000, false, true, true, -1.0);
+        proc.update_residual_gate(true);
+        assert!(
+            proc.is_suppressing(),
+            "consecutive non-owner SV verdicts must close residual gate even with mild TSE attenuation"
+        );
+
+        // 3) Clear low cosine similarity (orthogonal stranger ~0.0 << 0.40 - 0.06) closes the gate
+        //    immediately even if VoxLock barely attenuated (-0.5 dB).
+        proc.sv_tracker.reset_utterance();
+        proc.suppressing_residual = false;
+        proc.smoothed_tse_atten_db = -0.5;
+        proc.sv_tracker
+            .apply_result(&[0.0, 1.0, 0.0, 0.0], 16_000, false, true, true, -0.5);
+        proc.update_residual_gate(true);
+        assert!(
+            proc.is_suppressing(),
+            "clear non-owner SV score must close residual gate even at -0.5 dB TSE attenuation"
+        );
+    }
+
+    #[test]
+    fn owner_speech_stays_open_without_false_suppression_under_tse_attenuation() {
+        let mut proc = LiveCallProcessor::with_config_and_ort(enrolled_test_config(false), false);
+        proc.has_sv = true;
+        proc.speaking = true;
+
+        let mut tone = [0i16; 320];
+        for (i, s) in tone.iter_mut().enumerate() {
+            *s = (0.40 * (2.0 * PI * 700.0 * (i as f64) / 16000.0).sin() * 32767.0) as i16;
+        }
+
+        // Unverified onset before SV verdict applies gentle attenuation (not full 1.0 blast).
+        let _ = proc.process_frame_320(&tone);
+        let (_, onset_lvl) = proc.process_frame_320(&tone);
+        assert!(
+            proc.onset_gain < 0.70,
+            "expected unverified onset attenuation before owner confirmation, got onset_gain={}",
+            proc.onset_gain
+        );
+
+        // Once SV confirms owner (even when TSE attenuated an overlapping interferer by -4 dB or -10 dB),
+        // gate stays completely open and onset_gain attacks rapidly back to 1.0.
+        proc.smoothed_tse_atten_db = -4.0;
+        proc.sv_tracker
+            .apply_result(&[0.98, 0.1, 0.0, 0.0], 16_000, false, true, true, -4.0);
+        proc.update_residual_gate(true);
+        assert!(!proc.is_suppressing(), "owner must never be suppressed at -4.0 dB TSE attenuation");
+
+        proc.smoothed_tse_atten_db = -10.0;
+        proc.update_residual_gate(true);
+        assert!(!proc.is_suppressing(), "owner must never be suppressed at -10.0 dB TSE attenuation");
+
+        let (_, owner_lvl) = proc.process_frame_320(&tone);
+        assert!(
+            (proc.onset_gain - 1.0).abs() < 1e-4,
+            "expected fast attack to 1.0 once owner confirmed, got {}",
+            proc.onset_gain
+        );
+        assert!(
+            owner_lvl > onset_lvl * 1.4 && owner_lvl > 0.35,
+            "expected full unattenuated owner level > onset (owner={owner_lvl}, onset={onset_lvl})"
+        );
+    }
+
+    #[test]
+    fn vocal_enhancer_does_not_boost_confirmed_non_owner_or_unverified_frames() {
+        // Quiet 2.5 kHz tone squarely inside the 1.5-3.8 kHz presence boost band & AGC boost range.
+        let make_tone = |frame_idx: usize| -> [i16; 320] {
+            let mut buf = [0i16; 320];
+            for (i, s) in buf.iter_mut().enumerate() {
+                let idx = frame_idx * 320 + i;
+                let v = 0.06 * (2.0 * PI * 2500.0 * (idx as f64) / 16000.0).sin();
+                *s = (v * 32767.0) as i16;
+            }
+            buf
+        };
+        let ref_frame = make_tone(0);
+        let in_f32: Vec<f32> = ref_frame.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let in_rms = rms(&in_f32);
+
+        // 1) Confirmed owner: VocalEnhancer boosts presence & quiet level.
+        let mut proc_owner =
+            LiveCallProcessor::with_config_and_ort(enrolled_test_config(true), false);
+        proc_owner.has_sv = true;
+        proc_owner.speaking = true;
+        proc_owner
+            .sv_tracker
+            .apply_result(&[0.99, 0.05, 0.0, 0.0], 16_000, false, true, false, 0.0);
+        assert!(proc_owner.allow_vocal_boost());
+        let mut owner_out = [0i16; 320];
+        for f in 0..8 {
+            owner_out = proc_owner.process_frame_320(&make_tone(f)).0;
+        }
+        let owner_f32: Vec<f32> = owner_out.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let owner_rms = rms(&owner_f32);
+        assert!(
+            owner_rms > in_rms * 1.15,
+            "expected confirmed owner 2.5kHz speech boosted (in={in_rms}, owner={owner_rms})"
+        );
+
+        // 2) Confirmed non-owner: allow_vocal_boost() MUST be false, VocalEnhancer MUST NOT boost,
+        //    and the residual gate mutes output.
+        let mut proc_stranger =
+            LiveCallProcessor::with_config_and_ort(enrolled_test_config(true), false);
+        proc_stranger.has_sv = true;
+        proc_stranger.speaking = true;
+        proc_stranger
+            .sv_tracker
+            .apply_result(&[0.0, 1.0, 0.0, 0.0], 16_000, false, true, false, 0.0);
+        proc_stranger.update_residual_gate(false);
+        assert!(
+            !proc_stranger.allow_vocal_boost(),
+            "vocal enhancer boost must be blocked for confirmed non-owner"
+        );
+        // Verify directly that passing allow_boost=false into enhancer does not amplify the tone.
+        let mut unboosted = [0.0f32; 320];
+        unboosted.copy_from_slice(&in_f32);
+        proc_stranger
+            .enhancer
+            .process_in_place_gated(&mut unboosted, proc_stranger.allow_vocal_boost());
+        let unboosted_rms = rms(&unboosted);
+        assert!(
+            unboosted_rms <= in_rms * 1.01,
+            "confirmed non-owner frame must never be boosted by VocalEnhancer (in={in_rms}, out={unboosted_rms})"
+        );
+        let _ = proc_stranger.process_frame_320(&make_tone(0));
+        let (muted, muted_lvl) = proc_stranger.process_frame_320(&make_tone(1));
+        assert!(muted.iter().all(|&s| s == 0) && muted_lvl == 0.0);
+
+        // 3) Unverified speech onset (before SV confirms owner): NEVER boosted.
+        let mut proc_onset =
+            LiveCallProcessor::with_config_and_ort(enrolled_test_config(true), false);
+        proc_onset.has_sv = true;
+        proc_onset.speaking = true;
+        assert!(
+            !proc_onset.allow_vocal_boost(),
+            "vocal enhancer boost must be blocked during unverified speech onset"
+        );
+        let mut onset_out = [0i16; 320];
+        for f in 0..4 {
+            onset_out = proc_onset.process_frame_320(&make_tone(f)).0;
+        }
+        let onset_f32: Vec<f32> = onset_out.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let onset_rms = rms(&onset_f32);
+        assert!(
+            onset_rms < in_rms,
+            "unverified onset must be gently attenuated and never boosted (in={in_rms}, onset={onset_rms})"
+        );
+    }
+
+    #[test]
+    fn early_sv_window_is_tightened_and_utterance_end_resets_sv_and_tse_state() {
+        assert!(
+            LiveCallProcessor::EARLY_VOICED_W <= 10,
+            "EARLY_VOICED_W should be tightened from 13 to reduce initial unverified speech leak"
+        );
+        let mut proc = LiveCallProcessor::with_config_and_ort(enrolled_test_config(false), false);
+        proc.has_sv = true;
+        proc.speaking = true;
+        proc.smoothed_tse_atten_db = -8.0;
+        proc.sv_tracker
+            .apply_result(&[0.0, 1.0, 0.0, 0.0], 16_000, false, true, true, -8.0);
+        proc.update_residual_gate(true);
+        assert!(proc.is_suppressing());
+
+        // Feed silence frames until END_WINDOWS (12 * 512 = 6144 samples -> ~20 frames of 320).
+        let silence = [0i16; 320];
+        for _ in 0..22 {
+            let _ = proc.process_frame_320(&silence);
+        }
+        assert!(!proc.speaking, "silence must end active utterance");
+        assert!(!proc.is_suppressing(), "utterance end must clear residual suppression");
+        assert!(
+            !proc.sv_tracker.sv_confirmed_non_owner && !proc.sv_tracker.sv_confirmed_owner,
+            "utterance end must reset per-utterance SV state"
+        );
+        assert!(
+            proc.smoothed_tse_atten_db.abs() < 1e-6,
+            "utterance end must clear stale smoothed_tse_atten_db"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_coreml_ep_flags_and_optional_session_creation_work() {
+        assert_eq!(ort::COREML_FLAG_USE_NONE, 0x000);
+        assert_eq!(ort::COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE, 0x004);
+        assert_ne!(
+            ort::ExecutionProvider::Cpu,
+            ort::ExecutionProvider::CoreMlPreferred
+        );
+
+        // If ONNX Runtime and a heavy model (ERes2NetV2 / VoxLock) are present locally,
+        // verify CoreML EP attaches cleanly or falls back seamlessly to CPU EP without error.
+        let Some(ort_path) = discover_ort_library() else {
+            return;
+        };
+        let rt = ort::OrtRuntime::load_from(&ort_path).expect("load ORT dynamic library");
+        for spec in [SV_SPEC, VOXLOCK_ENROLL_SPEC, VOXLOCK_CHUNK_SPEC] {
+            if let Some(model_path) = discover_model_path(&spec) {
+                let sess = ort::Session::create_with_ep(
+                    &rt,
+                    &model_path,
+                    1,
+                    ort::ExecutionProvider::CoreMlPreferred,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("create_with_ep(CoreMlPreferred) failed for {}: {e}", spec.file_name)
+                });
+                assert!(!sess.input_names.is_empty());
+                assert!(!sess.output_names.is_empty());
+            }
+        }
     }
 }

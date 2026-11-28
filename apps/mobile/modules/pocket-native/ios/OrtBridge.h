@@ -66,10 +66,16 @@ typedef NS_ENUM(int32_t, ORTTensorElementDataType) {
 @end
 
 @interface ORTSession : NSObject
+@property (nonatomic, readonly) BOOL usingCoreML;
 - (instancetype)init NS_UNAVAILABLE;
 - (nullable instancetype)initWithEnv:(ORTEnv *)env
                            modelPath:(NSString *)modelPath
                       sessionOptions:(nullable ORTSessionOptions *)sessionOptions
+                               error:(NSError * _Nullable * _Nullable)error;
+- (nullable instancetype)initWithEnv:(ORTEnv *)env
+                           modelPath:(NSString *)modelPath
+                      sessionOptions:(nullable ORTSessionOptions *)sessionOptions
+                        preferCoreML:(BOOL)preferCoreML
                                error:(NSError * _Nullable * _Nullable)error;
 - (nullable NSArray<NSString *> *)inputNamesWithError:(NSError * _Nullable * _Nullable)error;
 - (nullable NSArray<NSString *> *)outputNamesWithError:(NSError * _Nullable * _Nullable)error;

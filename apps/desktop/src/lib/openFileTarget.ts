@@ -111,7 +111,11 @@ export function looksLikeClickableFilePath(rawToken: string): boolean {
 }
 
 export function parseFileTarget(raw: string, cwd?: string): ParsedFileTarget | null {
-  let clean = raw.trim().replace(/^[<("'`]+|[>)"'`]+$/g, "");
+  let clean = raw
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[\r\n]+/g, "")
+    .trim()
+    .replace(/^[<("'`\u201c\u2018]+|[>)"'`\u201d\u2019]+$/g, "");
   if (!clean || URL_SCHEME_RE.test(clean)) return null;
   if (/^file:\/\//i.test(clean)) {
     clean = clean.slice("file://".length);
