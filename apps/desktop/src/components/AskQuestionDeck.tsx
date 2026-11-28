@@ -116,18 +116,25 @@ export function AskQuestionDeck({
 
       <div className="ask-deck-question">{deck.question}</div>
 
+      {!deck.terminalMenuSynced && deck.multiSelect ? (
+        <div className="ask-deck-sync-hint">
+          多选菜单正在同步终端光标；如需勾选多项，请先点右上角「切到终端」或稍候 1 秒待终端菜单就绪。
+        </div>
+      ) : null}
+
       <div className="ask-deck-options" role="listbox" aria-multiselectable={deck.multiSelect || undefined} aria-label="可选项">
         {deck.entries.map((entry) => {
           const isEditingWriteIn = writeInEntry?.key === entry.key;
           const isBusy = busyKey === entry.key;
           const isChecked = Boolean(entry.checked);
+          const blockUnsyncedMulti = !deck.terminalMenuSynced && deck.multiSelect && !entry.isWriteIn;
           return (
             <button
               key={entry.key}
               type="button"
               role="option"
               aria-selected={deck.multiSelect ? isChecked : entry.selected || isEditingWriteIn}
-              disabled={busyKey !== null}
+              disabled={busyKey !== null || blockUnsyncedMulti}
               className={`ask-deck-opt${entry.selected ? " selected" : ""}${isChecked ? " checked" : ""}${entry.recommended ? " recommended" : ""}${isEditingWriteIn ? " editing" : ""}`}
               onClick={() => void handleOptionClick(entry)}
             >

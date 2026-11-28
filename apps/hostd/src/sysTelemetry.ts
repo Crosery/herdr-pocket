@@ -1,4 +1,5 @@
 import { arch, cpus, freemem, loadavg, release, totalmem } from "node:os";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { LogLevel } from "@herdr-pocket/protocol";
 
 export interface HostSystemProfile {
@@ -50,6 +51,10 @@ export function collectHostResourcePulse(stats: { agentCount: number; activeStre
   };
 }
 
+function roundDelayMs(ns: number): number {
+  return Number.isFinite(ns) && ns > 0 ? Math.round((ns / 1e6) * 10) / 10 : 0;
+}
+
 export function startHostTelemetry(
   emit: (level: LogLevel, kind: string, msg: string, data: Record<string, unknown>) => void,
   readStats: () => { agentCount: number; activeStreams: number; directPeers: number },
@@ -58,11 +63,27 @@ export function startHostTelemetry(
   const boot = collectHostSystemProfile();
   emit("info", "sys.host_boot", `hostd ${boot.os} (${boot.arch}, ${boot.displayServer})`, { ...boot });
 
+  const histogram = monitorEventLoopDelay({ resolution: 20 });
+  histogram.enable();
+
   const timer = setInterval(() => {
     const pulse = collectHostResourcePulse(readStats());
-    emit("info", "sys.host_pulse", `hostd rss=${pulse.rssMb}MB load=${pulse.load1m}`, pulse);
+    const hasSamples = histogram.count > 0;
+    const elMeanMs = hasSamples ? roundDelayMs(histogram.mean) : 0;
+    const elP99Ms = hasSamples ? roundDelayMs(histogram.percentile(99)) : 0;
+    const elMaxMs = hasSamples ? roundDelayMs(histogram.max) : 0;
+    histogram.reset();
+    emit("info", "sys.host_pulse", `hostd rss=${pulse.rssMb}MB load=${pulse.load1m} elP99=${elP99Ms}ms`, {
+      ...pulse,
+      elMeanMs,
+      elP99Ms,
+      elMaxMs,
+    });
   }, intervalMs);
   timer.unref?.();
 
-  return () => clearInterval(timer);
+  return () => {
+    clearInterval(timer);
+    histogram.disable();
+  };
 }

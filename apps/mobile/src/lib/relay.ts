@@ -345,9 +345,20 @@ class SocketLink implements Link {
         break;
       case "stream_open": {
         const s = this.streams.get(f.id);
-        if (f.error) applog("warn", "stream", `${s?.stream ?? "?"} stream failed: ${f.error.code}: ${f.error.message}`, { to: s?.to });
-        if (f.error) s?.onState?.({ status: "error", code: f.error.code, message: f.error.message });
-        else s?.onState?.({ status: "open", result: f.result });
+        if (f.error) {
+          const permanent =
+            f.error.code === "not_found" ||
+            f.error.code === "bad_request" ||
+            f.error.code === "forbidden" ||
+            f.error.code === "unsupported";
+          if (permanent) this.streams.delete(f.id);
+          if (f.error.code !== "not_found") {
+            applog("warn", "stream", `${s?.stream ?? "?"} stream failed: ${f.error.code}: ${f.error.message}`, { to: s?.to });
+          }
+          s?.onState?.({ status: "error", code: f.error.code, message: f.error.message });
+        } else {
+          s?.onState?.({ status: "open", result: f.result });
+        }
         break;
       }
       case "stream_event": {

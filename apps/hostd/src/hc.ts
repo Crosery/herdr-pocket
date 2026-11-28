@@ -1,6 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { SHELL_HARNESSES, normalizeStatus, parseTerminalChoices, type Agent, type AgentStatus, type TerminalDisplay } from "@herdr-pocket/protocol";
+import {
+  SHELL_HARNESSES,
+  normalizeStatus,
+  parseTerminalChoices,
+  type Agent,
+  type AgentInteraction,
+  type AgentStatus,
+  type TerminalDisplay,
+} from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
 import { HcScreens, type ScreenLines, type ScreenSnapshot } from "./hcscreen.ts";
 import { defaultHcBin, programName } from "./platform.ts";
@@ -100,6 +108,7 @@ export interface SubscreenDetection {
 
 const ACTIVE_INPUT_PROMPT_RE = /^(?:[❯›>](?:\s|$).*|.*\bshift\+tab\s+to\s+cycle\b.*|.*\?\s+for\s+shortcuts\b.*)$/i;
 const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+const ANSI_ESCAPE_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g;
 const AGY_REVIEW_STATUS_RE = /\bctx\s*·\s*reviewing\b/i;
 const AGY_NON_WORKING_FOOTER_RE = /\bctx\s*·\s*(?:idle|done|reviewing)\b/i;
 const AGY_WORKING_FOOTER_RE = /\bctx\s*·\s*workin/i;
@@ -111,25 +120,281 @@ const AGY_ACTIVE_SPINNER_RE =
   /^[⣾⣽⣻⢿⡿⣟⣯⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✶✳✻✽]\s+\S|^[●⏺•]\s+Running\b|\(\s*(?:[^()]*[•·]\s*)?esc\s+(?:to\s+)?(?:cancel|interrupt)\s*\)/i;
 const AGY_MODAL_APPROVAL_RE =
   /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool|this command)|allow tool execution|permission required|approve\s+plan\?|proceed\?|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|press enter to (?:approve|proceed|confirm|submit)|enter to (?:select|confirm|submit)|space to toggle|use arrow keys|chat about this|type your(?: own)? answer|submit answers?|trust (?:this|the) (?:folder|directory|workspace|files)|do you trust|question \d+\s*(?:of|\/)\s*\d+|esc\s+(?:to\s+)?(?:cancel|reject|decline|dismiss))\b|\[y\/n\]|\(y\/n\)|↑\/↓|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认|信任(?:此|该)?(?:目录|文件夹|工作区)/i;
+const INTERACTIVE_PROMPT_TAIL_RE =
+  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|allow (?:once|always|execution|this tool|this command)|allow tool execution|permission required|approve\s+(?:plan|this|changes|execution|command)\??|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|press enter to (?:approve|proceed|confirm|submit)|enter to (?:select|confirm|submit|submit answer)|space to toggle|type your(?: own)? answer|submit answers?|trust (?:this|the) (?:folder|directory|workspace|files)|do you trust)\b|\[\s*y\s*\/\s*n\s*\]|\(\s*y\s*\/\s*n\s*\)|\[\s*yes\s*\/\s*no\s*\]|\(\s*yes\s*\/\s*no\s*\)|是否允许|允许执行|是否继续\s*[?？(（\[]|按数字选择|输入.{0,8}回答|确认执行|授权确认|信任(?:此|该)?(?:目录|文件夹|工作区)/i;
+const QUESTION_TAIL_KIND_RE =
+  /\b(?:press (?:a )?number to choose|type your(?: own)? answer|enter to submit answer|submit answers?|space to toggle)\b|按数字选择|输入.{0,8}回答/i;
+const PERMISSION_MENU_PROMPT_RE =
+  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow|make(?:\s+this\s+edit)?|apply|overwrite|write)|would you like to (?:proceed|continue|run|edit|create|delete|execute|allow|make|apply|overwrite|write)|run the following command|allow (?:once|always|execution|this tool|this command|[^?\n]{0,40}\bto run)|allow tool execution|permission required|approve\s+(?:plan|this|changes|execution|command)\??|trust (?:this|the) (?:folder|directory|workspace|files)|do you trust)\b|是否允许|允许执行|确认执行|授权确认|信任(?:此|该)?(?:目录|文件夹|工作区)/i;
+const OPEN_WH_QUESTION_RE = /^\s*[?？☐◆●•▸▶\s]*(?:which|what|where|when|who|how)\b/i;
+const PERMISSION_CHOICE_LABEL_RE =
+  /\b(?:yes,?\s*(?:and\s+)?(?:allow|don't ask|proceed)|allow\s+(?:once|always|this|execution)|approve\s+(?:once|always|plan|this))\b|允许(?:一次|本次|始终)|始终允许|授权/i;
+const MENU_CHROME_LINE_RE =
+  /^(?:[─━═┄┈\-_=│┃┌┐└┘├┤┬┴┼╭╮╰╯\s]+|question\s+\d+\s*(?:of|\/)\s*\d+)$/i;
+const MENU_HINT_LINE_RE =
+  /\b(?:enter\s+to\s+(?:select|confirm|submit)|esc\s+to\s+(?:cancel|dismiss|reject|back)|use\s+arrow|space\s+to\s+toggle|tab\s+to\s+|shift\+tab\s+to\s+cycle|\?\s+for\s+shortcuts)\b|↑\/↓|←\/→/i;
 const AUTH_MODAL_RE =
   /\b(?:please\s+(?:log\s*in|sign\s*in|authenticate)|(?:login|sign[- ]?in|authentication|re-?authentication)\s+required|sign\s+in\s+(?:with|to)\b|log\s+in\s+(?:with|to)\b|waiting\s+for\s+(?:browser\s+)?(?:auth|authentication|login|sign[- ]?in)|authorize\s+in\s+(?:your\s+)?browser|open\s+(?:this|the)\s+url\s+to\s+(?:auth|authenticate|log\s*in|sign\s*in)|(?:enter|paste|provide)\s+(?:your\s+|the\s+)?(?:api\s*key|auth(?:entication)?\s+code|verification\s+code|device\s+code|access\s+token|one-time\s+code)|device\s+code\s*[:：]|verification\s+code\s*[:：]|oauth\s+(?:login|flow|authorization|callback|token\s+expired)|session\s+expired\b.*(?:log\s*in|sign\s*in|auth))\b|请(?:先)?登录|登录以继续|扫码登录|授权登录|等待浏览器(?:授权|登录)|请输入\s*(?:API\s*Key|验证码|授权码)|需要重新(?:登录|认证)/i;
-const IDLE_PROMPT_GLYPH_RE = /^[❯›>]\s*$/;
+const IDLE_PROMPT_GLYPH_RE = /^[❯›>▌]\s*$/;
+const COMPOSER_BORDER_LINE_RE = /^[╭╰┌└─━═┄┈-][─━═┄┈-]{6,}[╮╯┐┘─━═┄┈-]?$/;
 const QUESTION_HEADER_LINE_RE = /^[?？☐]\s+\S/;
 const IDLE_COMPOSER_FOOTER_RE =
   /\b(?:shift\+tab\s+to\s+cycle|\?\s+for\s+shortcuts|for\s+shortcuts|context\s+left|bypass\s+permissions\s+on|plan\s+mode\s+on|accept\s+edits\s+on|auto-?accept\s+edits)\b|\b\d+(?:\.\d+)?%\s*(?:ctx|context|\/\s*\d+[kKmM]?)\b|\bctx\s*·\s*(?:idle|done|reviewing)\b|\b\d+\s+artifacts?\s*·\s*\/artifact\s+to\s+review\b|[·•|]\s*(?:idle|done|reviewing)\b/i;
 
+function parseFiniteSeen(labels?: Record<string, unknown>): number | null {
+  const raw = labels?.["herdr.seen"];
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clipInteractionPrompt(raw: string, max = 160): string | undefined {
+  const clean = raw.replace(/\s+/g, " ").trim();
+  if (!clean) return undefined;
+  const chars = [...clean];
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : clean;
+}
+
+function hasComposerBelow(afterLines: readonly string[]): boolean {
+  for (let i = 0; i < afterLines.length; i += 1) {
+    const line = afterLines[i]!;
+    if (IDLE_PROMPT_GLYPH_RE.test(line)) return true;
+    if (/^▌\s+\S/.test(line)) return true;
+    if (/^[❯›>]\s+\S/.test(line)) {
+      const below = afterLines.slice(i + 1);
+      if (below.some((b) => IDLE_COMPOSER_FOOTER_RE.test(b) || AGY_NON_WORKING_FOOTER_RE.test(b))) {
+        return true;
+      }
+      if (
+        i > 0 &&
+        COMPOSER_BORDER_LINE_RE.test(afterLines[i - 1]!) &&
+        below.some((b) => COMPOSER_BORDER_LINE_RE.test(b))
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function extractMenuPrompt(lines: readonly string[], firstChoiceIdx: number): string | undefined {
+  let questionFallback: string | undefined;
+  let plainFallback: string | undefined;
+  let commandFallback: string | undefined;
+  const start = Math.max(0, firstChoiceIdx - 8);
+  for (let i = firstChoiceIdx - 1; i >= start; i -= 1) {
+    const line = lines[i]!.trim();
+    if (!line) continue;
+    if (/^[┌╭]/.test(line)) break;
+    if (MENU_CHROME_LINE_RE.test(line) || MENU_HINT_LINE_RE.test(line)) continue;
+    if (/^[?？]\s+\S/.test(line)) {
+      return clipInteractionPrompt(line.replace(/^[?？]\s+/, ""));
+    }
+    const cleaned = line.replace(/^[☐◆●•▸▶]\s+/, "").trim();
+    if (!cleaned) continue;
+    if (
+      !questionFallback &&
+      (PERMISSION_MENU_PROMPT_RE.test(cleaned) || AUTH_MODAL_RE.test(cleaned) || /[?？]\s*$/.test(cleaned))
+    ) {
+      questionFallback = cleaned;
+    } else if (/^\$\s+\S/.test(cleaned)) {
+      if (!commandFallback) commandFallback = cleaned;
+    } else if (!plainFallback) {
+      plainFallback = cleaned;
+    }
+  }
+  const chosen = questionFallback ?? plainFallback ?? commandFallback;
+  return chosen ? clipInteractionPrompt(chosen) : undefined;
+}
+
+/**
+ * Positive cross-harness interactive prompt detector (`question` choice menus, `auth` modals,
+ * and `[y/n]` / approval prompts). Strictly rejects historical prompts when an active chat
+ * composer prompt renders below them, as well as viewer subscreens (`/status`, `Swarm board`).
+ */
+export function detectScreenInteraction(
+  screen: string,
+  opts?: { harness?: string; rawStatusKind?: Agent["statusKind"] },
+): AgentInteraction | null {
+  if (!screen) return null;
+  const plain = screen.replace(/\r\n?/g, "\n").replace(ANSI_ESCAPE_RE, "");
+  const cleanLines = plain.split("\n").map((l) => l.trimEnd());
+  const nonEmpty = cleanLines.map((l) => l.trim()).filter(Boolean);
+  if (nonEmpty.length === 0) return null;
+
+  // Never misclassify non-input viewer/transcript subscreens as interactive Ask prompts.
+  if (/^Swarm board\b/m.test(plain) || TRANSCRIPT_CTRL_O_RE.test(plain)) return null;
+  if (
+    nonEmpty.slice(0, 8).some((l) => TABBED_VIEWER_HEADER_RE.test(l)) &&
+    !/shift\+tab\s+to\s+cycle/i.test(nonEmpty.slice(-4).join("\n"))
+  ) {
+    return null;
+  }
+
+  const tail = nonEmpty
+    .map((l) => l.replace(/[│┃║]/g, " ").trim())
+    .filter(Boolean)
+    .slice(-36);
+
+  // Priority 1: Structured selectable choices menu (numbered cursor, radio/checkbox, or arrow under `? `).
+  const choices = parseTerminalChoices(cleanLines);
+  if (choices.length >= 2) {
+    let cIdx = choices.length - 1;
+    let lastChoiceIdx = -1;
+    let firstChoiceIdx = -1;
+    for (let i = tail.length - 1; i >= 0 && cIdx >= 0; i -= 1) {
+      if (tail[i]!.includes(choices[cIdx]!.label)) {
+        if (lastChoiceIdx < 0) lastChoiceIdx = i;
+        firstChoiceIdx = i;
+        cIdx -= 1;
+      }
+    }
+    const afterChoices = lastChoiceIdx >= 0 ? tail.slice(lastChoiceIdx + 1) : [];
+    if (!hasComposerBelow(afterChoices)) {
+      const prompt = firstChoiceIdx > 0 ? extractMenuPrompt(tail, firstChoiceIdx) : undefined;
+      const aboveLines = firstChoiceIdx > 0 ? tail.slice(Math.max(0, firstChoiceIdx - 8), firstChoiceIdx) : [];
+      const aboveText = aboveLines.join("\n");
+      const aboveMatchesPermission = aboveLines.some(
+        (line) => !OPEN_WH_QUESTION_RE.test(line) && PERMISSION_MENU_PROMPT_RE.test(line),
+      );
+      const choicesText = choices.map((c) => c.label).join("\n");
+      const multiSelect = choices.some((c) => c.checked !== undefined);
+      const kind: AgentInteraction["kind"] =
+        opts?.rawStatusKind === "auth" || (aboveText && AUTH_MODAL_RE.test(aboveText))
+          ? "auth"
+          : opts?.rawStatusKind === "permission" ||
+              aboveMatchesPermission ||
+              (choicesText && PERMISSION_CHOICE_LABEL_RE.test(choicesText))
+            ? "permission"
+            : "question";
+      return {
+        kind,
+        ...(prompt ? { prompt } : {}),
+        choices,
+        multiSelect,
+        source: "terminal",
+      };
+    }
+  }
+
+  // Priority 2: Auth / OAuth / API-key gate modal.
+  const authTailStart = Math.max(0, tail.length - 10);
+  let authMatchIdx = -1;
+  for (let i = tail.length - 1; i >= authTailStart; i -= 1) {
+    if (AUTH_MODAL_RE.test(tail[i]!)) {
+      authMatchIdx = i;
+      break;
+    }
+  }
+  if (authMatchIdx >= 0) {
+    const afterAuth = tail.slice(authMatchIdx + 1);
+    if (
+      !hasComposerBelow(afterAuth) &&
+      !afterAuth.some((l) => AGY_ACTIVE_SPINNER_RE.test(l) || WORKING_INLINE_HINT_RE.test(l))
+    ) {
+      const prompt = clipInteractionPrompt(tail[authMatchIdx]!);
+      return {
+        kind: "auth",
+        ...(prompt ? { prompt } : {}),
+        source: "terminal",
+      };
+    }
+  }
+
+  // Priority 3: Interactive approval / `[y/n]` / question prompt without a numbered choice list.
+  const promptTailStart = Math.max(0, tail.length - 8);
+  let promptMatchIdx = -1;
+  for (let i = tail.length - 1; i >= promptTailStart; i -= 1) {
+    if (INTERACTIVE_PROMPT_TAIL_RE.test(tail[i]!)) {
+      promptMatchIdx = i;
+      break;
+    }
+  }
+  if (promptMatchIdx >= 0) {
+    const matchedLine = tail[promptMatchIdx]!;
+    const fromMatch = tail.slice(promptMatchIdx);
+    const afterMatch = tail.slice(promptMatchIdx + 1);
+    if (
+      !hasComposerBelow(afterMatch) &&
+      !fromMatch.some((l) => AGY_ACTIVE_SPINNER_RE.test(l) || WORKING_INLINE_HINT_RE.test(l) || AGY_WORKING_FOOTER_RE.test(l))
+    ) {
+      const isQuestion = opts?.rawStatusKind === "question" || QUESTION_TAIL_KIND_RE.test(matchedLine);
+      const prompt = clipInteractionPrompt(matchedLine);
+      return {
+        kind: isQuestion ? "question" : "permission",
+        ...(prompt ? { prompt } : {}),
+        source: "terminal",
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * True when the live terminal screen unambiguously displays an empty idle chat composer
+ * with no active spinner above it (used to expire structured tool-call Ask fallbacks promptly).
+ */
+export function hasIdleComposerScreen(screen: string, harness: string): boolean {
+  if (!screen) return false;
+  const nonEmpty = screen
+    .replace(/\r\n?/g, "\n")
+    .replace(ANSI_ESCAPE_RE, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (nonEmpty.length === 0) return false;
+  const tail24 = nonEmpty.slice(-24);
+  const h = harness.toLowerCase();
+  let promptIdx = -1;
+  if (h === "antigravity") {
+    const footerLines = tail24.slice(-3);
+    if (footerLines.some((l) => AGY_WORKING_FOOTER_RE.test(l))) return false;
+    if (!tail24.some((l) => AGY_NON_WORKING_FOOTER_RE.test(l) || AGY_ARTIFACT_HINT_RE.test(l))) return false;
+    for (let i = tail24.length - 1; i >= 1; i -= 1) {
+      if (
+        AGY_IDLE_PROMPT_LINE_RE.test(tail24[i]!) &&
+        AGY_BORDER_LINE_RE.test(tail24[i - 1]!) &&
+        i + 1 < tail24.length &&
+        AGY_BORDER_LINE_RE.test(tail24[i + 1]!)
+      ) {
+        promptIdx = i;
+        break;
+      }
+    }
+    if (promptIdx < 1) return false;
+  } else {
+    const minPromptIdx = Math.max(0, tail24.length - 8);
+    for (let i = tail24.length - 1; i >= minPromptIdx; i -= 1) {
+      if (IDLE_PROMPT_GLYPH_RE.test(tail24[i]!)) {
+        promptIdx = i;
+        break;
+      }
+    }
+    if (promptIdx < 0) return false;
+    const belowPrompt = tail24.slice(promptIdx + 1);
+    if (belowPrompt.length === 0) return false;
+    if (belowPrompt.some((l) => WORKING_INLINE_HINT_RE.test(l) || AGY_WORKING_FOOTER_RE.test(l))) return false;
+    if (!belowPrompt.some((l) => IDLE_COMPOSER_FOOTER_RE.test(l))) return false;
+  }
+  const aboveEnd = promptIdx > 0 && AGY_BORDER_LINE_RE.test(tail24[promptIdx - 1]!) ? promptIdx - 1 : promptIdx;
+  const aboveLines = tail24.slice(Math.max(0, aboveEnd - 12), aboveEnd);
+  return !aboveLines.some((l) => AGY_ACTIVE_SPINNER_RE.test(l));
+}
+
 /**
  * Resolves the finished status (`"done"` vs `"idle"`) when demoting a terminal whose raw `hc`
  * `working` or `blocked` state was verified against its live screen to be idle/finished.
- * Unseen finished turns (`herdr.seen` missing or `< turn`) stay `"done"` ("已完成").
+ * Returns `"idle"` when `turn` is missing or `<= 0` (fresh terminal before any completed turn,
+ * which `agent.seen` cannot mark), and `"done"` only when `turn > 0` and `herdr.seen < turn`.
  */
 export function demotedFinishedStatus(rawTerm: HcTerminal | undefined): "done" | "idle" {
-  if (typeof rawTerm?.turn === "number" && rawTerm.turn > 0) {
-    const rawSeen = rawTerm.labels?.["herdr.seen"];
-    const seen = rawSeen !== undefined && rawSeen.trim() !== "" ? Number(rawSeen) : NaN;
-    return Number.isFinite(seen) && seen >= rawTerm.turn ? "idle" : "done";
+  if (typeof rawTerm?.turn !== "number" || !Number.isFinite(rawTerm.turn) || rawTerm.turn <= 0) {
+    return "idle";
   }
-  return "idle";
+  const seen = parseFiniteSeen(rawTerm.labels);
+  return seen !== null && seen >= rawTerm.turn ? "idle" : "done";
 }
 
 /**
@@ -469,6 +734,11 @@ export class HcAdapter extends EventEmitter {
   private timer: NodeJS.Timeout | null = null;
   /** Last line from the subscription; herdr-core sends a heartbeat every 15 s. */
   private lastLine = 0;
+  private listGen = 0;
+  private appliedListGen = 0;
+  private listInFlight: Promise<void> | null = null;
+  private listQueued = false;
+  private listTrailing: Promise<void> | null = null;
 
   private hcBin: string;
   private screens: HcScreens;
@@ -542,6 +812,9 @@ export class HcAdapter extends EventEmitter {
 
   stop(): void {
     this.stopped = true;
+    this.listQueued = false;
+    this.listInFlight = null;
+    this.listTrailing = null;
     if (this.timer) clearInterval(this.timer);
     if (this.doneResyncTimer) {
       clearTimeout(this.doneResyncTimer);
@@ -580,10 +853,11 @@ export class HcAdapter extends EventEmitter {
       this.backoff = Math.min(this.backoff * 2, 30_000);
     });
     child.on("error", () => {});
+    const subscribeGen = ++this.listGen;
     void this.request("events.subscribe", {}).then((r) => {
       if (r?.result?.terminals) {
         this.backoff = 1000;
-        this.setAll(r.result.terminals);
+        this.setAll(r.result.terminals, subscribeGen);
       } else {
         void this.list();
       }
@@ -687,10 +961,40 @@ export class HcAdapter extends EventEmitter {
    * The full list, over a connection of its own: once a connection has
    * subscribed to events, herdr-core answers nothing else on it (hc 0.1.21), so
    * asking there only ever timed out and left the list as it was at startup.
+   * Single-flight coalesced with one trailing re-list + generation guard so
+   * concurrent callers never apply stale snapshots out of order.
    */
   async list(): Promise<void> {
-    const r = await this.oneShot("terminal.list", {});
-    if (r?.result?.terminals) this.setAll(r.result.terminals);
+    if (this.listInFlight) {
+      this.listQueued = true;
+      if (!this.listTrailing) {
+        const waitFor = this.listInFlight;
+        const nextPass = waitFor
+          .catch(() => {})
+          .then(() => {
+            if (this.listTrailing === nextPass) this.listTrailing = null;
+            if (!this.listQueued || this.stopped) return;
+            this.listQueued = false;
+            return this.list();
+          });
+        this.listTrailing = nextPass;
+      }
+      return this.listTrailing;
+    }
+    const gen = ++this.listGen;
+    let runPass: Promise<void> | null = null;
+    runPass = (async () => {
+      try {
+        const r = await this.oneShot("terminal.list", {});
+        if (r?.result?.terminals) this.setAll(r.result.terminals, gen);
+      } finally {
+        if (this.listInFlight === runPass) {
+          this.listInFlight = null;
+        }
+      }
+    })();
+    this.listInFlight = runPass;
+    return runPass;
   }
 
   async docGet(name: string): Promise<{ value: unknown; version: number } | null> {
@@ -777,9 +1081,74 @@ export class HcAdapter extends EventEmitter {
     });
   }
 
-  private setAll(list: HcTerminal[]): void {
-    this.terminals = new Map(list.filter((t) => t.state !== "finished").map((t) => [t.address, t]));
-    this.emit("change");
+  private static terminalsSig(map: Map<string, HcTerminal>): string {
+    return JSON.stringify([...map.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  }
+
+  /** Monotonically advances the in-memory `herdr.seen` watermark right after `hc.label()` succeeds. */
+  recordSeenWatermark(address: string, turn: number): boolean {
+    if (!Number.isFinite(turn) || turn <= 0) return false;
+    const t = this.terminals.get(address);
+    if (!t) return false;
+    const prevSeen = parseFiniteSeen(t.labels);
+    const nextSeen = prevSeen !== null ? Math.max(prevSeen, turn) : turn;
+    const nextVal = String(nextSeen);
+    if (t.labels?.["herdr.seen"] === nextVal) return false;
+    t.labels = { ...(t.labels ?? {}), "herdr.seen": nextVal };
+    return true;
+  }
+
+  private setAll(list: HcTerminal[], gen?: number): void {
+    if (gen !== undefined) {
+      if (gen < this.appliedListGen) return;
+      this.appliedListGen = gen;
+      if (gen > this.listGen) this.listGen = gen;
+    } else {
+      this.appliedListGen = ++this.listGen;
+    }
+    const before = HcAdapter.terminalsSig(this.terminals);
+    const next = new Map<string, HcTerminal>();
+    for (const t of list) {
+      if (t.state === "finished") continue;
+      const prev = this.terminals.get(t.address);
+      const isRecreated =
+        prev !== undefined &&
+        typeof prev.created_ms === "number" &&
+        typeof t.created_ms === "number" &&
+        t.created_ms > prev.created_ms;
+      if (!prev || isRecreated) {
+        next.set(t.address, t);
+        continue;
+      }
+      let mergedTurn = t.turn;
+      if (typeof prev.turn === "number" && Number.isFinite(prev.turn)) {
+        if (typeof t.turn !== "number" || !Number.isFinite(t.turn)) {
+          mergedTurn = prev.turn;
+        } else {
+          mergedTurn = Math.max(prev.turn, t.turn);
+        }
+      }
+      let mergedLabels = t.labels;
+      if (mergedLabels === undefined) {
+        if (prev.labels !== undefined) mergedLabels = { ...prev.labels };
+      } else {
+        const prevSeen = parseFiniteSeen(prev.labels);
+        if (prevSeen !== null) {
+          const nextSeen = parseFiniteSeen(mergedLabels);
+          if (nextSeen === null || nextSeen < prevSeen) {
+            mergedLabels = { ...mergedLabels, "herdr.seen": String(prevSeen) };
+          }
+        }
+      }
+      const merged: HcTerminal = {
+        ...t,
+        ...(mergedTurn !== undefined ? { turn: mergedTurn } : {}),
+        ...(mergedLabels !== undefined ? { labels: mergedLabels } : {}),
+      };
+      next.set(t.address, merged);
+    }
+    this.terminals = next;
+    if (HcAdapter.terminalsSig(next) !== before) this.emit("change");
   }
 
   /** Program running in the terminal, e.g. claude-code, omp, sh (on Windows without `.exe`). */
@@ -803,8 +1172,8 @@ export class HcAdapter extends EventEmitter {
     if (!t.status) return "idle";
     const s = normalizeStatus(t.status.state);
     if (s !== "done") return s;
-    const seen = Number(t.labels?.["herdr.seen"]);
-    return Number.isFinite(seen) && typeof t.turn === "number" && seen >= t.turn ? "idle" : "done";
+    const seen = parseFiniteSeen(t.labels);
+    return seen !== null && typeof t.turn === "number" && t.turn > 0 && seen >= t.turn ? "idle" : "done";
   }
 
   /** Structured prompt kind while `"blocked"` (`permission` / `question` / `auth`). */

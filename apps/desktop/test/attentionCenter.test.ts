@@ -70,6 +70,53 @@ test("classifyAttentionCategory and sortAttentionItems categorize all 4 Ovis tie
     "completed",
   );
   assert.equal(classifyAttentionCategory(makeAgent({ key: "d1/a5", status: "working" })), null);
+  assert.equal(
+    classifyAttentionCategory(
+      makeAgent({
+        key: "d1/a6",
+        status: "working",
+        interaction: { kind: "question", prompt: "Choose deploy mode", source: "terminal" },
+      }),
+    ),
+    "question",
+  );
+  assert.equal(
+    classifyAttentionCategory(
+      makeAgent({
+        key: "d1/a7",
+        status: "working",
+        interaction: { kind: "permission", prompt: "Allow command?", source: "terminal" },
+      }),
+    ),
+    "approval",
+  );
+  assert.equal(
+    classifyAttentionCategory(
+      makeAgent({
+        key: "d1/a8",
+        status: "working",
+        interaction: { kind: "auth", prompt: "Sign in required", source: "terminal" },
+      }),
+    ),
+    "approval",
+  );
+  // Defense-in-depth: permission/auth statusKind must never be downgraded by a question interaction,
+  // while a stale statusKind on a non-blocked idle agent must not trigger approval.
+  assert.equal(
+    classifyAttentionCategory(
+      makeAgent({
+        key: "d1/a9",
+        status: "blocked",
+        statusKind: "permission",
+        interaction: { kind: "question", prompt: "Do you want to proceed?", source: "terminal" },
+      }),
+    ),
+    "approval",
+  );
+  assert.equal(
+    classifyAttentionCategory(makeAgent({ key: "d1/a10", status: "idle", statusKind: "permission" })),
+    null,
+  );
 
   const shuffled: AttentionItem[] = [
     { id: "c", agentKey: "k4", category: "completed", title: "Done", subtitle: "", ts: 900 },
@@ -220,4 +267,67 @@ test("jumpToAttentionAgent activates existing split pane across spaces, unzooms 
   assert.equal(workTab?.split?.zoomedPaneId, undefined);
   assert.equal(tabLeaves(workTab!).length, 2);
   assert.equal(attentionStore.get().items.length, 0);
+});
+
+test("reconcileAttentionSnapshot tracks working agents with active interaction without double-chiming on blocked transition", () => {
+  const tracker = createAttentionTracker();
+  const seed = reconcileAttentionSnapshot(
+    tracker,
+    [],
+    [makeAgent({ key: "d1/codex", status: "working", statusSince: 1_000 })],
+    new Set(),
+    true,
+    2_000,
+  );
+  assert.equal(seed.items.length, 0);
+
+  // Hostd attaches interaction.kind === "question" while status stays "working"
+  const asked = reconcileAttentionSnapshot(
+    tracker,
+    seed.items,
+    [
+      makeAgent({
+        key: "d1/codex",
+        status: "working",
+        interaction: { kind: "question", prompt: "确认执行迁移？", source: "terminal" },
+      }),
+    ],
+    new Set(),
+    true,
+    3_000,
+  );
+  assert.equal(asked.items.length, 1);
+  assert.equal(asked.items[0]!.category, "question");
+  assert.equal(asked.items[0]!.subtitle, "确认执行迁移？");
+  assert.equal(asked.chimes.length, 1);
+  assert.equal(asked.newPeek?.agentKey, "d1/codex");
+
+  // Status later flips to "blocked" while interaction stays active -> no duplicate chime
+  const nowBlocked = reconcileAttentionSnapshot(
+    tracker,
+    asked.items,
+    [
+      makeAgent({
+        key: "d1/codex",
+        status: "blocked",
+        interaction: { kind: "question", prompt: "确认执行迁移？", source: "terminal" },
+      }),
+    ],
+    new Set(),
+    true,
+    4_000,
+  );
+  assert.equal(nowBlocked.items.length, 1);
+  assert.equal(nowBlocked.chimes.length, 0);
+
+  // Interaction resolves & agent resumes working -> cleared from attention queue
+  const resumed = reconcileAttentionSnapshot(
+    tracker,
+    nowBlocked.items,
+    [makeAgent({ key: "d1/codex", status: "working" })],
+    new Set(),
+    true,
+    5_000,
+  );
+  assert.equal(resumed.items.length, 0);
 });

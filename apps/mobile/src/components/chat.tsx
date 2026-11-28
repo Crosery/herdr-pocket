@@ -1330,28 +1330,57 @@ function SessionChatView({
 
   // The session the agent is on. A new one (a fresh start, `/clear`) is another conversation: its file
   // positions do not continue the old one's. A moment without a match keeps the last one.
-  const [session, setSession] = useState(agent.sessionKey);
-  if (agent.sessionKey && agent.sessionKey !== session) setSession(agent.sessionKey);
+  const [sessionState, setSessionState] = useState<{
+    agentKey: string;
+    propSession: string | undefined;
+    session: string | undefined;
+  }>(() => ({
+    agentKey: agent.key,
+    propSession: agent.sessionKey,
+    session: agent.sessionKey,
+  }));
+  let session = sessionState.session;
+  if (sessionState.agentKey !== agent.key) {
+    session = agent.sessionKey;
+    setSessionState({ agentKey: agent.key, propSession: agent.sessionKey, session });
+  } else if (agent.sessionKey && agent.sessionKey !== sessionState.propSession) {
+    // Only follow `agent.sessionKey` when the prop itself changes to a new non-empty value:
+    // a transient `undefined` keeps the last known session, and a lagging prop won't revert a newer `q.data.sessionKey`.
+    session = agent.sessionKey;
+    setSessionState({ agentKey: agent.key, propSession: agent.sessionKey, session });
+  }
   const [streamState, setStreamState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
-  const [waitingForSession, setWaitingForSession] = useState(false);
+  const [waitingForSession, setWaitingForSession] = useState(() => !sub && !agent.sessionKey);
   const linkOnline = useLive((s) => s.link === "online");
+  const hasSession = Boolean(session || sub);
   const q = useQuery({
     queryKey: ["session.events", agent.key, sub ?? null, session ?? null],
     // One screenful first; older pages load as the list is scrolled up.
     queryFn: () => call(agent.deviceId, "session.events", { agent: agent.key, sub, limit: 60 }),
-    enabled: active,
+    enabled: active && hasSession,
     // Recover missed events while the stream is unavailable or still finding a session.
-    refetchInterval: !active || (!linkOnline && streamState !== "live") ? false : streamState === "live" && !!session ? 30_000 : 3000,
+    refetchInterval: !active || !hasSession || (!linkOnline && streamState !== "live") ? false : streamState === "live" && !!session ? 30_000 : 3000,
   });
   // Everything received for this conversation, by id. The newest page slides forward as the agent works;
   // without this, events between the older pages and the current page would silently disappear.
   const [liveEvents, setLiveEvents] = useState<ConvEvent[]>([]);
   // Another conversation starts empty, and each newest page the query brings is merged in. Done while
   // rendering (React's way to adjust state to new props), so a frame never shows the old conversation.
-  const conv = `${agent.key}\n${sub ?? ""}\n${session ?? ""}`;
+  const resSessionKey = q.data?.sessionKey?.trim() || undefined;
+  const sessionSwitchedByPage = Boolean(!sub && resSessionKey && resSessionKey !== session);
+  const effectiveSession = sessionSwitchedByPage ? resSessionKey : session;
+  const conv = `${agent.key}\n${sub ?? ""}\n${effectiveSession ?? ""}`;
   const [synced, setSynced] = useState<{ conv: string; page: typeof q.data }>({ conv, page: undefined });
-  if (synced.conv !== conv || synced.page !== q.data) {
-    const fresh = synced.conv !== conv;
+  if (sessionSwitchedByPage || synced.conv !== conv || synced.page !== q.data) {
+    const fresh = sessionSwitchedByPage || synced.conv !== conv;
+    if (sessionSwitchedByPage) {
+      session = resSessionKey;
+      setSessionState((prev) => ({
+        agentKey: agent.key,
+        propSession: prev.agentKey === agent.key ? prev.propSession : agent.sessionKey,
+        session: resSessionKey,
+      }));
+    }
     setSynced({ conv, page: q.data });
     let next = fresh ? [] : liveEvents;
     if (fresh) {
@@ -1359,19 +1388,34 @@ function SessionChatView({
       setOlderCursor(undefined);
       setStreamState("connecting");
     }
-    const page = q.data?.events;
+    const subMismatched = Boolean(sub && resSessionKey && resSessionKey !== sub);
+    const page = subMismatched ? undefined : q.data?.events;
     if (page?.length) {
-      const oldestNew = posOf(page[0]!);
-      const newestOld = next.length ? posOf(next[next.length - 1]!) : null;
-      // The page no longer touches what we hold (long time away): what lies between is unknown, so start over from the page.
-      if (newestOld !== null && oldestNew !== null && oldestNew > newestOld && !next.some((e) => e.id === page[0]!.id)) {
-        setOlder([]);
-        setOlderCursor(undefined);
-        next = page;
-      } else next = mergeEvents(next, page);
+      if (fresh) {
+        next = mergeEvents([], page);
+      } else {
+        const oldestNew = posOf(page[0]!);
+        const newestOld = next.length ? posOf(next[next.length - 1]!) : null;
+        // The page no longer touches what we hold (long time away): what lies between is unknown, so start over from the page.
+        if (newestOld !== null && oldestNew !== null && oldestNew > newestOld && !next.some((e) => e.id === page[0]!.id)) {
+          setOlder([]);
+          setOlderCursor(undefined);
+          next = page;
+        } else next = mergeEvents(next, page);
+      }
     }
     if (next !== liveEvents) setLiveEvents(next);
   }
+  const sessionGuardRef = useRef<{ agentKey: string; sub: string | null; session: string | null }>({
+    agentKey: agent.key,
+    sub: sub ?? null,
+    session: effectiveSession ?? null,
+  });
+  sessionGuardRef.current = {
+    agentKey: agent.key,
+    sub: sub ?? null,
+    session: effectiveSession ?? null,
+  };
   const [attempt, setAttempt] = useState(0);
   const failures = useRef(0);
   const hasPageDataRef = useRef(q.data !== undefined);
@@ -1385,7 +1429,11 @@ function SessionChatView({
     recordMobileSessionEvents(agent.key, liveEvents);
   }, [agent.key, sub, liveEvents]);
   useEffect(() => {
-    if (!active) return;
+    if (!active || (!session && !sub)) {
+      setWaitingForSession(!sub && !session);
+      return;
+    }
+    setWaitingForSession(false);
     let opened = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let pageSettled = hasPageDataRef.current;
@@ -1419,7 +1467,8 @@ function SessionChatView({
       } else if (event?.kind === "stale") setStreamState("stale");
       else if (event?.kind === "alive") setStreamState("live");
     }, (state) => {
-      setWaitingForSession(state.code === "not_found" && !sub && !session);
+      const noSession = state.code === "not_found" && !sub && !session;
+      setWaitingForSession(noSession);
       setStreamState(state.status === "open" ? "live" : "error");
       // A stream that reopens after a drop may have missed events; the page query fills them in.
       if (state.status === "open") {
@@ -1428,7 +1477,7 @@ function SessionChatView({
         retry = undefined;
         if (opened) void q.refetch();
         opened = true;
-      } else {
+      } else if (!noSession) {
         // Refused, or ended because the computer went away: try again a little later.
         retry ??= setTimeout(() => {
           setStreamState("connecting");
@@ -1445,7 +1494,7 @@ function SessionChatView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, agent.deviceId, agent.key, sub, session, attempt]);
   useEffect(() => {
-    if (active && linkOnline && !q.isFetching) void q.refetch();
+    if (active && linkOnline && !q.isFetching && Boolean(session || sub)) void q.refetch();
     // The socket may have come back before the stream is ready.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, linkOnline]);
@@ -1678,7 +1727,17 @@ function SessionChatView({
 
   /** Fetch one older page; returns the next cursor (null at the beginning). */
   async function fetchOlder(before: string, limit: number): Promise<{ next: string | null; count: number }> {
-    const res = await call(agent.deviceId, "session.events", { agent: agent.key, sub, limit, before });
+    const req = sessionGuardRef.current;
+    const res = await call(agent.deviceId, "session.events", { agent: req.agentKey, sub, limit, before });
+    const cur = sessionGuardRef.current;
+    if (cur.agentKey !== req.agentKey || cur.sub !== req.sub || cur.session !== req.session) {
+      return { next: null, count: 0 };
+    }
+    const resSession = res.sessionKey?.trim() || null;
+    const expectedSession = req.sub ?? cur.session;
+    if (resSession && expectedSession && resSession !== expectedSession) {
+      return { next: null, count: 0 };
+    }
     setOlder((o) => [...res.events, ...o]);
     const next = res.more ? res.nextBefore ?? res.events[0]?.pos ?? null : null;
     setOlderCursor(next);

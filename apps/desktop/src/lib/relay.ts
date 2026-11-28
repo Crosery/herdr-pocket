@@ -33,7 +33,37 @@ import { native, onNativeEvent } from "./native";
 import { recordClientRpcSample } from "./perfTelemetry";
 import { notifyReleaseAvailable } from "./updates";
 
-function shallowEqualAgent(a: Agent, b: Agent): boolean {
+function shallowEqualInteraction(a: Agent["interaction"], b: Agent["interaction"]): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (
+    a.kind !== b.kind ||
+    a.prompt !== b.prompt ||
+    a.multiSelect !== b.multiSelect ||
+    a.source !== b.source
+  ) {
+    return false;
+  }
+  const ac = a.choices;
+  const bc = b.choices;
+  if (ac === bc) return true;
+  if (!ac || !bc || ac.length !== bc.length) return false;
+  for (let i = 0; i < ac.length; i += 1) {
+    const x = ac[i]!;
+    const y = bc[i]!;
+    if (
+      x.key !== y.key ||
+      x.label !== y.label ||
+      x.selected !== y.selected ||
+      x.checked !== y.checked
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function shallowEqualAgent(a: Agent, b: Agent): boolean {
   if (a === b) return true;
   if (
     a.key !== b.key ||
@@ -47,6 +77,7 @@ function shallowEqualAgent(a: Agent, b: Agent): boolean {
     a.title !== b.title ||
     a.name !== b.name ||
     a.where !== b.where ||
+    a.cwd !== b.cwd ||
     a.model !== b.model ||
     a.thinkingLevel !== b.thinkingLevel ||
     a.costUsd !== b.costUsd ||
@@ -61,6 +92,9 @@ function shallowEqualAgent(a: Agent, b: Agent): boolean {
     a.sessionKey !== b.sessionKey ||
     a.updatedAt !== b.updatedAt
   ) {
+    return false;
+  }
+  if (!shallowEqualInteraction(a.interaction, b.interaction)) {
     return false;
   }
   const aq = a.queuedItems;
@@ -99,6 +133,26 @@ function reconcileAgentList(prevList: Agent[] | undefined, nextList: Agent[]): A
     return nextItem;
   });
   return allSame ? prevList : out;
+}
+
+/**
+ * Stable space/tab topology signature for a host's agents.
+ * Ignores status/cost/context/turn churn so `spaces.list` refreshes only when space/tab/cwd topology changes.
+ */
+export function agentSpaceTopologySig(agents: readonly Pick<Agent, "key" | "where" | "cwd">[]): string {
+  return agents.map((a) => `${a.key}\0${a.where ?? ""}\0${a.cwd ?? ""}`).join("\n");
+}
+
+/**
+ * Whether an incoming stream frame counts as actual delivered content for `rehome()` history suppression.
+ * For `terminal` streams, control/meta frames (`stale`, `alive`, `portal_event`, `queue`, etc.) must not
+ * mark the stream populated before real screen output arrives.
+ */
+export function countsAsDeliveredStreamEvent(stream: StreamKind, event: unknown): boolean {
+  if (stream !== "terminal") return true;
+  if (!event || typeof event !== "object") return false;
+  const kind = (event as { kind?: unknown }).kind;
+  return kind === "terminal_data" || kind === "terminal" || kind === "terminal_rows";
 }
 
 export class RelayError extends Error {
@@ -298,6 +352,7 @@ class SocketClient {
   private spaceInflight = new Map<string, Promise<void>>();
   private spaceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private spaceSig = new Map<string, string>();
+  private spaceTopoSig = new Map<string, string>();
   private seq = 0;
   private backoff = 1000;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -664,8 +719,16 @@ class SocketClient {
         const grouped: Record<string, Agent[]> = {};
         for (const a of f.agents) (grouped[a.deviceId] ??= []).push(a);
         const agents: Record<string, Agent[]> = {};
+        this.spaceTopoSig.clear();
         for (const [hostId, list] of Object.entries(grouped)) {
-          agents[hostId] = reconcileAgentList(prev.agents[hostId], list);
+          const reconciled = reconcileAgentList(prev.agents[hostId], list);
+          agents[hostId] = reconciled;
+          this.spaceTopoSig.set(hostId, agentSpaceTopologySig(reconciled));
+        }
+        for (const d of f.devices) {
+          if (d.kind === "host" && !this.spaceTopoSig.has(d.id)) {
+            this.spaceTopoSig.set(d.id, agentSpaceTopologySig(agents[d.id] ?? []));
+          }
         }
         liveStore.set({ hasSnapshot: true, devices, agents, rev: prev.rev + 1 });
         for (const d of f.devices) {
@@ -697,6 +760,7 @@ class SocketClient {
         this.closeDirectFor(f.id);
         this.clearSpaceTimer(f.id);
         this.spaceSig.delete(f.id);
+        this.spaceTopoSig.delete(f.id);
         liveStore.set((prev) => {
           const devices = { ...prev.devices };
           delete devices[f.id];
@@ -718,7 +782,10 @@ class SocketClient {
             rev: prev.rev + 1,
           });
         }
-        if (prev.devices[f.deviceId]?.online !== false) {
+        const nextTopoSig = agentSpaceTopologySig(nextList);
+        const topoChanged = this.spaceTopoSig.get(f.deviceId) !== nextTopoSig;
+        this.spaceTopoSig.set(f.deviceId, nextTopoSig);
+        if (prev.devices[f.deviceId]?.online !== false && (!prev.spaces[f.deviceId] || topoChanged)) {
           this.scheduleSpacesRefresh(f.deviceId, 500);
         }
         break;
@@ -729,7 +796,11 @@ class SocketClient {
         this.pending.delete(f.id);
         clearTimeout(p.timer);
         if (f.error) {
-          logger.warn("rpc", `${f.id} ${f.error.code}: ${f.error.message}`);
+          if (f.error.code === "not_found") {
+            logger.debug("rpc", `${f.id} ${f.error.code}: ${f.error.message}`);
+          } else {
+            logger.warn("rpc", `${f.id} ${f.error.code}: ${f.error.message}`);
+          }
           p.reject(new RelayError(f.error.code, f.error.message));
         }
         else p.resolve(f.result);
@@ -738,14 +809,27 @@ class SocketClient {
       case "stream_open": {
         const s = this.subs.get(f.id);
         if (!s) break;
-        if (f.error) s.onState?.({ kind: "error", code: f.error.code, error: f.error.message });
-        else s.onState?.({ kind: "live", result: f.result });
+        if (f.error) {
+          if (
+            f.error.code === "not_found" ||
+            f.error.code === "bad_request" ||
+            f.error.code === "forbidden" ||
+            f.error.code === "unsupported"
+          ) {
+            this.subs.delete(f.id);
+          }
+          s.onState?.({ kind: "error", code: f.error.code, error: f.error.message });
+        } else {
+          s.onState?.({ kind: "live", result: f.result });
+        }
         break;
       }
       case "stream_event": {
         const sub = this.subs.get(f.id);
         if (sub) {
-          sub.delivered = (sub.delivered ?? 0) + 1;
+          if (countsAsDeliveredStreamEvent(sub.stream, f.event)) {
+            sub.delivered = (sub.delivered ?? 0) + 1;
+          }
           sub.onEvent(f.event);
         }
         break;
@@ -1212,6 +1296,8 @@ class SocketClient {
     this.direct.clear();
     for (const t of this.spaceTimers.values()) clearTimeout(t);
     this.spaceTimers.clear();
+    this.spaceSig.clear();
+    this.spaceTopoSig.clear();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.offWake();

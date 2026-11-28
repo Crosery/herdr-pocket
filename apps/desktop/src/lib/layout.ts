@@ -111,11 +111,145 @@ export function useWindowHidden(): boolean {
 }
 
 /**
- * Keeps two root attributes current: `data-idle` while the window is hidden and
- * `data-calm` when motion should be reduced (OS setting or the app's energy saver).
- * CSS pauses every endless animation under either.
+ * Keeps four root attributes current: `data-idle` while the window is hidden,
+ * `data-blurred` while the window lacks OS focus, `data-user-idle` after 45s of
+ * user inactivity while visible/focused, and `data-calm` when motion should be
+ * reduced (OS setting or the app's energy saver).
+ * CSS pauses/detaches endless animations under any of them so WebKit stops 120Hz wakeups.
  */
 export const powerStore = createStore<{ onBattery: boolean; systemLowPower: boolean }>({ onBattery: false, systemLowPower: false });
+
+export const USER_IDLE_TIMEOUT_MS = 45_000;
+const USER_IDLE_MOVE_THROTTLE_MS = 1_000;
+
+/**
+ * Tracks OS window focus/blur and visibility on `doc.documentElement` via `data-blurred`
+ * so visible-but-unfocused windows do not keep WebKit's display link ticking for endless animations.
+ */
+export function attachWindowBlurAttribute(
+  win: Pick<Window, "addEventListener" | "removeEventListener">,
+  doc: {
+    documentElement: Pick<HTMLElement, "setAttribute" | "removeAttribute">;
+    hasFocus: () => boolean;
+    hidden?: boolean;
+    addEventListener: (type: string, listener: () => void) => void;
+    removeEventListener: (type: string, listener: () => void) => void;
+  },
+): () => void {
+  const root = doc.documentElement;
+  const apply = (blurred: boolean) => {
+    if (blurred) root.setAttribute("data-blurred", "");
+    else root.removeAttribute("data-blurred");
+  };
+  const sync = () => {
+    apply(Boolean(doc.hidden) || !doc.hasFocus());
+  };
+  const onFocus = () => {
+    apply(false);
+  };
+  const onBlur = () => {
+    apply(true);
+  };
+  sync();
+  win.addEventListener("focus", onFocus);
+  win.addEventListener("blur", onBlur);
+  doc.addEventListener("visibilitychange", sync);
+  return () => {
+    win.removeEventListener("focus", onFocus);
+    win.removeEventListener("blur", onBlur);
+    doc.removeEventListener("visibilitychange", sync);
+  };
+}
+
+/**
+ * Sets `data-user-idle` on `doc.documentElement` after `idleMs` (default 25s) with no user input
+ * (`pointerdown`, throttled `pointermove`, `keydown`, `wheel`), and clears it immediately on any
+ * input or window focus so visible-and-focused idle windows stop 120Hz ProMotion wakeups.
+ */
+export function attachUserIdleAttribute(
+  win: Pick<Window, "addEventListener" | "removeEventListener">,
+  doc: {
+    documentElement: Pick<HTMLElement, "setAttribute" | "removeAttribute">;
+    hidden?: boolean;
+    addEventListener: (type: string, listener: () => void) => void;
+    removeEventListener: (type: string, listener: () => void) => void;
+  },
+  options?: {
+    idleMs?: number;
+    pointerMoveThrottleMs?: number;
+    now?: () => number;
+    setTimeoutFn?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+    clearTimeoutFn?: (id: ReturnType<typeof setTimeout>) => void;
+  },
+): () => void {
+  const root = doc.documentElement;
+  const idleMs = options?.idleMs ?? USER_IDLE_TIMEOUT_MS;
+  const moveThrottleMs = options?.pointerMoveThrottleMs ?? USER_IDLE_MOVE_THROTTLE_MS;
+  const nowFn = options?.now ?? (() => Date.now());
+  const schedule = options?.setTimeoutFn ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+  const cancel = options?.clearTimeoutFn ?? ((id: ReturnType<typeof setTimeout>) => clearTimeout(id));
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let isIdle = false;
+  let lastMoveResetAt = 0;
+
+  const clearTimer = () => {
+    if (timer !== null) {
+      cancel(timer);
+      timer = null;
+    }
+  };
+
+  const armTimer = () => {
+    clearTimer();
+    if (doc.hidden) return;
+    timer = schedule(() => {
+      timer = null;
+      isIdle = true;
+      root.setAttribute("data-user-idle", "");
+    }, idleMs);
+  };
+
+  const markActive = () => {
+    if (isIdle) {
+      isIdle = false;
+      root.removeAttribute("data-user-idle");
+    }
+    armTimer();
+  };
+
+  const onPointerMove = () => {
+    const t = nowFn();
+    if (!isIdle && t - lastMoveResetAt < moveThrottleMs) return;
+    lastMoveResetAt = t;
+    markActive();
+  };
+
+  const onVisibilityChange = () => {
+    if (doc.hidden) clearTimer();
+    else markActive();
+  };
+
+  root.removeAttribute("data-user-idle");
+  armTimer();
+  win.addEventListener("pointerdown", markActive, { passive: true, capture: true });
+  win.addEventListener("pointermove", onPointerMove, { passive: true, capture: true });
+  win.addEventListener("keydown", markActive, { passive: true, capture: true });
+  win.addEventListener("wheel", markActive, { passive: true, capture: true });
+  win.addEventListener("focus", markActive);
+  doc.addEventListener("visibilitychange", onVisibilityChange);
+
+  return () => {
+    clearTimer();
+    win.removeEventListener("pointerdown", markActive, { capture: true });
+    win.removeEventListener("pointermove", onPointerMove, { capture: true });
+    win.removeEventListener("keydown", markActive, { capture: true });
+    win.removeEventListener("wheel", markActive, { capture: true });
+    win.removeEventListener("focus", markActive);
+    doc.removeEventListener("visibilitychange", onVisibilityChange);
+    root.removeAttribute("data-user-idle");
+  };
+}
 
 /** `resources.lowPower`: "on" always, "auto" on battery or in the system's low power mode. */
 export function useLowPower(): boolean {
@@ -152,6 +286,15 @@ export function useEnergyAttributes(): void {
     if (saver) root.setAttribute("data-calm", "");
     else root.removeAttribute("data-calm");
   }, [saver]);
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    const offBlur = attachWindowBlurAttribute(window, document);
+    const offUserIdle = attachUserIdleAttribute(window, document);
+    return () => {
+      offBlur();
+      offUserIdle();
+    };
+  }, []);
 }
 
 /** Re-renders every `ms` while the window is visible, to keep "3 分钟前" labels honest. */

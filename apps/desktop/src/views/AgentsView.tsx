@@ -80,11 +80,27 @@ import { ModelSwitchDropdown, formatEffortLabel } from "../components/ModelSwitc
 import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
-import { buildAskQuestionDeck, buildChoiceSelectKeys, isQuestionToolName, summarizeAskQuestionInput } from "../lib/askQuestion";
+import {
+  buildAskQuestionDeck,
+  buildChoiceSelectKeys,
+  findOpenQuestionToolCallWithId,
+  isQuestionToolName,
+  summarizeAskQuestionInput,
+} from "../lib/askQuestion";
 import { computeTurnTelemetry, fmtLatencyClean, fmtPctClean } from "../lib/turnTelemetry";
 import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
-import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../lib/chatFold";
+import {
+  createBufferedEventMerger,
+  foldConvEvents,
+  mergeConvEvents,
+  reconcileSessionEventsBatch,
+  resolveSessionTrackTransition,
+  type BufferedEventMerger,
+  type ChatRow,
+  type SessionEventsBatchKind,
+  type SessionOwner,
+} from "../lib/chatFold";
 import {
   BUILTIN_SLASH,
   builtinSlashCommands,
@@ -647,7 +663,15 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
   const subLiveRef = useRef(false);
-  const sessionTrackRef = useRef<{ agentKey: string; sessionKey?: string }>({ agentKey: agent.key, sessionKey: agent.sessionKey });
+  const sessionTrackRef = useRef<SessionOwner>({
+    agentKey: agent.key,
+    sessionKey: agent.sessionKey ?? null,
+  });
+  const eventsOwnerRef = useRef<SessionOwner>({
+    agentKey: agent.key,
+    sessionKey: agent.sessionKey ?? null,
+  });
+  const sessionEpochRef = useRef(0);
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<StagedAttachment[]>([]);
   attachmentsRef.current = attachments;
@@ -732,50 +756,119 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
 
   const sessionStreamPaused = !chatVisited || streamHibernated;
 
-  useEffect(() => {
-    if (sessionStreamPaused) return;
-    let alive = true;
-    const prev = sessionTrackRef.current;
-    const sessionSwitched = prev.agentKey !== agent.key || (Boolean(prev.sessionKey) && Boolean(agent.sessionKey) && prev.sessionKey !== agent.sessionKey);
-    sessionTrackRef.current = { agentKey: agent.key, sessionKey: agent.sessionKey };
-    if (sessionSwitched) {
-      setEvents([]);
-      setOlderCursor(null);
-      setLoadingOlder(false);
-      setLoadOlderError(false);
-      setHasLoadedOlder(false);
-      setChoiceLines([]);
-      setSubs([]);
-      setSubTrail([]);
-      setActiveChildSubs([]);
-      setSubEvents([]);
+  const resetSessionViewState = useCallback((opts?: { resetShellAndSlash?: boolean }) => {
+    eventsLenRef.current = 0;
+    setEvents([]);
+    setOlderCursor(null);
+    setLoadingOlder(false);
+    setLoadOlderError(false);
+    setHasLoadedOlder(false);
+    setChoiceLines([]);
+    setSubs([]);
+    setSubTrail([]);
+    setActiveChildSubs([]);
+    setSubEvents([]);
+    if (opts?.resetShellAndSlash !== false) {
       setShellRaw("");
       setDiscoveredSlash([]);
       setSlashDismissedFor(null);
-      stickRef.current = true;
-      initialPositionedRef.current = false;
-      prependAnchorRef.current = null;
-      inFlightCursorRef.current = null;
-      prevScrollTopRef.current = 0;
-      autoFillCountRef.current = 0;
-      setAtBottom(true);
-      setUnreadCount(0);
-      lastTrackedRowIdRef.current = null;
     }
+    stickRef.current = true;
+    initialPositionedRef.current = false;
+    prependAnchorRef.current = null;
+    inFlightCursorRef.current = null;
+    prevScrollTopRef.current = 0;
+    autoFillCountRef.current = 0;
+    setAtBottom(true);
+    setUnreadCount(0);
+    lastTrackedRowIdRef.current = null;
+  }, []);
+
+  const applySessionEventsResponse = useCallback(
+    (
+      kind: Exclude<SessionEventsBatchKind, "older">,
+      reqAgentKey: string,
+      reqSessionKey: string | null | undefined,
+      res: { sessionKey?: string | null; events: ConvEvent[]; more?: boolean; nextBefore?: string | null },
+      opts?: { forceReplace?: boolean; merger?: BufferedEventMerger; reqEpoch?: number },
+    ) => {
+      if (opts?.reqEpoch !== undefined && opts.reqEpoch < sessionEpochRef.current) return;
+      const verdict = reconcileSessionEventsBatch({
+        kind,
+        prevEvents: [],
+        owner: eventsOwnerRef.current,
+        track: sessionTrackRef.current,
+        requestAgentKey: reqAgentKey,
+        requestSessionKey: reqSessionKey,
+        responseSessionKey: res.sessionKey,
+        responseEvents: res.events,
+        more: res.more,
+        nextBefore: res.nextBefore,
+        forceReplace: opts?.forceReplace,
+      });
+      if (verdict.action === "discard") return;
+      eventsOwnerRef.current = verdict.nextOwner;
+      if (verdict.sessionChanged || (!sessionTrackRef.current.sessionKey && verdict.nextOwner.sessionKey)) {
+        sessionTrackRef.current = verdict.nextOwner;
+      }
+      if (verdict.sessionChanged) {
+        sessionEpochRef.current += 1;
+        resetSessionViewState({ resetShellAndSlash: false });
+      }
+      if (verdict.olderCursor !== undefined) {
+        setOlderCursor(verdict.olderCursor);
+      }
+      if (opts?.merger) {
+        opts.merger.onInitialPage(res.events, { replace: verdict.action === "replace" });
+      } else if (verdict.action === "replace") {
+        setEvents(verdict.events);
+      } else {
+        setEvents((prevList) => mergeConvEvents(prevList, res.events));
+      }
+    },
+    [resetSessionViewState],
+  );
+
+  useEffect(() => {
+    const transition = resolveSessionTrackTransition(
+      sessionTrackRef.current,
+      eventsOwnerRef.current,
+      agent.key,
+      agent.sessionKey,
+    );
+    const sessionSwitched = transition.switched;
+    sessionTrackRef.current = transition.nextTrack;
+    eventsOwnerRef.current = transition.nextOwner;
+    if (sessionSwitched) {
+      sessionEpochRef.current += 1;
+      resetSessionViewState();
+    }
+    if (sessionStreamPaused) return;
+    let alive = true;
     streamLiveRef.current = false;
     hadOpenRef.current = false;
-    const merger = createBufferedEventMerger((batch) => {
-      if (alive) setEvents((prevList) => mergeConvEvents(prevList, batch));
+    if (!agent.sessionKey) return;
+    const merger = createBufferedEventMerger((batch, options) => {
+      if (!alive) return;
+      if (options?.replace) {
+        setEvents(batch.length ? mergeConvEvents([], batch) : []);
+      } else {
+        setEvents((prevList) => mergeConvEvents(prevList, batch));
+      }
     });
     if (!sessionSwitched && eventsLenRef.current > 0) {
       merger.onInitialReady();
     }
 
+    const initialEpoch = sessionEpochRef.current;
     void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 200 })
       .then((res) => {
         if (!alive) return;
-        merger.onInitialPage(res.events);
-        setOlderCursor(res.more ? (res.nextBefore ?? null) : null);
+        applySessionEventsResponse("initial", agent.key, agent.sessionKey, res, {
+          forceReplace: sessionSwitched,
+          merger,
+          reqEpoch: initialEpoch,
+        });
       })
       .catch(() => {
         if (alive) merger.onInitialReady();
@@ -797,10 +890,24 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
           const reopened = hadOpenRef.current && !streamLiveRef.current;
           hadOpenRef.current = true;
           streamLiveRef.current = true;
-          if (reopened) {
+          const openedSessionKey =
+            typeof st.result?.sessionKey === "string" && st.result.sessionKey.trim()
+              ? st.result.sessionKey.trim()
+              : null;
+          const openedDifferentSession = Boolean(
+            openedSessionKey &&
+              eventsOwnerRef.current.sessionKey &&
+              openedSessionKey !== eventsOwnerRef.current.sessionKey,
+          );
+          if (reopened || openedDifferentSession) {
+            const reopenEpoch = sessionEpochRef.current;
             void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 120 })
               .then((res) => {
-                if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
+                if (alive) {
+                  applySessionEventsResponse("reopened", agent.key, agent.sessionKey, res, {
+                    reqEpoch: reopenEpoch,
+                  });
+                }
               })
               .catch(() => {});
           }
@@ -821,9 +928,14 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
           .catch(() => {});
       }
       if (streamLiveRef.current || !agent.sessionKey) return;
+      const pollEpoch = sessionEpochRef.current;
       void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
         .then((res) => {
-          if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
+          if (alive) {
+            applySessionEventsResponse("poll", agent.key, agent.sessionKey, res, {
+              reqEpoch: pollEpoch,
+            });
+          }
         })
         .catch(() => {});
     }, 3_000);
@@ -834,7 +946,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
       window.clearInterval(pollTimer);
       unsubSession();
     };
-  }, [agent.deviceId, agent.key, agent.sessionKey, sessionStreamPaused]);
+  }, [agent.deviceId, agent.key, agent.sessionKey, applySessionEventsResponse, resetSessionViewState, sessionStreamPaused]);
 
   const lastSeenMarkRef = useRef<string | null>(null);
   const wasVisibleForSeenRef = useRef(false);
@@ -852,21 +964,14 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     const timer = window.setTimeout(() => {
       if (lastSeenMarkRef.current === mark && !justBecameViewed) return;
       lastSeenMarkRef.current = mark;
-      liveStore.set((prev) => {
-        const list = prev.agents[agent.deviceId];
-        if (!list?.some((a) => a.key === agent.key && a.status === "done")) return prev;
-        return {
-          ...prev,
-          agents: {
-            ...prev.agents,
-            [agent.deviceId]: list.map((a) =>
-              a.key === agent.key && a.status === "done" ? { ...a, status: "idle" } : a,
-            ),
-          },
-          rev: prev.rev + 1,
-        };
+      void rpcCall(agent.deviceId, "agent.seen", {
+        agent: agent.key,
+        ...(typeof agent.turn === "number" ? { turn: agent.turn } : {}),
+      }).catch(() => {
+        if (lastSeenMarkRef.current === mark) {
+          lastSeenMarkRef.current = null;
+        }
       });
-      void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
     }, 600);
     return () => {
       window.clearTimeout(timer);
@@ -1017,9 +1122,14 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     if (!visible || wasVisible || !chatVisited) return;
     let alive = true;
     if (!streamLiveRef.current && agent.sessionKey) {
+      const recoveryEpoch = sessionEpochRef.current;
       void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
         .then((res) => {
-          if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
+          if (alive) {
+            applySessionEventsResponse("recovery", agent.key, agent.sessionKey, res, {
+              reqEpoch: recoveryEpoch,
+            });
+          }
         })
         .catch(() => {});
     }
@@ -1045,7 +1155,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     return () => {
       alive = false;
     };
-  }, [activeSubKey, agent.deviceId, agent.key, agent.sessionKey, chatVisited, visible]);
+  }, [activeSubKey, agent.deviceId, agent.key, agent.sessionKey, applySessionEventsResponse, chatVisited, visible]);
 
   useEffect(() => {
     if (!chatVisited || agent.isShell) {
@@ -1065,15 +1175,30 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     };
   }, [agent.cwd, agent.deviceId, agent.harness, agent.isShell, agent.key, chatVisited]);
 
+  const displayedEvents = activeSub ? subEvents : events;
+  const openQuestionCall = useMemo(
+    () => (!activeSub ? findOpenQuestionToolCallWithId(displayedEvents) : null),
+    [activeSub, displayedEvents],
+  );
+  const hasOpenQuestionTool = Boolean(openQuestionCall);
+  const shouldPollAskChoices =
+    agent.status === "blocked" ||
+    agent.interaction?.kind === "question" ||
+    (agent.status === "working" && hasOpenQuestionTool);
+  const askDismissed = Boolean(
+    dismissedAskCallId &&
+      (openQuestionCall ? dismissedAskCallId === openQuestionCall.callId : dismissedAskCallId === "__dismissed__"),
+  );
+
   useEffect(() => {
     setDismissedAskCallId(null);
   }, [agent.key]);
 
   useEffect(() => {
-    if (agent.status !== "blocked") {
+    if (!shouldPollAskChoices) {
       setDismissedAskCallId(null);
     }
-  }, [agent.status]);
+  }, [shouldPollAskChoices]);
 
   const refreshChoicesSoon = useCallback(() => {
     setChoiceRefreshNonce((n) => n + 1);
@@ -1082,7 +1207,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   }, []);
 
   useEffect(() => {
-    if (activeMode !== "chat" || activeSub || agent.status !== "blocked") {
+    if (!visible || activeMode !== "chat" || activeSub || !shouldPollAskChoices || askDismissed) {
       setChoiceLines([]);
       return;
     }
@@ -1095,15 +1220,17 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
         .catch(() => {});
     };
     fetchChoices();
-    const timer = window.setInterval(fetchChoices, 900);
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      fetchChoices();
+    }, 900);
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [activeMode, activeSub, agent.deviceId, agent.key, agent.status, choiceRefreshNonce, events.length]);
+  }, [activeMode, activeSub, agent.deviceId, agent.key, askDismissed, choiceRefreshNonce, events.length, shouldPollAskChoices, visible]);
 
   const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
-  const displayedEvents = activeSub ? subEvents : events;
   const questionDeck = useMemo(
     () =>
       activeMode === "chat" && !activeSub
@@ -1112,10 +1239,11 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
             choiceLines,
             choices,
             agentStatus: agent.status,
+            interaction: agent.interaction,
             dismissedCallId: dismissedAskCallId,
           })
         : null,
-    [activeMode, activeSub, agent.status, choiceLines, choices, dismissedAskCallId, displayedEvents],
+    [activeMode, activeSub, agent.interaction, agent.status, choiceLines, choices, dismissedAskCallId, displayedEvents],
   );
   const shellChat = useMemo(() => (isPlainShellChat ? parseTerminalChatTranscript(shellRaw) : null), [isPlainShellChat, shellRaw]);
   const cachedFoldedRef = useRef<ChatRow[]>([]);
@@ -1451,30 +1579,49 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     if (!cursor || inFlightCursorRef.current === cursor) return;
     inFlightCursorRef.current = cursor;
     const reqAgentKey = agent.key;
+    const reqSessionKey =
+      eventsOwnerRef.current.sessionKey ?? sessionTrackRef.current.sessionKey ?? agent.sessionKey ?? null;
     setLoadingOlder(true);
     setLoadOlderError(false);
     try {
       const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, before: cursor, limit: 200 });
-      if (sessionTrackRef.current.agentKey !== reqAgentKey) return;
+      const verdict = reconcileSessionEventsBatch({
+        kind: "older",
+        prevEvents: [],
+        owner: eventsOwnerRef.current,
+        track: sessionTrackRef.current,
+        requestAgentKey: reqAgentKey,
+        requestSessionKey: reqSessionKey,
+        responseSessionKey: res.sessionKey,
+        responseEvents: res.events,
+        more: res.more,
+        nextBefore: res.nextBefore,
+        beforeCursor: cursor,
+      });
+      if (verdict.action === "discard") return;
+      eventsOwnerRef.current = verdict.nextOwner;
       const el = chatScrollRef.current;
       prependAnchorRef.current = el ? { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop } : null;
       stickRef.current = false;
       setAtBottom(false);
       setHasLoadedOlder(true);
       setEvents((prevList) => mergeConvEvents(prevList, res.events));
-      const nextCursor =
-        !res.more || !res.nextBefore || res.nextBefore === cursor || res.events.length === 0
-          ? null
-          : res.nextBefore;
-      setOlderCursor(nextCursor);
+      setOlderCursor(verdict.olderCursor ?? null);
     } catch (e) {
-      setLoadOlderError(true);
-      toast((e as Error).message, true);
+      if (
+        sessionTrackRef.current.agentKey === reqAgentKey &&
+        (reqSessionKey === null || sessionTrackRef.current.sessionKey === reqSessionKey)
+      ) {
+        setLoadOlderError(true);
+        toast((e as Error).message, true);
+      }
     } finally {
-      if (inFlightCursorRef.current === cursor) inFlightCursorRef.current = null;
-      setLoadingOlder(false);
+      if (inFlightCursorRef.current === cursor) {
+        inFlightCursorRef.current = null;
+        setLoadingOlder(false);
+      }
     }
-  }, [agent.deviceId, agent.key, olderCursor, toast]);
+  }, [agent.deviceId, agent.key, agent.sessionKey, olderCursor, toast]);
 
   useEffect(() => {
     const tail = captured.length ? `cap:${captured[captured.length - 1]!.id}` : foldedRows.length ? `row:${foldedRows[foldedRows.length - 1]!.id}` : null;
@@ -2804,7 +2951,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                 <span className="composer-queue-hint">
                   {!hostOnline
                     ? "电脑离线，上线后自动发送"
-                    : agent.status === "blocked"
+                    : agent.status === "blocked" || Boolean(agent.interaction?.kind)
                       ? "等待确认，点「立即发送」可直接送入"
                       : "当前轮结束后依次自动发送"}
                 </span>

@@ -141,9 +141,15 @@
   height: 11px;
 }
 
-/* Energy care: no spinning while the window is hidden or on low power. */
+/* Energy care: no spinning or endless dot pulsing while hidden, blurred, user-idle, or on low power. */
 :root[data-idle] .v3-spinner,
-:root[data-calm] .v3-spinner {
+:root[data-calm] .v3-spinner,
+:root[data-blurred] .v3-spinner,
+:root[data-user-idle] .v3-spinner,
+:root[data-idle] .v3-ego-dot.working,
+:root[data-calm] .v3-ego-dot.working,
+:root[data-blurred] .v3-ego-dot.working,
+:root[data-user-idle] .v3-ego-dot.working {
   animation: none;
 }
 

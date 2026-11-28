@@ -13,6 +13,8 @@
  * `type` / `kind` values. Clients must ignore what they don't recognise.
  */
 
+import type { TerminalChoiceOption } from "./askQuestion.ts";
+
 export const PROTOCOL_VERSION = 1;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +63,15 @@ export interface AgentListeningPort {
 
 export type TutorialStatus = 0 | 1 | 2;
 
+/** Host-detected active interactive prompt (Ask menu, approval dialog, or auth gate) across all harnesses. */
+export interface AgentInteraction {
+  kind: "question" | "permission" | "auth";
+  prompt?: string;
+  choices?: TerminalChoiceOption[];
+  multiSelect?: boolean;
+  source: "structured_tool" | "terminal";
+}
+
 export interface Agent {
   /** Globally unique: `<deviceId>/<source>:<localId>`. */
   key: string;
@@ -90,6 +101,8 @@ export interface Agent {
   statusNote?: string;
   /** Active non-input terminal subscreen hint detected by hostd. */
   subscreen?: "viewer" | "pager" | null;
+  /** Host-normalized active interaction (Ask question menu, approval, or auth prompt) across all harnesses. */
+  interaction?: AgentInteraction;
   /**
    * The program stopped on an error (a model or connection failure) rather than
    * on a question. `status` is `blocked` then, so older apps still flag it.
@@ -800,7 +813,7 @@ export interface RpcMethods {
    * The person looked at this agent: a finished turn stops counting as "done"
    * here and in the desktop app (herdr keeps this on the terminal for every client).
    */
-  "agent.seen": { params: { agent: string }; result: { ok: true } };
+  "agent.seen": { params: { agent: string; turn?: number }; result: { ok: true } };
   /** Press the stop key (like `hc interrupt`); `report` says what happened. */
   "terminal.interrupt": { params: { agent: string }; result: { ok: true; report?: string } };
   /** End the terminal and its sub-agents. */

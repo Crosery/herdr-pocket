@@ -213,20 +213,46 @@ export const useMobileQueue = create<MobileQueueState>()(
 const inFlight = new Set<string>();
 const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean; idleSince?: number }>();
 const latestEventsByAgent = new Map<string, readonly ConvEvent[]>();
+const eventListenersByAgent = new Map<string, Set<() => void>>();
 let watcherInstalled = false;
 const IDLE_DEBOUNCE_MS = 600;
 const RECENT_OUTGOING_MS = 15_000;
 
+function notifySessionEventListeners(agentKey: string): void {
+  const listeners = eventListenersByAgent.get(agentKey);
+  if (!listeners) return;
+  for (const listener of listeners) {
+    listener();
+  }
+}
+
 export function recordMobileSessionEvents(agentKey: string, events: readonly ConvEvent[]): void {
+  const prev = latestEventsByAgent.get(agentKey);
   if (!events.length) {
+    if (!prev) return;
     latestEventsByAgent.delete(agentKey);
   } else {
+    if (prev === events) return;
     latestEventsByAgent.set(agentKey, events);
   }
+  notifySessionEventListeners(agentKey);
 }
 
 export function getMobileSessionEvents(agentKey: string): readonly ConvEvent[] | undefined {
   return latestEventsByAgent.get(agentKey);
+}
+
+export function subscribeMobileSessionEvents(agentKey: string, listener: () => void): () => void {
+  let set = eventListenersByAgent.get(agentKey);
+  if (!set) {
+    set = new Set();
+    eventListenersByAgent.set(agentKey, set);
+  }
+  set.add(listener);
+  return () => {
+    set!.delete(listener);
+    if (set!.size === 0) eventListenersByAgent.delete(agentKey);
+  };
 }
 
 /**

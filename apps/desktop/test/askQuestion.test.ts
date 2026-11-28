@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseTerminalChoices, type ConvEvent } from "@herdr-pocket/protocol";
+import { parseTerminalChoices, type Agent, type AgentInteraction, type ConvEvent } from "@herdr-pocket/protocol";
 import {
   buildAskQuestionDeck,
   buildChoiceSelectKeys,
@@ -11,6 +11,7 @@ import {
   parseAskQuestionInput,
   summarizeAskQuestionInput,
 } from "../src/lib/askQuestion";
+import { shallowEqualAgent } from "../src/lib/relay.ts";
 
 test("parseAskQuestionInput unwraps doubly JSON-encoded questions strings cleanly", () => {
   const rawInput = {
@@ -133,11 +134,51 @@ test("buildAskQuestionDeck falls back to structured options when terminal choice
   const fallbackDeck = buildAskQuestionDeck({ events, choiceLines: [], choices: [] });
   assert.ok(fallbackDeck);
   assert.equal(fallbackDeck.fromStructuredTool, true);
+  assert.equal(fallbackDeck.terminalMenuSynced, false);
   assert.equal(fallbackDeck.question, "选择发布渠道？");
   assert.equal(fallbackDeck.entries.length, 3);
   assert.equal(fallbackDeck.entries[0]!.key, "1");
   assert.equal(fallbackDeck.entries[0]!.recommended, true);
   assert.equal(fallbackDeck.entries[2]!.isWriteIn, true);
+
+  // Synced multi-select Claude AskUserQuestion with live terminal checkboxes MUST have terminalMenuSynced=true.
+  const multiEvents: ConvEvent[] = [
+    {
+      id: "tc-multi",
+      session: "s1",
+      ts: 1500,
+      kind: "tool_call",
+      call_id: "c-multi",
+      name: "AskUserQuestion",
+      input: {
+        questions: [
+          {
+            question: "Select targets to build",
+            multiSelect: true,
+            options: [{ label: "macOS" }, { label: "Linux" }, { label: "Windows" }],
+          },
+        ],
+      },
+    },
+  ];
+  const unsyncedMulti = buildAskQuestionDeck({
+    events: multiEvents,
+    choiceLines: [],
+    choices: [],
+    agentStatus: "working",
+  });
+  assert.equal(unsyncedMulti?.multiSelect, true);
+  assert.equal(unsyncedMulti?.terminalMenuSynced, false);
+
+  const syncedMulti = buildAskQuestionDeck({
+    events: multiEvents,
+    choiceLines: ["Select targets to build", "❯ 1. [ ] macOS", "  2. [x] Linux", "  3. [ ] Windows"],
+    choices: parseTerminalChoices(["❯ 1. [ ] macOS", "  2. [x] Linux", "  3. [ ] Windows"]),
+    agentStatus: "blocked",
+  });
+  assert.equal(syncedMulti?.multiSelect, true);
+  assert.equal(syncedMulti?.fromStructuredTool, true);
+  assert.equal(syncedMulti?.terminalMenuSynced, true);
 
   const afterReply = buildAskQuestionDeck({
     events: [...events, { id: "u1", session: "s1", ts: 2000, kind: "user_message", text: "1" }],
@@ -147,7 +188,7 @@ test("buildAskQuestionDeck falls back to structured options when terminal choice
   assert.equal(afterReply, null);
 });
 
-test("chronological tool_call -> tool_result and non-blocked agentStatus immediately clear AskQuestionDeck (image-132 P0 regression)", () => {
+test("chronological tool_call -> tool_result and done/idle agentStatus immediately clear AskQuestionDeck (image-132 P0 regression)", () => {
   const askCall: ConvEvent = {
     id: "s4666:c0",
     session: "antigravity:a1",
@@ -167,31 +208,41 @@ test("chronological tool_call -> tool_result and non-blocked agentStatus immedia
   // Answered chronologically via tool_result -> MUST return null!
   const answeredEvents: ConvEvent[] = [
     askCall,
-    { id: "s4667", session: "antigravity:a1", ts: 2000, kind: "tool_result", call_id: "s4666:0", name: "ask_question", output: "A1: 小吹私人助理" },
+    { id: "s4667", session: "antigravity:a1", ts: 2000, kind: "tool_result", call_id: "s4666:0", name: "ask_question", output: "A1: 小吹私人助理", is_error: false },
   ];
   assert.deepEqual(findOpenQuestionToolCall(answeredEvents), []);
   assert.equal(buildAskQuestionDeck({ events: answeredEvents, choiceLines: [], choices: [], agentStatus: "working" }), null);
 
-  // Even before tool_result arrives, reasoning / assistant_message / another tool_call / working status MUST clear zombie deck!
-  assert.deepEqual(
-    findOpenQuestionToolCall([askCall, { id: "s4668:r", session: "antigravity:a1", ts: 1500, kind: "reasoning", text: "Thinking..." }]),
-    [],
-  );
+  // Even before tool_result arrives, reasoning / assistant_message / another tool_call MUST close the question & clear zombie deck!
+  const resumedEvents: ConvEvent[] = [
+    askCall,
+    { id: "s4668:r", session: "antigravity:a1", ts: 1500, kind: "reasoning", text: "Thinking..." },
+  ];
+  assert.deepEqual(findOpenQuestionToolCall(resumedEvents), []);
   assert.equal(
-    buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "working" }),
+    buildAskQuestionDeck({ events: resumedEvents, choiceLines: [], choices: [], agentStatus: "working" }),
     null,
   );
+  // Zombie deck MUST NEVER render when agent is idle or done without an active hostd question interaction.
   assert.equal(
     buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "idle" }),
     null,
   );
+  assert.equal(
+    buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "done" }),
+    null,
+  );
 
-  // While genuinely blocked, user dismiss hides the deck cleanly
+  // While genuinely blocked or working with an open ask call, user dismiss hides the deck cleanly
   const blockedDeck = buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "blocked" });
   assert.ok(blockedDeck);
   assert.equal(blockedDeck.callId, "s4666:0");
   assert.equal(
     buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "blocked", dismissedCallId: "s4666:0" }),
+    null,
+  );
+  assert.equal(
+    buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "working", dismissedCallId: "s4666:0" }),
     null,
   );
 });
@@ -312,4 +363,189 @@ test("parseTerminalChoices rejects Antigravity reviewing footer and background t
   assert.equal(validRadio.length, 2);
   assert.equal(validRadio[0]!.selected, true);
   assert.equal(validRadio[1]!.selected, false);
+});
+
+test("buildAskQuestionDeck renders cross-harness working asks and hostd interaction choices instantly, while blocking done/idle zombies", () => {
+  // 1. Open ask / ask_question / request_user_input tool calls render immediately even when agentStatus === "working"
+  for (const toolName of ["ask", "ask_question", "request_user_input"] as const) {
+    const ev: ConvEvent = {
+      id: `tc-${toolName}`,
+      session: "s-cross",
+      ts: 1000,
+      kind: "tool_call",
+      call_id: `call-${toolName}`,
+      name: toolName,
+      input: {
+        questions: [
+          {
+            question: `(${toolName}) 选择构建模式？`,
+            options: ["(Recommended) 增量构建 — 更快", "全量重建", "Write-in..."],
+          },
+        ],
+      },
+    };
+    const deck = buildAskQuestionDeck({
+      events: [ev],
+      choiceLines: [],
+      choices: [],
+      agentStatus: "working",
+    });
+    assert.ok(deck, `expected working deck for ${toolName}`);
+    assert.equal(deck.callId, `call-${toolName}`);
+    assert.equal(deck.question, `(${toolName}) 选择构建模式？`);
+    assert.equal(deck.entries.length, 3);
+    assert.equal(deck.entries[0]!.recommended, true);
+    assert.equal(deck.entries[2]!.isWriteIn, true);
+  }
+
+  // 2. hostd interaction.kind === "question" renders immediately using interaction.choices + prompt + multiSelect before terminal.read arrives
+  const interaction: AgentInteraction = {
+    kind: "question",
+    prompt: "勾选要启用的功能模块",
+    multiSelect: true,
+    source: "terminal",
+    choices: [
+      { key: "1", label: "(Recommended) 缓存加速 — 默认开启", selected: true, checked: true },
+      { key: "2", label: "详细日志", selected: false, checked: false },
+      { key: "3", label: "Other", selected: false, checked: false },
+    ],
+  };
+  const instantDeck = buildAskQuestionDeck({
+    events: [],
+    choiceLines: [],
+    choices: [],
+    agentStatus: "working",
+    interaction,
+  });
+  assert.ok(instantDeck);
+  assert.equal(instantDeck.question, "勾选要启用的功能模块");
+  assert.equal(instantDeck.multiSelect, true);
+  assert.equal(instantDeck.entries.length, 3);
+  assert.equal(instantDeck.entries[0]!.title, "缓存加速");
+  assert.equal(instantDeck.entries[0]!.description, "默认开启");
+  assert.equal(instantDeck.entries[0]!.recommended, true);
+  assert.equal(instantDeck.entries[0]!.checked, true);
+  assert.equal(instantDeck.entries[2]!.isWriteIn, true);
+
+  // Live terminal choices override interaction.choices once terminal.read returns
+  const liveOverrides = buildAskQuestionDeck({
+    events: [],
+    choiceLines: ["勾选要启用的功能模块", "  1. [x] 缓存加速", "❯ 2. [x] 详细日志"],
+    choices: [
+      { key: "1", label: "缓存加速", selected: false, checked: true },
+      { key: "2", label: "详细日志", selected: true, checked: true },
+    ],
+    agentStatus: "working",
+    interaction,
+  });
+  assert.ok(liveOverrides);
+  assert.equal(liveOverrides.entries.length, 2);
+  assert.equal(liveOverrides.entries[1]!.selected, true);
+  assert.equal(liveOverrides.entries[1]!.checked, true);
+
+  // 3. NEVER renders zombie decks on done / idle without a live question interaction (even with stale choices or permission interaction)
+  const staleChoices = [
+    { key: "1", label: "A", selected: true },
+    { key: "2", label: "B", selected: false },
+  ];
+  assert.equal(
+    buildAskQuestionDeck({ events: [], choiceLines: [], choices: staleChoices, agentStatus: "done" }),
+    null,
+  );
+  assert.equal(
+    buildAskQuestionDeck({ events: [], choiceLines: [], choices: staleChoices, agentStatus: "idle" }),
+    null,
+  );
+  assert.equal(
+    buildAskQuestionDeck({
+      events: [],
+      choiceLines: [],
+      choices: staleChoices,
+      agentStatus: "idle",
+      interaction: { kind: "permission", prompt: "Allow?", source: "terminal" },
+    }),
+    null,
+  );
+});
+
+test("shallowEqualAgent detects agent.interaction additions, field/choice updates, and removals", () => {
+  const base: Agent = {
+    key: "d1/hc:t1",
+    deviceId: "d1",
+    source: "hc",
+    localId: "t1",
+    harness: "codex",
+    status: "working",
+    isShell: false,
+    updatedAt: 1000,
+  };
+  const baseCopy: Agent = { ...base };
+  assert.equal(shallowEqualAgent(base, baseCopy), true);
+
+  const withInteraction: Agent = {
+    ...base,
+    interaction: {
+      kind: "question",
+      prompt: "Choose target",
+      multiSelect: false,
+      source: "terminal",
+      choices: [
+        { key: "1", label: "Alpha", selected: true },
+        { key: "2", label: "Beta", selected: false },
+      ],
+    },
+  };
+  // Addition detected
+  assert.equal(shallowEqualAgent(base, withInteraction), false);
+  // Removal detected
+  assert.equal(shallowEqualAgent(withInteraction, base), false);
+  // Structurally identical interaction returns true
+  const sameInteraction: Agent = {
+    ...base,
+    interaction: {
+      kind: "question",
+      prompt: "Choose target",
+      multiSelect: false,
+      source: "terminal",
+      choices: [
+        { key: "1", label: "Alpha", selected: true },
+        { key: "2", label: "Beta", selected: false },
+      ],
+    },
+  };
+  assert.equal(shallowEqualAgent(withInteraction, sameInteraction), true);
+
+  // Cursor selection change detected
+  const cursorMoved: Agent = {
+    ...withInteraction,
+    interaction: {
+      ...withInteraction.interaction!,
+      choices: [
+        { key: "1", label: "Alpha", selected: false },
+        { key: "2", label: "Beta", selected: true },
+      ],
+    },
+  };
+  assert.equal(shallowEqualAgent(withInteraction, cursorMoved), false);
+
+  // Checkbox checked state change detected
+  const checkedChanged: Agent = {
+    ...withInteraction,
+    interaction: {
+      ...withInteraction.interaction!,
+      multiSelect: true,
+      choices: [
+        { key: "1", label: "Alpha", selected: true, checked: true },
+        { key: "2", label: "Beta", selected: false, checked: false },
+      ],
+    },
+  };
+  assert.equal(shallowEqualAgent(withInteraction, checkedChanged), false);
+
+  // Prompt change detected
+  const promptChanged: Agent = {
+    ...withInteraction,
+    interaction: { ...withInteraction.interaction!, prompt: "Choose another target" },
+  };
+  assert.equal(shallowEqualAgent(withInteraction, promptChanged), false);
 });

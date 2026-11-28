@@ -16,6 +16,7 @@ interface CachedWindow {
 
 const windowCache = new Map<string, CachedWindow>();
 let quotaCache: { at: number; bars: AgentQuotaBar[] } | null = null;
+let quotaInFlight: Promise<AgentQuotaBar[]> | null = null;
 
 function sanitizeAccountLabel(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -101,20 +102,28 @@ export function parseOmpUsageJson(raw: string): AgentQuotaBar[] {
 
 export async function getDefaultOmpQuotas(): Promise<AgentQuotaBar[]> {
   if (quotaCache && Date.now() - quotaCache.at < QUOTA_CACHE_MS) return quotaCache.bars;
-  try {
-    const found = await findPrograms(["omp"]);
-    const bin = found.get("omp");
-    if (!bin) {
-      quotaCache = { at: Date.now(), bars: [] };
-      return [];
+  if (quotaInFlight) return quotaInFlight;
+  quotaInFlight = (async () => {
+    try {
+      const found = await findPrograms(["omp"]);
+      const bin = found.get("omp");
+      if (!bin) {
+        quotaCache = { at: Date.now(), bars: [] };
+        return [];
+      }
+      const { stdout } = await execFileAsync(bin, ["usage", "--json", "--redact"], { timeout: 3500, maxBuffer: 512 * 1024 });
+      const bars = parseOmpUsageJson(stdout);
+      quotaCache = { at: Date.now(), bars };
+      return bars;
+    } catch {
+      const fallback = quotaCache?.bars ?? [];
+      quotaCache = { at: Date.now(), bars: fallback };
+      return fallback;
+    } finally {
+      quotaInFlight = null;
     }
-    const { stdout } = await execFileAsync(bin, ["usage", "--json", "--redact"], { timeout: 3500, maxBuffer: 512 * 1024 });
-    const bars = parseOmpUsageJson(stdout);
-    quotaCache = { at: Date.now(), bars };
-    return bars;
-  } catch {
-    return quotaCache?.bars ?? [];
-  }
+  })();
+  return quotaInFlight;
 }
 
 export interface CachedSessionUsageSummary {

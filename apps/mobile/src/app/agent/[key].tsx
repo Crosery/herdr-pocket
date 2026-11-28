@@ -113,20 +113,12 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
     const mark = `${agent.key}:${agent.turn ?? ""}`;
     if (seenSent.has(mark)) return;
     seenSent.add(mark);
-    useLive.setState((s) => {
-      const list = s.agents[agent.deviceId];
-      if (!list?.some((a) => a.key === agent.key && a.status === "done")) return s;
-      return {
-        agents: {
-          ...s.agents,
-          [agent.deviceId]: list.map((a) =>
-            a.key === agent.key && a.status === "done" ? { ...a, status: "idle" } : a,
-          ),
-        },
-      };
-    });
-    call(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {
-      /* an older computer does not know this; the list just keeps showing it as done */
+    call(agent.deviceId, "agent.seen", {
+      agent: agent.key,
+      ...(typeof agent.turn === "number" ? { turn: agent.turn } : {}),
+    }).catch(() => {
+      /* failed (offline/timeout) or unsupported: reset dedupe so re-viewing retries cleanly */
+      seenSent.delete(mark);
     });
   }, [agent.key, agent.deviceId, agent.status, agent.turn]);
 

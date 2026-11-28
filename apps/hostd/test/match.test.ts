@@ -358,3 +358,77 @@ test("a new terminal is not given its folder's earlier conversation", () => {
   assert.equal(u.enrich([titled, two[1]!], pids, new Map(), created)[0]!.sessionKey, undefined);
   assert.equal(u.enrich([titled, two[1]!], pids)[0]!.sessionKey, "omp:old");
 });
+
+test("uniflo matching: duplicate pid prefers working/newest session and accepts interactively resumed antigravity while preserving sibling guard", () => {
+  const u = new UnifloAdapter("http://127.0.0.1:1");
+  const now = Date.now();
+  const born = now - 60_000;
+
+  // Duplicate PID 4200: Uniflo lists newest-first.
+  // - `agy:resumed` started 3h before terminal opened, resumed interactively (`updated_at > born`), currently `work`.
+  // - `agy:startup-idle` started after terminal opened, currently `idle` (older `updated_at` than `agy:resumed`).
+  const resumed = session("agy:resumed", "antigravity", "/p/app", {
+    pid: 4200,
+    title: "Resumed active session",
+    started_at: born - 3 * 3600_000,
+    updated_at: now - 2_000,
+    status: "work",
+  });
+  const startupIdle = session("agy:startup-idle", "antigravity", "/p/app", {
+    pid: 4200,
+    title: "Fresh idle placeholder",
+    started_at: born + 1_000,
+    updated_at: born + 5_000,
+    status: "idle",
+  });
+  // Put newest first (same order Uniflo returns): old `byPid` loop overwrote `resumed` with `startupIdle`.
+  u.sessions = [resumed, startupIdle];
+
+  const t1 = agent("t1", "antigravity", "/p/app");
+  const out = u.enrich([t1], new Map([[t1.key, 4200]]), new Map(), new Map([[t1.key, born]]));
+  assert.equal(out[0]!.sessionKey, "agy:resumed");
+
+  // Also verify tie-breaking when both share status "idle": larger updated_at wins regardless of list order.
+  const newerIdle = { ...resumed, key: "agy:resumed-idle", status: "idle" as const, updated_at: now - 1_000 };
+  u.sessions = [newerIdle, startupIdle];
+  assert.equal(u.enrich([t1], new Map([[t1.key, 4200]]), new Map(), new Map([[t1.key, born]]))[0]!.sessionKey, "agy:resumed-idle");
+
+  // Sibling guard: an unmatched sibling `tSibling` opened around `resumed.started_at` in the same `(harness, cwd)`
+  // must NOT have its session stolen by `t1` even if `t1` shares the PID and `updated_at > born`.
+  u.sessions = [resumed];
+  const tSibling = agent("t-sib", "antigravity", "/p/app");
+  const sibOut = u.enrich(
+    [t1, tSibling],
+    new Map([[t1.key, 4200]]),
+    new Map(),
+    new Map([
+      [t1.key, born],
+      [tSibling.key, resumed.started_at! - 5_000],
+    ]),
+  );
+  assert.equal(sibOut[0]!.sessionKey, undefined, "newer terminal must not steal unmatched older sibling's session");
+
+  // When that older sibling matches its OWN session by PID (even if listed after `t1`), `t1` still matches `resumed`.
+  const siblingOwn = session("agy:sib-own", "antigravity", "/p/app", {
+    pid: 5300,
+    title: "Sibling own session",
+    started_at: resumed.started_at! - 2_000,
+    updated_at: now - 3_000,
+    status: "work",
+  });
+  u.sessions = [resumed, siblingOwn];
+  const bothOut = u.enrich(
+    [t1, tSibling],
+    new Map([
+      [t1.key, 4200],
+      [tSibling.key, 5300],
+    ]),
+    new Map(),
+    new Map([
+      [t1.key, born],
+      [tSibling.key, resumed.started_at! - 5_000],
+    ]),
+  );
+  assert.equal(bothOut[0]!.sessionKey, "agy:resumed");
+  assert.equal(bothOut[1]!.sessionKey, "agy:sib-own");
+});

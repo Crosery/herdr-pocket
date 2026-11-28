@@ -24,6 +24,9 @@ const QUESTION_TOOL_NAMES = new Set([
   "askuserquestion",
   "ask_user_question",
   "ask_user",
+  "ask_human",
+  "user_input",
+  "clarify",
   "question",
   "request_user_input",
   "ask_followup_question",
@@ -235,7 +238,7 @@ export interface TerminalChoiceOption {
   checked?: boolean;
 }
 
-const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+const ANSI_ESCAPE_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g;
 const NUMBERED_OPTION_RE = /^\s*([❯›>▶➜→●▸]\s*)?(\d{1,2})[.)]\s+(.+?)\s*$/;
 const RADIO_CHECK_OPTION_RE = /^\s*([❯›>▶➜→▸]\s*)?(?:(\[[ xX✓✔]\])|([●◉○◯]))\s+(.+?)\s*$/;
 const POINTER_ONLY_OPTION_RE = /^(\s*)([❯›▶▸]|>\s)(.+?)\s*$/;
@@ -252,7 +255,7 @@ const CLEAN_TRAILING_HINT_RE = /\s+\((?:esc|y|n|a|p|shift\+tab|tab)\)$/i;
  */
 export function parseTerminalChoices(lines: readonly string[], lookback = 36): TerminalChoiceOption[] {
   const cleaned = lines
-    .map((l) => l.replace(ANSI_SGR_RE, "").replace(/[│┃║]/g, " ").replace(/\s+$/, ""))
+    .map((l) => l.replace(ANSI_ESCAPE_RE, "").replace(/[│┃║]/g, " ").replace(/\s+$/, ""))
     .filter((l) => l.trim().length > 0)
     .slice(-lookback);
   if (cleaned.length === 0) return [];

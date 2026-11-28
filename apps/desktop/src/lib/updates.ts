@@ -607,7 +607,6 @@ export async function fetchReleaseNotes(timeoutMs = 4000, version?: string): Pro
 const RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
 
 function focusRecheckMs(): number {
-  if (updateStore.get().info?.hasUpdate) return 15_000;
   return Math.min(
     10 * 60_000,
     Math.max(60_000, clientConfigStore.get().config.update.checkIntervalHours * 3_600_000),
@@ -676,7 +675,7 @@ export function startAutoUpdateChecks(
       return;
     }
 
-    const every = updateStore.get().info?.hasUpdate ? 60_000 : checkIntervalHours * 3_600_000;
+    const every = checkIntervalHours * 3_600_000;
     const last = updateStore.get().checkedAt ?? 0;
     const jitter = every * (Math.random() * 0.2 - 0.1);
     const wait = Math.max(15_000, last + every + jitter - Date.now());

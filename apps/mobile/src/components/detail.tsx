@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ComponentRef } from "react";
 import { Image, Pressable, ScrollView, TextInput as RNTextInput, useWindowDimensions, View, type TextStyle } from "react-native";
 import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -17,7 +17,6 @@ import {
   findModelOptionForModel,
   inferAgentModelAndThinking,
   isNonReasoningModelName,
-  normalizeChoiceLabel,
   normalizeSwitchHarness,
   parseModelSwitchText,
   resolveThinkingLevelsForModel,
@@ -47,6 +46,7 @@ import {
   removeMobileQueuedPrompt,
   scheduleMobilePendingSwitch,
   steerMobileQueuedPromptNow,
+  subscribeMobileSessionEvents,
   useMobileQueue,
 } from "../lib/chatQueue";
 import { onQueueEvent, sendOut } from "../lib/outbox";
@@ -57,7 +57,13 @@ import { compactNum, money, relTime, shortPath } from "../lib/format";
 import { TERM_BG, TERM_FG } from "../lib/ansi";
 import { TermScreen, type ScreenView, type ShownRow } from "../lib/termscreen";
 import { harnessLook } from "../lib/harness";
-import { parseChoices, type Choice } from "../lib/choices";
+import {
+  buildMobileAskState,
+  findOpenMobileQuestionToolCall,
+  parseChoices,
+  type Choice,
+  type MobileQuestionEntry,
+} from "../lib/choices";
 import { BUILTIN_SLASH, builtinSlashCommands, extractSlashQuery, matchSlashCommands, mergeSlashCommands, slashCommandIconKind, type SlashIconKind } from "../lib/slashCommands";
 import { ModelBrandIcon } from "./ModelBrandIcon";
 
@@ -546,11 +552,17 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
 // Waiting card (docked above the composer when the agent is blocked)
 // ---------------------------------------------------------------------------
 
+const EMPTY_MOBILE_EVENTS: readonly ConvEvent[] = [];
+
 /**
  * Last lines on the agent's screen, so the question it is asking can be read
  * without leaving the chat, and the options it offers (`parseChoices`).
  */
-function useScreenTail(agent: Agent, enabled: boolean, lines = 7): { tail: string[]; choices: Choice[] } {
+function useScreenTail(
+  agent: Agent,
+  enabled: boolean,
+  lines = 7,
+): { tail: string[]; allLines: string[]; choices: Choice[] } {
   const q = useQuery({
     queryKey: ["terminal.tail", agent.key],
     queryFn: () => call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 50 }),
@@ -559,17 +571,25 @@ function useScreenTail(agent: Agent, enabled: boolean, lines = 7): { tail: strin
     retry: false,
   });
   return useMemo(() => {
-    const all = (q.data?.text ?? "").split("\n").map((l) => l.replace(/\s+$/, ""));
-    while (all.length && !all[all.length - 1]!.trim()) all.pop();
-    const choices = parseChoices(all);
-    return { tail: all.filter((l, i) => l.trim() || (i > 0 && all[i - 1]!.trim())).slice(-lines), choices };
-  }, [q.data?.text, lines]);
+    const rawDisplay = (q.data?.text ?? "").split("\n").map((l) => l.replace(/\s+$/, ""));
+    while (rawDisplay.length && !rawDisplay[rawDisplay.length - 1]!.trim()) rawDisplay.pop();
+    const rawParse = (q.data?.ansi || q.data?.text || "").split("\n").map((l) => l.replace(/\s+$/, ""));
+    while (rawParse.length && !rawParse[rawParse.length - 1]!.trim()) rawParse.pop();
+    const choices = parseChoices(rawParse);
+    return {
+      tail: rawDisplay.filter((l, i) => l.trim() || (i > 0 && rawDisplay[i - 1]!.trim())).slice(-lines),
+      allLines: rawParse,
+      choices,
+    };
+  }, [q.data?.ansi, q.data?.text, lines]);
 }
 
 function WaitingCard({
   agent,
+  events,
   onKey,
   onPickChoice,
+  onSubmitWriteIn,
   onRetry,
   busy,
   compact,
@@ -578,8 +598,10 @@ function WaitingCard({
   marginRight = space.lg,
 }: {
   agent: Agent;
+  events: readonly ConvEvent[];
   onKey: (key: string) => void;
-  onPickChoice?: (choice: Choice, all: Choice[]) => void;
+  onPickChoice?: (choice: Choice, all: Choice[], multiSelect: boolean) => void;
+  onSubmitWriteIn?: (choice: Choice, text: string, all: Choice[]) => Promise<boolean> | void;
   onRetry: () => void;
   busy: boolean;
   compact: boolean;
@@ -589,8 +611,28 @@ function WaitingCard({
 }) {
   const p = usePalette();
   const c = statusColors("blocked", p.dark);
+  const [writeInEntry, setWriteInEntry] = useState<MobileQuestionEntry | null>(null);
+  const [writeInText, setWriteInText] = useState("");
+  const writeInInputRef = useRef<ComponentRef<typeof RNTextInput>>(null);
+
   // Read even beside the terminal: the options decide which keys the buttons press.
-  const { tail, choices } = useScreenTail(agent, !agent.errored);
+  const { tail, allLines, choices } = useScreenTail(agent, !agent.errored);
+  const askState = useMemo(
+    () => (agent.errored ? null : buildMobileAskState({ agent, events, tailLines: allLines, liveChoices: choices })),
+    [agent, allLines, choices, events],
+  );
+
+  useEffect(() => {
+    setWriteInEntry(null);
+    setWriteInText("");
+  }, [agent.key, askState?.callId, askState?.question, askState?.currentQuestionIndex, askState?.entries.length]);
+
+  useEffect(() => {
+    if (writeInEntry) {
+      requestAnimationFrame(() => writeInInputRef.current?.focus());
+    }
+  }, [writeInEntry]);
+
   if (agent.errored) {
     // Stopped on an error, not on a question: y / n mean nothing to it.
     return (
@@ -627,55 +669,123 @@ function WaitingCard({
       </View>
     );
   }
-  const choice = (o: Choice) => {
-    const clean = normalizeChoiceLabel(o.label);
+
+  const entries = askState?.entries ?? [];
+  const isMulti = Boolean(askState?.multiSelect);
+  const isSubmitStep = Boolean(askState?.isSubmitStep);
+  const isUnsyncedStructuredMulti = Boolean(askState?.fromStructuredTool && isMulti);
+  const promptText =
+    askState?.question ||
+    (agent.interaction?.kind === "question" ? agent.interaction.prompt?.trim() : undefined) ||
+    agent.statusNote?.trim();
+
+  const submitCustom = async () => {
+    const clean = writeInText.trim();
+    if (!writeInEntry || !clean || busy || !onSubmitWriteIn) return;
+    const ok = await onSubmitWriteIn(writeInEntry, clean, entries);
+    if (ok !== false) {
+      setWriteInEntry(null);
+      setWriteInText("");
+    }
+  };
+
+  const choiceRow = (o: MobileQuestionEntry) => {
+    const isChecked = Boolean(o.checked);
+    const isEditing = writeInEntry?.key === o.key;
+    const solidHighlight = !isMulti && o.selected && !isEditing;
+    const blockUnsyncedMulti = isUnsyncedStructuredMulti && !o.isWriteIn;
     return (
       <Pressable
         key={o.key}
-        disabled={busy}
-        onPress={() => (onPickChoice ? onPickChoice(o, choices) : onKey(o.key))}
-        accessibilityRole="button"
-        accessibilityLabel={`选第 ${o.key} 项：${clean.title}`}
+        disabled={busy || blockUnsyncedMulti}
+        onPress={() => {
+          if (o.isWriteIn && onSubmitWriteIn) {
+            setWriteInEntry(o);
+            return;
+          }
+          if (onPickChoice) onPickChoice(o, entries, isMulti);
+          else onKey(o.key);
+        }}
+        accessibilityRole={isMulti ? "checkbox" : "button"}
+        accessibilityState={isMulti ? { checked: isChecked, disabled: busy || blockUnsyncedMulti } : { selected: o.selected || isEditing }}
+        accessibilityLabel={`选第 ${o.key} 项：${o.title}`}
         style={({ pressed }) => ({
           flexDirection: "row",
           alignItems: "center",
           gap: space.sm,
-          minHeight: 40,
+          minHeight: 42,
           paddingHorizontal: space.md,
-          paddingVertical: 6,
+          paddingVertical: 7,
           borderRadius: radius.md,
-          backgroundColor: pressed ? (o.selected ? p.accentText : p.surface3) : o.selected ? p.primary : p.surface,
-          opacity: busy ? 0.5 : 1,
+          borderWidth: isEditing || (isMulti && (isChecked || o.selected)) ? 1 : 0,
+          borderColor: isEditing || isChecked ? p.primary : p.accentText,
+          backgroundColor: pressed
+            ? solidHighlight
+              ? p.accentText
+              : p.surface3
+            : solidHighlight
+              ? p.primary
+              : isMulti && isChecked
+                ? p.accentContainer
+                : p.surface,
+          opacity: busy || blockUnsyncedMulti ? 0.5 : 1,
         })}
       >
-        <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: o.selected ? p.onPrimary : c.fg, minWidth: 14 }}>{o.key}</Text>
-        <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
-          <Text numberOfLines={2} style={{ fontFamily: fonts.bodySemi, fontSize: 13.5, color: o.selected ? p.onPrimary : p.ink }}>
-            {clean.title}
+        {isMulti ? (
+          <View
+            style={{
+              width: 20,
+              height: 20,
+              borderRadius: 6,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: isChecked ? p.primary : "transparent",
+              borderWidth: isChecked ? 0 : 1.5,
+              borderColor: o.selected ? p.primary : p.muted,
+            }}
+          >
+            {isChecked ? <MaterialCommunityIcons name="check" size={14} color={p.onPrimary} /> : null}
+          </View>
+        ) : (
+          <Text style={{ fontFamily: fonts.monoBold, fontSize: 13, color: solidHighlight ? p.onPrimary : c.fg, minWidth: 16 }}>
+            {o.key}
           </Text>
-          {clean.description ? (
-            <Text numberOfLines={1} style={{ fontSize: 11.5, color: o.selected ? p.onPrimary : p.muted, opacity: o.selected ? 0.9 : 1 }}>
-              {clean.description}
+        )}
+        <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+          <Text numberOfLines={2} style={{ fontFamily: fonts.bodySemi, fontSize: 13.5, color: solidHighlight ? p.onPrimary : p.ink }}>
+            {o.title}
+          </Text>
+          {o.description ? (
+            <Text numberOfLines={2} style={{ fontSize: 11.5, color: solidHighlight ? p.onPrimary : p.muted, opacity: solidHighlight ? 0.9 : 1 }}>
+              {o.description}
             </Text>
           ) : null}
         </View>
-        {clean.recommended ? (
+        {o.recommended ? (
           <View
             style={{
               paddingHorizontal: 6,
               paddingVertical: 2,
               borderRadius: radius.pill,
-              backgroundColor: o.selected ? "rgba(255,255,255,0.22)" : p.accentContainer,
+              backgroundColor: solidHighlight ? "rgba(255,255,255,0.22)" : p.accentContainer,
             }}
           >
-            <Text style={{ fontSize: 10.5, fontFamily: fonts.bodyBold, color: o.selected ? p.onPrimary : p.accentText }}>
+            <Text style={{ fontSize: 10.5, fontFamily: fonts.bodyBold, color: solidHighlight ? p.onPrimary : p.accentText }}>
               推荐
             </Text>
           </View>
         ) : null}
+        {o.isWriteIn ? (
+          <MaterialCommunityIcons name="pencil-outline" size={15} color={solidHighlight ? p.onPrimary : p.accentText} />
+        ) : isMulti ? (
+          <Text style={{ fontSize: 11, fontFamily: fonts.bodySemi, color: isChecked ? p.accentText : p.muted }}>
+            {isChecked ? "已选" : "勾选"}
+          </Text>
+        ) : null}
       </Pressable>
     );
   };
+
   const answer = (label: string, key: string, a11y: string, primary = false) => (
     <Pressable
       key={key}
@@ -698,23 +808,49 @@ function WaitingCard({
       <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, fontSize: 13, color: primary ? p.onPrimary : p.ink }}>{label}</Text>
     </Pressable>
   );
+
   return (
     <View accessibilityLiveRegion="polite" style={{ marginLeft, marginRight, marginBottom: space.sm, backgroundColor: c.bg, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-        <MaterialCommunityIcons name="hand-wave-outline" size={18} color={c.fg} />
-        <Text style={{ flex: 1, minWidth: 0, fontFamily: fonts.cute, fontSize: 16, color: c.fg }}>它在等你回复</Text>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }}>
+          <MaterialCommunityIcons
+            name={entries.length > 0 ? "help-circle-outline" : "hand-wave-outline"}
+            size={18}
+            color={c.fg}
+          />
+          <Text numberOfLines={1} style={{ fontFamily: fonts.cute, fontSize: 16, color: c.fg, flexShrink: 1 }}>
+            {isSubmitStep ? "确认提交" : entries.length > 0 ? "需要你确认" : "它在等你回复"}
+          </Text>
+          {askState?.header ? (
+            <View style={{ paddingHorizontal: 7, paddingVertical: 2, borderRadius: radius.pill, backgroundColor: p.surface }}>
+              <Text numberOfLines={1} style={{ fontSize: 11, fontFamily: fonts.bodySemi, color: p.muted }}>
+                {askState.header}
+              </Text>
+            </View>
+          ) : null}
+          {isMulti ? (
+            <View style={{ paddingHorizontal: 7, paddingVertical: 2, borderRadius: radius.pill, backgroundColor: p.accentContainer }}>
+              <Text style={{ fontSize: 11, fontFamily: fonts.bodyBold, color: p.accentText }}>可多选</Text>
+            </View>
+          ) : null}
+          {askState && askState.totalQuestions > 1 && !isSubmitStep ? (
+            <Text style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: c.fg }}>
+              {askState.currentQuestionIndex + 1}/{askState.totalQuestions}
+            </Text>
+          ) : null}
+        </View>
         {!compact && onOpenTerminal ? (
           <Pressable hitSlop={8} accessibilityRole="button" onPress={onOpenTerminal} style={{ flexShrink: 0 }}>
             <Text style={{ color: c.fg, fontFamily: fonts.bodySemi, fontSize: 12.5 }}>看终端</Text>
           </Pressable>
         ) : null}
       </View>
-      {agent.statusNote ? (
-        <Text selectable style={{ fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: p.ink }}>
-          {agent.statusNote}
+      {promptText ? (
+        <Text selectable style={{ fontFamily: entries.length > 0 ? fonts.bodyBold : fonts.body, fontSize: 13.5, lineHeight: 19, color: p.ink }}>
+          {promptText}
         </Text>
       ) : null}
-      {!compact && tail.length && !choices.length ? (
+      {!compact && tail.length && !entries.length ? (
         <Pressable accessibilityLabel="它屏幕上最后几行，点按去终端" onPress={onOpenTerminal} style={{ backgroundColor: TERM_BG, borderRadius: radius.sm, paddingHorizontal: space.md, paddingVertical: space.sm }}>
           {tail.map((l, i) => (
             <Text key={i} numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 11, lineHeight: 16, color: TERM_FG }}>
@@ -723,14 +859,86 @@ function WaitingCard({
           ))}
         </Pressable>
       ) : null}
-      {choices.length ? (
+      {entries.length ? (
         <View style={{ gap: 6 }}>
-          {choices.slice(0, compact ? 4 : 9).map(choice)}
+          {entries.slice(0, compact ? 4 : 9).map(choiceRow)}
+          {writeInEntry ? (
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 }}>
+              <RNTextInput
+                ref={writeInInputRef}
+                value={writeInText}
+                onChangeText={setWriteInText}
+                placeholder="输入你的自定义回答…"
+                placeholderTextColor={p.faint}
+                returnKeyType="send"
+                onSubmitEditing={() => void submitCustom()}
+                editable={!busy}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  minHeight: 40,
+                  paddingHorizontal: space.md,
+                  paddingVertical: 8,
+                  borderRadius: radius.md,
+                  borderWidth: 1,
+                  borderColor: p.primary,
+                  backgroundColor: p.surface,
+                  color: p.ink,
+                  fontFamily: fonts.body,
+                  fontSize: 13.5,
+                }}
+              />
+              <Pressable
+                disabled={busy || !writeInText.trim()}
+                onPress={() => void submitCustom()}
+                accessibilityRole="button"
+                accessibilityLabel="提交自定义回答"
+                style={({ pressed }) => ({
+                  minHeight: 40,
+                  paddingHorizontal: 14,
+                  borderRadius: radius.pill,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: pressed ? p.accentText : p.primary,
+                  opacity: busy || !writeInText.trim() ? 0.5 : 1,
+                })}
+              >
+                <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: p.onPrimary }}>提交</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  setWriteInEntry(null);
+                  setWriteInText("");
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="取消自定义输入"
+                style={({ pressed }) => ({
+                  width: 36,
+                  height: 36,
+                  borderRadius: 18,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: pressed ? p.surface3 : p.surface,
+                })}
+              >
+                <MaterialCommunityIcons name="close" size={16} color={p.muted} />
+              </Pressable>
+            </View>
+          ) : null}
           <View style={{ flexDirection: "row", gap: 6 }}>
-            {answer("←", "left", "上一题")}
-            {answer("→", "right", "下一题")}
-            {answer("回车", "enter", "按回车确认当前高亮项")}
+            {askState && askState.totalQuestions > 1 ? (
+              <>
+                {answer(compact ? "←" : "上一题", "left", "上一题")}
+                {answer(compact ? "→" : "下一题", "right", "下一题")}
+              </>
+            ) : null}
             {answer("Esc", "esc", "按 Esc 取消")}
+            {answer(
+              isSubmitStep ? "确认提交" : isMulti ? "提交所选" : "回车",
+              "enter",
+              isSubmitStep ? "按回车确认提交" : isMulti ? "按回车提交已勾选项" : "按回车确认当前高亮项",
+              isMulti || isSubmitStep,
+            )}
           </View>
         </View>
       ) : (
@@ -1766,6 +1974,67 @@ export function Composer({
     return pressKeys([key], haptic);
   }
 
+  async function submitWriteInChoice(choice: Choice, customAnswer: string, all: Choice[]): Promise<boolean> {
+    const clean = customAnswer.trim();
+    if (!clean) return false;
+    Haptics.selectionAsync().catch(() => undefined);
+    setSending(true);
+    try {
+      const navKeys = buildChoiceSelectKeys({
+        entries: all,
+        targetKey: choice.key,
+        harness: agent.harness,
+        isShell: agent.isShell,
+        multiSelect: false,
+        confirm: true,
+      });
+      for (let i = 0; i < navKeys.length; i += 1) {
+        await call(agent.deviceId, "terminal.keys", { agent: agent.key, keys: [navKeys[i]!] });
+        if (i + 1 < navKeys.length) {
+          await new Promise((r) => setTimeout(r, 55));
+        }
+      }
+      await new Promise((r) => setTimeout(r, 120));
+      try {
+        await call(agent.deviceId, "terminal.input", { agent: agent.key, data: clean });
+        await new Promise((r) => setTimeout(r, 70));
+        await call(agent.deviceId, "terminal.keys", { agent: agent.key, keys: ["enter"] });
+      } catch (e) {
+        const err = e as RelayError;
+        if (err?.code === "unsupported") {
+          await call(agent.deviceId, "terminal.send", { agent: agent.key, text: clean, enter: true });
+        } else {
+          throw e;
+        }
+      }
+      refreshSoon();
+      return true;
+    } catch (e) {
+      setToast((e as Error).message);
+      return false;
+    } finally {
+      setSending(false);
+    }
+  }
+
+  const subscribeSessionEvents = useCallback(
+    (cb: () => void) => subscribeMobileSessionEvents(agent.key, cb),
+    [agent.key],
+  );
+  const liveSessionEvents = useSyncExternalStore(
+    subscribeSessionEvents,
+    () => getMobileSessionEvents(agent.key) ?? EMPTY_MOBILE_EVENTS,
+  );
+  const openQuestionCall = useMemo(
+    () => findOpenMobileQuestionToolCall(liveSessionEvents),
+    [liveSessionEvents],
+  );
+  const showWaitingCard =
+    online &&
+    (agent.status === "blocked" ||
+      agent.interaction?.kind === "question" ||
+      (agent.status === "working" && Boolean(openQuestionCall)));
+
   /** After an error (a dropped connection, a model that failed): ask it to carry on. */
   async function retry() {
     Haptics.selectionAsync().catch(() => undefined);
@@ -1823,22 +2092,24 @@ export function Composer({
           </Pressable>
         </View>
       ) : null}
-      {agent.status === "blocked" && online ? (
+      {showWaitingCard ? (
         <WaitingCard
           agent={agent}
+          events={liveSessionEvents}
           busy={sending}
           onKey={(k) => press(k)}
-          onPickChoice={(choice, all) => {
+          onPickChoice={(choice, all, multiSelect) => {
             const keys = buildChoiceSelectKeys({
               entries: all,
               targetKey: choice.key,
               harness: agent.harness,
               isShell: agent.isShell,
-              multiSelect: all.some((c) => c.checked !== undefined),
+              multiSelect: Boolean(multiSelect || all.some((c) => c.checked !== undefined)),
               confirm: true,
             });
             void pressKeys(keys);
           }}
+          onSubmitWriteIn={submitWriteInChoice}
           onRetry={retry}
           compact={mode === "terminal"}
           onOpenTerminal={onOpenTerminal}

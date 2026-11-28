@@ -593,6 +593,10 @@ export class UnifloAdapter {
   private onChange: () => void = () => {};
   private onLiveToolCall?: (sessionKey: string, ev: ConvEvent) => void;
   private parentBySession = new Map<string, string>();
+  /** parent session key -> (child session key -> status) for live + periodic subagent counts. */
+  private childByParent = new Map<string, Map<string, "idle" | "work">>();
+  private lastSubRefreshAt = 0;
+  private lastNamedRefreshAt = 0;
   /** Sessions named by a running agent (see SessionHints) that the recent list doesn't hold. */
   private named = new Map<string, UnifloSession>();
   /** Named keys being fetched, or not found (key -> when to look again). */
@@ -633,7 +637,10 @@ export class UnifloAdapter {
     this.onChange = onChange;
     this.onLiveToolCall = onLiveToolCall;
     void this.refresh();
-    this.timer = setInterval(() => void this.refresh(), 8000);
+    this.timer = setInterval(() => {
+      if (this.live && Date.now() - this.lastRefresh < 20_000) return;
+      void this.refresh();
+    }, 8000);
     this.liveAbort = new AbortController();
     void this.watch(this.liveAbort.signal);
   }
@@ -733,23 +740,78 @@ export class UnifloAdapter {
         }
       }
       const kind = j.event.kind;
-      if (kind === "user_message" || kind === "assistant_message" || kind === "turn_end" || kind === "usage") {
+      if ((kind === "user_message" || kind === "assistant_message" || kind === "turn_end") && !this.known.has(eventSession)) {
         this.refreshSoon();
       }
-      const needsToolHook = Boolean(this.onLiveToolCall && kind === "tool_call");
+      const needsToolHook = Boolean(
+        this.onLiveToolCall && (kind === "tool_call" || kind === "tool_result" || kind === "turn_end"),
+      );
       if (!targets.size && !needsToolHook) return;
       const e = sameAsPage(j.event) ? toConvEvent(j.event) : undefined;
       if (e === null) return; // a usage tick or an empty notice: nothing to show
-      if (e && e.kind === "tool_call" && this.onLiveToolCall) {
+      if (e && (e.kind === "tool_call" || e.kind === "tool_result" || e.kind === "turn_end") && this.onLiveToolCall) {
         this.onLiveToolCall(eventSession, e);
       }
       if (targets.size) {
         for (const fn of [...targets]) fn(e ?? null);
       }
     } else if (j.type === "session" && j.session?.key) {
-      // A new session (a fresh start, `/clear`, a subagent) or a changed one: match agents now, not in 8 s.
-      if (this.known.get(j.session.key) !== sessionSig(j.session)) this.refreshSoon();
+      // Apply session updates in-place so matching updates immediately without re-listing `/v1/sessions`.
+      this.applyLiveSession(j.session);
     }
+  }
+
+  private recomputeParentCount(parentKey: string): void {
+    const kids = this.childByParent.get(parentKey);
+    if (!kids || kids.size === 0) {
+      this.childCounts.delete(parentKey);
+      return;
+    }
+    let working = 0;
+    for (const status of kids.values()) {
+      if (status === "work") working += 1;
+    }
+    this.childCounts.set(parentKey, [kids.size, working]);
+  }
+
+  private recordChildSession(s: UnifloSession): void {
+    if (!s.parent) return;
+    const prevParent = this.parentBySession.get(s.key);
+    if (prevParent && prevParent !== s.parent) {
+      const prevKids = this.childByParent.get(prevParent);
+      if (prevKids) {
+        prevKids.delete(s.key);
+        if (prevKids.size === 0) this.childByParent.delete(prevParent);
+      }
+      this.recomputeParentCount(prevParent);
+    }
+    this.parentBySession.set(s.key, s.parent);
+    let kids = this.childByParent.get(s.parent);
+    if (!kids) {
+      kids = new Map();
+      this.childByParent.set(s.parent, kids);
+    }
+    kids.set(s.key, s.status === "work" ? "work" : "idle");
+    this.recomputeParentCount(s.parent);
+  }
+
+  private applyLiveSession(s: UnifloSession): void {
+    const before = this.sig();
+    this.known.set(s.key, sessionSig(s));
+    if (!s.parent) {
+      const next = this.sessions.filter((x) => x.key !== s.key);
+      let idx = next.findIndex((x) => s.updated_at >= x.updated_at);
+      if (idx < 0) idx = next.length;
+      next.splice(idx, 0, s);
+      if (next.length > 300) next.length = 300;
+      this.sessions = next;
+      for (const [k, old] of [...this.named]) {
+        if (k === s.key || old.key === s.key) this.named.delete(k);
+      }
+    } else {
+      this.recordChildSession(s);
+    }
+    if (this.sig() !== before) this.onChange();
   }
 
   private wakeAll(): void {
@@ -761,7 +823,7 @@ export class UnifloAdapter {
     this.soonTimer = setTimeout(() => {
       this.soonTimer = null;
       void this.refresh();
-    }, Math.max(80, this.lastRefresh + 300 - Date.now()));
+    }, Math.max(250, this.lastRefresh + 2000 - Date.now()));
     this.soonTimer.unref?.();
   }
 
@@ -785,35 +847,70 @@ export class UnifloAdapter {
 
   private async refreshOnce(): Promise<void> {
     try {
-      // Live agents are recent; 300 newest sessions are plenty to match against.
-      const list = (await this.get("/v1/sessions?limit=300")) as UnifloSession[];
-      this.known = new Map(list.map((s) => [s.key, sessionSig(s)]));
+      const now = Date.now();
+      const shouldRefreshSubs = this.lastSubRefreshAt === 0 || now - this.lastSubRefreshAt >= 20_000;
+      // Fetch root sessions separately so subagent bursts cannot evict active root sessions.
+      const [rawRoots, rawSubs] = await Promise.all([
+        this.get("/v1/sessions?limit=300&q=is:root") as Promise<UnifloSession[]>,
+        shouldRefreshSubs
+          ? (this.get("/v1/sessions?limit=300&q=is:sub") as Promise<UnifloSession[]>).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      const rootsList = Array.isArray(rawRoots) ? rawRoots : [];
+      const roots = rootsList.filter((s) => !s.parent).slice(0, 300);
       const before = this.sig();
-      this.sessions = list.filter((s) => !s.parent);
-      this.childCounts = new Map();
-      this.parentBySession = new Map();
-      for (const s of list) {
-        if (!s.parent) continue;
-        this.parentBySession.set(s.key, s.parent);
-        const c = this.childCounts.get(s.parent) ?? [0, 0];
-        c[0]++;
-        if (s.status === "work") c[1]++;
-        this.childCounts.set(s.parent, c);
-      }
-      // Named sessions outside the recent list go stale too: read them again.
-      let namedChanged = false;
-      for (const [key, old] of [...this.named]) {
-        if (this.sessions.some((s) => s.key === old.key)) {
-          this.named.delete(key);
-          continue;
+      this.sessions = roots;
+
+      const nextKnown = new Map<string, string>();
+      for (const s of roots) nextKnown.set(s.key, sessionSig(s));
+
+      const subsSource =
+        rawSubs !== null
+          ? (Array.isArray(rawSubs) ? rawSubs.filter((s) => Boolean(s.parent)) : [])
+          : shouldRefreshSubs && rootsList.some((s) => Boolean(s.parent))
+            ? rootsList.filter((s) => Boolean(s.parent))
+            : null;
+
+      if (subsSource !== null) {
+        this.lastSubRefreshAt = now;
+        this.childCounts = new Map();
+        this.parentBySession = new Map();
+        this.childByParent = new Map();
+        for (const s of subsSource) {
+          this.recordChildSession(s);
+          nextKnown.set(s.key, sessionSig(s));
         }
-        try {
-          // By its full key: the name may have been a short prefix.
-          const s = (await this.get(`/v1/sessions/${encodeURIComponent(old.key)}`)) as UnifloSession;
-          if (s.updated_at !== old.updated_at || s.title !== old.title) namedChanged = true;
+      } else {
+        for (const key of this.parentBySession.keys()) {
+          const prevSig = this.known.get(key);
+          if (prevSig !== undefined) nextKnown.set(key, prevSig);
+        }
+      }
+      this.known = nextKnown;
+
+      const rootKeys = new Set(this.sessions.map((s) => s.key));
+      for (const [key, old] of [...this.named]) {
+        if (rootKeys.has(old.key)) this.named.delete(key);
+      }
+
+      // Named sessions outside the recent list go stale too: refresh concurrently at most once per minute.
+      let namedChanged = false;
+      if (this.named.size > 0 && now - this.lastNamedRefreshAt >= 60_000) {
+        this.lastNamedRefreshAt = now;
+        const entries = [...this.named.entries()];
+        const results = await Promise.allSettled(
+          entries.map(async ([key, old]) => {
+            // By its full key: the name may have been a short prefix.
+            const s = (await this.get(`/v1/sessions/${encodeURIComponent(old.key)}`)) as UnifloSession;
+            return { key, old, s };
+          }),
+        );
+        for (const res of results) {
+          if (res.status !== "fulfilled") continue;
+          const { key, old, s } = res.value;
+          if (!this.named.has(key)) continue;
+          if (s.updated_at !== old.updated_at || s.title !== old.title || s.status !== old.status) namedChanged = true;
           this.named.set(key, s);
-        } catch {
-          /* keep the last copy */
         }
       }
       if (this.sig() !== before || namedChanged) this.onChange();
@@ -823,12 +920,15 @@ export class UnifloAdapter {
   }
 
   private sig(): string {
-    const kids = [...this.childCounts].map(([k, [n, w]]) => `${k}=${n}/${w}`).join(",");
+    const kids = [...this.childCounts]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, [n, w]]) => `${k}=${n}/${w}`)
+      .join(",");
     return (
       this.sessions
         .map(
           (s) =>
-            `${s.key}:${s.updated_at}:${s.pid ?? ""}:${s.title ?? ""}:${s.usage?.last_context_tokens ?? ""}:${s.usage?.cache_read ?? ""}`,
+            `${s.key}:${s.updated_at}:${s.status}:${s.pid ?? ""}:${s.title ?? ""}:${s.usage?.last_context_tokens ?? ""}:${s.usage?.cache_read ?? ""}`,
         )
         .join("|") + kids
     );
@@ -917,8 +1017,18 @@ export class UnifloAdapter {
         .slice(0, 48);
     const normText = (raw: string | undefined): string => (raw ?? "").replace(/\s+/g, " ").trim();
 
+    const isBetterPidSession = (cand: UnifloSession, cur: UnifloSession): boolean => {
+      const candWork = cand.status === "work";
+      const curWork = cur.status === "work";
+      if (candWork !== curWork) return candWork;
+      return cand.updated_at > cur.updated_at;
+    };
     const byPid = new Map<number, UnifloSession>();
-    for (const s of this.sessions) if (s.pid) byPid.set(s.pid, s);
+    for (const s of this.sessions) {
+      if (!s.pid || s.parent) continue;
+      const cur = byPid.get(s.pid);
+      if (!cur || isBetterPidSession(s, cur)) byPid.set(s.pid, s);
+    }
     const used = new Set<string>();
     const matched = new Map<string, UnifloSession>();
 
@@ -933,6 +1043,21 @@ export class UnifloAdapter {
       }
     }
 
+    const antigravitySiblingFitsBetter = (a: Agent, s: UnifloSession, born: number, h: string | undefined): boolean => {
+      if (h !== "antigravity" || !a.cwd || !s.started_at) return false;
+      return agents.some((b) => {
+        if (b === a || matched.has(b.key)) return false;
+        if (harnessId(b.harness) !== h || b.cwd !== a.cwd) return false;
+        const bBorn = created.get(b.key);
+        if (!bBorn) return false;
+        const bInWindow = s.started_at! >= bBorn - 15_000 && s.started_at! <= bBorn + 180_000;
+        const myDiff = Math.abs(s.started_at! - born);
+        const bDiff = Math.abs(s.started_at! - bBorn);
+        return bInWindow && bDiff + 15_000 < myDiff;
+      });
+    };
+
+    // Pass 1a: Exact PID match for sessions started near or after terminal creation.
     for (const a of agents) {
       if (matched.has(a.key)) continue;
       const pid = pids.get(a.key);
@@ -940,38 +1065,36 @@ export class UnifloAdapter {
       if (!s || used.has(s.key)) continue;
       const born = created.get(a.key);
       const h = harnessId(a.harness);
-      // Do not blindly trust Uniflo's PID assignment when the session predates this terminal
-      // by more than 2 minutes (e.g. shared language-server trees in antigravity) or when
-      // a sibling agent in the same cwd opened tightly around s.started_at.
       if (born && s.started_at) {
-        if (!startedNearOrAfterBorn(a, s)) {
-          const allowInteractiveResume =
-            h !== "antigravity" &&
-            s.updated_at > born &&
-            !agents.some(
-              (b) =>
-                b !== a &&
-                !matched.has(b.key) &&
-                harnessId(b.harness) === h &&
-                b.cwd === a.cwd &&
-                (created.get(b.key) ?? Infinity) <= s.started_at! + 120_000,
-            );
-          if (!allowInteractiveResume) continue;
-        }
-        if (h === "antigravity" && a.cwd) {
-          const siblingFitsBetter = agents.some((b) => {
-            if (b === a || matched.has(b.key)) return false;
-            if (harnessId(b.harness) !== h || b.cwd !== a.cwd) return false;
-            const bBorn = created.get(b.key);
-            if (!bBorn) return false;
-            const bInWindow = s.started_at! >= bBorn - 15_000 && s.started_at! <= bBorn + 180_000;
-            const myDiff = Math.abs(s.started_at! - born);
-            const bDiff = Math.abs(s.started_at! - bBorn);
-            return bInWindow && bDiff + 15_000 < myDiff;
-          });
-          if (siblingFitsBetter) continue;
-        }
+        if (!startedNearOrAfterBorn(a, s)) continue;
+        if (antigravitySiblingFitsBetter(a, s, born, h)) continue;
       }
+      matched.set(a.key, s);
+      used.add(s.key);
+    }
+
+    // Pass 1b: Exact PID match for interactive resume (session started earlier than terminal,
+    // updated after terminal creation, and best root session for this PID), keeping sibling guards.
+    for (const a of agents) {
+      if (matched.has(a.key)) continue;
+      const pid = pids.get(a.key);
+      const s = pid ? byPid.get(pid) : undefined;
+      if (!s || used.has(s.key) || s.pid !== pid) continue;
+      const born = created.get(a.key);
+      if (!born || !s.started_at || startedNearOrAfterBorn(a, s)) continue;
+      const h = harnessId(a.harness);
+      const allowInteractiveResume =
+        s.updated_at > born &&
+        !agents.some(
+          (b) =>
+            b !== a &&
+            !matched.has(b.key) &&
+            harnessId(b.harness) === h &&
+            b.cwd === a.cwd &&
+            (created.get(b.key) ?? Infinity) <= s.started_at! + 120_000,
+        );
+      if (!allowInteractiveResume) continue;
+      if (antigravitySiblingFitsBetter(a, s, born, h)) continue;
       matched.set(a.key, s);
       used.add(s.key);
     }

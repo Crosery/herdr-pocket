@@ -4,6 +4,7 @@ import {
   normalizeChoiceLabel,
   parseAskQuestionInput,
   summarizeAskQuestionInput,
+  type AgentInteraction,
   type AgentStatus,
   type ConvEvent,
   type ParsedQuestionItem,
@@ -36,6 +37,8 @@ export interface AskQuestionDeckState {
   isSubmitStep?: boolean;
   entries: DeckChoiceEntry[];
   fromStructuredTool: boolean;
+  /** True when `entries` come from live terminal/hostd parsed choices (cursor position is synced). */
+  terminalMenuSynced: boolean;
 }
 
 export interface OpenQuestionToolCall {
@@ -140,29 +143,49 @@ function normMatchText(s: string): string {
   return s.toLowerCase().replace(/[\s「」『』"'`()（）【】[\]—–\-:：,，.。?？!！]/g, "");
 }
 
-/** Merges live terminal choice menus with open `ask_question` metadata for `AskQuestionDeck`. */
+/** Merges live terminal choice menus with hostd `interaction` and open `ask_question` metadata for `AskQuestionDeck`. */
 export function buildAskQuestionDeck(params: {
   events: ConvEvent[];
   choiceLines: string[];
   choices: ChoiceOption[];
   agentStatus?: AgentStatus;
+  interaction?: AgentInteraction | null;
   dismissedCallId?: string | null;
 }): AskQuestionDeckState | null {
-  const { events, choiceLines, choices, agentStatus, dismissedCallId } = params;
+  const { events, choiceLines, choices, agentStatus, interaction, dismissedCallId } = params;
   const openCall = findOpenQuestionToolCallWithId(events);
   const openQuestions = openCall?.questions ?? [];
   const callId = openCall?.callId;
+  const hasQuestionInteraction = interaction?.kind === "question";
+  const interactionChoices =
+    hasQuestionInteraction && Array.isArray(interaction?.choices) ? interaction.choices : [];
+  const effectiveChoices = choices.length > 0 ? choices : interactionChoices;
 
-  // Respect explicit user dismissal for this exact tool call when no live terminal menu overrides it
-  if (callId && dismissedCallId && dismissedCallId === callId && choices.length === 0) {
+  // Respect explicit user dismissal for this exact tool call (or non-call interaction) when no live terminal menu overrides it
+  if (dismissedCallId && choices.length === 0) {
+    if (callId && dismissedCallId === callId) return null;
+    if (!callId && dismissedCallId === "__dismissed__") return null;
+  }
+
+  // Allow showing the deck when:
+  // 1) agentStatus is omitted (unit tests) or "blocked", OR
+  // 2) hostd explicitly reports an active question interaction, OR
+  // 3) agentStatus === "working" with an open question tool call or live choice menu (>= 2 choices).
+  // Never show a zombie deck on "done" / "idle" / "unknown" without an active question interaction.
+  const statusAllows =
+    agentStatus === undefined ||
+    agentStatus === "blocked" ||
+    hasQuestionInteraction ||
+    (agentStatus === "working" && (effectiveChoices.length >= 2 || Boolean(openCall)));
+
+  if (!statusAllows) {
     return null;
   }
 
-  // If the terminal has NO live choice menu:
-  // Only show the structured fallback when the agent is genuinely blocked (or in unit tests where agentStatus is omitted).
-  // Never show a zombie deck while the agent is already working / idle / done!
-  if (choices.length === 0) {
-    if (agentStatus !== undefined && agentStatus !== "blocked") return null;
+  const interactionPrompt = hasQuestionInteraction ? interaction?.prompt?.trim() || undefined : undefined;
+
+  // If neither live terminal nor hostd interaction provides choices, fall back to the open structured tool call.
+  if (effectiveChoices.length === 0) {
     const fallbackQ = openQuestions[0];
     if (!fallbackQ || fallbackQ.options.length === 0) return null;
     const entries: DeckChoiceEntry[] = fallbackQ.options.map((opt, idx) => ({
@@ -176,25 +199,22 @@ export function buildAskQuestionDeck(params: {
     }));
     return {
       ...(callId ? { callId } : {}),
-      question: fallbackQ.question || "请选择下一步操作",
+      question: fallbackQ.question || interactionPrompt || "请选择下一步操作",
       header: fallbackQ.header,
       totalQuestions: Math.max(1, openQuestions.length),
       currentQuestionIndex: 0,
-      multiSelect: Boolean(fallbackQ.multiSelect),
+      multiSelect: Boolean(fallbackQ.multiSelect ?? (hasQuestionInteraction && interaction?.multiSelect)),
       entries,
       fromStructuredTool: true,
+      terminalMenuSynced: false,
     };
   }
 
-  // Even if choices were parsed from terminal, never show stale terminal menus when the agent isn't blocked.
-  if (agentStatus !== undefined && agentStatus !== "blocked") {
-    return null;
-  }
-
-  const firstLabels = choices.map((c) => normMatchText(normalizeChoiceLabel(c.label).title));
+  const firstLabels = effectiveChoices.map((c) => normMatchText(normalizeChoiceLabel(c.label).title));
   const terminalPrompt = extractTerminalChoicePrompt(choiceLines);
-  const normPrompt = terminalPrompt ? normMatchText(terminalPrompt) : "";
-  const isSubmitStep = choices.some((c) => SUBMIT_LABEL_RE.test(normalizeChoiceLabel(c.label).title));
+  const promptHint = terminalPrompt || interactionPrompt;
+  const normPrompt = promptHint ? normMatchText(promptHint) : "";
+  const isSubmitStep = effectiveChoices.some((c) => SUBMIT_LABEL_RE.test(normalizeChoiceLabel(c.label).title));
 
   // Match the live terminal screen against the active structured question item when multi-question exists
   let matchedIdx = 0;
@@ -224,7 +244,7 @@ export function buildAskQuestionDeck(params: {
     }
   }
 
-  const entries: DeckChoiceEntry[] = choices.map((c, idx) => {
+  const entries: DeckChoiceEntry[] = effectiveChoices.map((c, idx) => {
     const base = normalizeChoiceLabel(c.label);
     const structuredOpt = matchedQ?.options[idx];
     if (structuredOpt && !base.isWriteIn && !isSubmitStep) {
@@ -246,8 +266,8 @@ export function buildAskQuestionDeck(params: {
   });
 
   const question = isSubmitStep
-    ? terminalPrompt || "确认并提交以上回答"
-    : matchedQ?.question || terminalPrompt || "请选择下一步操作";
+    ? promptHint || "确认并提交以上回答"
+    : matchedQ?.question || promptHint || "请选择下一步操作";
 
   return {
     ...(callId ? { callId } : {}),
@@ -255,9 +275,15 @@ export function buildAskQuestionDeck(params: {
     header: isSubmitStep ? "最后一步" : matchedQ?.header,
     totalQuestions: Math.max(1, openQuestions.length),
     currentQuestionIndex: isSubmitStep ? Math.max(0, openQuestions.length - 1) : matchedIdx,
-    multiSelect: Boolean(!isSubmitStep && (matchedQ?.multiSelect || choices.some((c) => c.checked !== undefined))),
+    multiSelect: Boolean(
+      !isSubmitStep &&
+        (matchedQ?.multiSelect ||
+          (hasQuestionInteraction && interaction?.multiSelect) ||
+          effectiveChoices.some((c) => c.checked !== undefined)),
+    ),
     ...(isSubmitStep ? { isSubmitStep: true } : {}),
     entries,
     fromStructuredTool: Boolean(matchedQ),
+    terminalMenuSynced: true,
   };
 }

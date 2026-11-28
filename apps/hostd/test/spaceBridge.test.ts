@@ -797,3 +797,56 @@ test("Host spaces.sync RPC performs bidirectional space + agent sync without dup
     0,
   );
 });
+
+test("empty default '~' herdr TUI workspace is excluded from spaces.list and never resurrected into herdr-core", async () => {
+  const coreSpaces: SpaceInfo[] = [
+    { id: "s1", name: "uniflo", folder: "~/work/uniflo", tabs: 1, terminals: 1 },
+  ];
+  const emptyHome: HerdrWorkspaceInfo = { id: "wK", label: "~", active: true, tabs: [], tabCount: 0, paneCount: 0 };
+  const shellOnlyHome: HerdrWorkspaceInfo = { id: "wShell", label: "~", active: false, tabs: [], tabCount: 3 };
+  const paneOnlyHome: HerdrWorkspaceInfo = { id: "wPane", label: "~", active: false, tabs: [], paneCount: 1 };
+  const activeHome: HerdrWorkspaceInfo = { id: "wHome", label: "~", folder: homedir(), active: false, tabs: [{ id: "t1", label: "shell" }] };
+
+  const mergedEmpty = mergeHerdrWorkspacesIntoSpaces(coreSpaces, [emptyHome]);
+  assert.deepEqual(mergedEmpty.map((s) => s.name), ["uniflo"]);
+
+  // Real '~' workspaces with tabCount/paneCount > 0 (even if tabs array is omitted/empty) must NOT be hidden.
+  const mergedShellOnly = mergeHerdrWorkspacesIntoSpaces(coreSpaces, [shellOnlyHome]);
+  assert.deepEqual(mergedShellOnly.map((s) => s.name), ["uniflo", "~"]);
+  const mergedPaneOnly = mergeHerdrWorkspacesIntoSpaces(coreSpaces, [paneOnlyHome]);
+  assert.deepEqual(mergedPaneOnly.map((s) => s.name), ["uniflo", "~"]);
+
+  const mergedWithTabs = mergeHerdrWorkspacesIntoSpaces(coreSpaces, [activeHome]);
+  assert.deepEqual(mergedWithTabs.map((s) => s.name), ["uniflo", "~"]);
+
+  let docVersion = 1;
+  let docValue: HerdrDoc = {
+    spaces: [{ id: "s1", name: "uniflo", folder: "~/work/uniflo", tabs: [] }],
+  };
+  const core: SpaceBridgeCoreLike = {
+    async docGet() {
+      return { value: structuredClone(docValue), version: docVersion };
+    },
+    async docSetCas(_name, value, version) {
+      docValue = structuredClone(value as HerdrDoc);
+      docVersion = version + 1;
+      return { ok: true, version: docVersion };
+    },
+  };
+  const herdr: SpaceBridgeHerdrLike = {
+    get workspaces() {
+      return [emptyHome, { id: "w1", label: "uniflo", folder: "~/work/uniflo", active: false, tabs: [] }];
+    },
+    async refreshWorkspaces() {
+      return this.workspaces;
+    },
+    async createWorkspace(label) {
+      return { id: "w-new", label };
+    },
+    async renameWorkspace() {},
+  };
+
+  const summary = await syncSpacesBidirectional({ core, herdr, herdrAvailable: true, mirrorToHerdr: false });
+  assert.equal(summary.syncedToCore, 0);
+  assert.deepEqual(docValue.spaces.map((s) => s.name), ["uniflo"]);
+});

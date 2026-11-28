@@ -2663,6 +2663,16 @@
   color: var(--ink);
 }
 
+.ask-deck-sync-hint {
+  font-size: calc(11.5px * var(--ts, 1));
+  line-height: 1.4;
+  color: var(--ink-soft);
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px dashed var(--line);
+}
+
 .ask-deck-options {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));

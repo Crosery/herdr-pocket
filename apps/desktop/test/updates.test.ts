@@ -368,3 +368,85 @@ test("startUpdateDownload checks pre-download freshness and upgrades to newer re
     else (globalThis as Record<string, unknown>).window = prevWindow;
   }
 });
+
+test("startAutoUpdateChecks schedules checkIntervalHours (not 60s) when hasUpdate is true", async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const prevUpdateConfig = clientConfigStore.get().config.update;
+  const prevUpdateState = updateStore.get();
+  const scheduled: Array<{ ms: number; cb: () => void; cleared: boolean }> = [];
+  (globalThis as any).setTimeout = (cb: () => void, ms: number) => {
+    const rec = { ms, cb, cleared: false };
+    scheduled.push(rec);
+    return rec;
+  };
+  (globalThis as any).clearTimeout = (id: any) => {
+    if (id && typeof id === "object" && "cleared" in id) id.cleared = true;
+  };
+
+  const hours = 4;
+  const expectedMs = hours * 3_600_000;
+  const updateInfo = {
+    current: "0.2.4",
+    latest: "99.3.0",
+    hasUpdate: true,
+    downloadUrl: "https://example.com/a.dmg",
+    downloadUrls: [],
+    pageUrl: "https://example.com/releases",
+    source: "github.com",
+    region: "global" as const,
+    regionReason: "test",
+  };
+
+  try {
+    clientConfigStore.set((prev) => ({
+      ...prev,
+      config: {
+        ...prev.config,
+        update: { ...prev.config.update, autoCheck: true, checkIntervalHours: hours },
+      },
+    }));
+    updateStore.set({ info: updateInfo, checkedAt: Date.now(), checking: false });
+
+    const stop = startAutoUpdateChecks(async () => {
+      updateStore.set({ info: updateInfo, checkedAt: Date.now(), checking: false });
+      return updateInfo;
+    });
+
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0]!.ms, 4000);
+
+    // Run startup check which resolves with hasUpdate: true.
+    scheduled[0]!.cb();
+    await new Promise((r) => realSetTimeout(r, 0));
+
+    assert.equal(scheduled.length, 2, "next auto-check timer should be scheduled after startup check");
+    const nextDelay = scheduled[1]!.ms;
+    assert.ok(
+      nextDelay >= expectedMs * 0.9 - 1000 && nextDelay <= expectedMs * 1.1 + 1000,
+      `expected next delay around ${expectedMs}ms (±10% jitter), got ${nextDelay}ms`,
+    );
+    assert.ok(nextDelay > 60_000 * 2, `must NOT poll every 60s when hasUpdate is true (got ${nextDelay}ms)`);
+
+    // Run the subsequent auto-check while hasUpdate remains true and verify cadence stays at checkIntervalHours.
+    scheduled[1]!.cb();
+    await new Promise((r) => realSetTimeout(r, 0));
+
+    assert.equal(scheduled.length, 3);
+    const followUpDelay = scheduled[2]!.ms;
+    assert.ok(
+      followUpDelay >= expectedMs * 0.9 - 1000 && followUpDelay <= expectedMs * 1.1 + 1000,
+      `expected follow-up delay around ${expectedMs}ms (±10% jitter), got ${followUpDelay}ms`,
+    );
+
+    stop();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    clientConfigStore.set((prev) => ({
+      ...prev,
+      config: { ...prev.config, update: prevUpdateConfig },
+    }));
+    updateStore.set(prevUpdateState);
+  }
+});

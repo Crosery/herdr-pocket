@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FILES_LIMITS } from "@herdr-pocket/protocol";
-import { FilesError, listFiles, looksBinary, readFileSlice, resolveInside } from "../src/files.ts";
+import { FilesError, isMacDatalessError, listFiles, looksBinary, readFileSlice, readHandleSlice, resolveInside } from "../src/files.ts";
 
 let dir: string;
 let root: string;
@@ -153,12 +153,16 @@ test("home and tmpdir extraRoots read agent scratch images while blocking creden
   const fakeHome = join(dir, "fake-home");
   const fakeTmp = join(dir, "fake-tmp");
   const brainDir = join(fakeHome, ".gemini", "antigravity-cli", "brain", "sess-1", "scratch", "qa-studio-visual");
-  const credDir = join(fakeHome, ".agents", "crosery", "credentials");
+  const credDir = join(fakeHome, ".agents", "credentials");
+  const userCredDir = join(fakeHome, ".agents", "demo-profile", "credentials");
+  const skillsDir = join(fakeHome, ".agents", "skills", "demo-skill");
   const keychainDir = join(fakeHome, "Library", "Keychains");
   const sshDir = join(fakeHome, ".ssh");
   mkdirSync(brainDir, { recursive: true });
   mkdirSync(fakeTmp, { recursive: true });
   mkdirSync(credDir, { recursive: true });
+  mkdirSync(userCredDir, { recursive: true });
+  mkdirSync(skillsDir, { recursive: true });
   mkdirSync(keychainDir, { recursive: true });
   mkdirSync(sshDir, { recursive: true });
 
@@ -166,6 +170,8 @@ test("home and tmpdir extraRoots read agent scratch images while blocking creden
   writeFileSync(join(brainDir, "clean-desktop-light.png"), pngBytes);
   writeFileSync(join(fakeTmp, "preview.png"), pngBytes);
   writeFileSync(join(credDir, "token.json"), '{"secret":"x"}');
+  writeFileSync(join(userCredDir, "vault.json"), '{"secret":"y"}');
+  writeFileSync(join(skillsDir, "SKILL.md"), "# skill doc\n");
   writeFileSync(join(keychainDir, "login.keychain-db"), "keychain");
   writeFileSync(join(sshDir, "id_ed25519"), "PRIVATE KEY");
   writeFileSync(join(fakeHome, ".env"), "API_KEY=123");
@@ -183,13 +189,51 @@ test("home and tmpdir extraRoots read agent scratch images while blocking creden
   const tmpImg = await readFileSlice(root, { path: join(fakeTmp, "preview.png") }, opts);
   assert.equal(tmpImg.kind, "image");
 
+  // Non-credential files inside `.agents` remain readable.
+  const skillDoc = await readFileSlice(root, { path: join(skillsDir, "SKILL.md") }, opts);
+  assert.equal(skillDoc.text, "# skill doc\n");
+
   for (const secretPath of [
     join(credDir, "token.json"),
+    join(userCredDir, "vault.json"),
+    userCredDir,
     join(keychainDir, "login.keychain-db"),
     join(sshDir, "id_ed25519"),
     join(fakeHome, ".env"),
   ]) {
+    await assert.rejects(resolveInside(root, secretPath, opts), (e) => code(e) === "forbidden");
     await assert.rejects(readFileSlice(root, { path: secretPath }, opts), (e) => code(e) === "forbidden");
+  }
+
+  // Even without explicit privateDirs, `.agents/**/credentials` is unconditionally blocked (both abs and rel).
+  await assert.rejects(
+    resolveInside(fakeHome, ".agents/demo-profile/credentials/vault.json"),
+    (e) => code(e) === "forbidden",
+  );
+  await assert.rejects(
+    readFileSlice(fakeHome, { path: ".agents/demo-profile/credentials/vault.json" }),
+    (e) => code(e) === "forbidden",
+  );
+  await assert.rejects(
+    listFiles(fakeHome, { path: ".agents/demo-profile/credentials" }),
+    (e) => code(e) === "forbidden",
+  );
+
+  if (SYMLINKS) {
+    const symlinkTarget = join(fakeHome, "plain-creds-store");
+    const symlinkCredDir = join(fakeHome, ".agents", "symlink-profile", "credentials");
+    mkdirSync(symlinkTarget, { recursive: true });
+    mkdirSync(join(fakeHome, ".agents", "symlink-profile"), { recursive: true });
+    writeFileSync(join(symlinkTarget, "api.json"), '{"key":"secret"}');
+    symlinkSync(symlinkTarget, symlinkCredDir);
+    await assert.rejects(
+      resolveInside(root, join(symlinkCredDir, "api.json"), opts),
+      (e) => code(e) === "forbidden",
+    );
+    await assert.rejects(
+      readFileSlice(root, { path: join(symlinkCredDir, "api.json") }, opts),
+      (e) => code(e) === "forbidden",
+    );
   }
 });
 
@@ -257,4 +301,42 @@ test("readFileSlice resolves bare filename into workspace subdirectory while exc
   // Ignored folders (node_modules) and private files remain unreachable.
   await assert.rejects(readFileSlice(bareRoot, { path: "ignored-only.html" }), (e) => code(e) === "not_found");
   await assert.rejects(readFileSlice(bareRoot, { path: ".env.prod" }), (e) => code(e) === "forbidden");
+});
+
+test("isMacDatalessError and readHandleSlice translate macOS iCloud -11/EDEADLK errors into friendly not_found errors", async () => {
+  const errErrno11 = Object.assign(new Error("Unknown system error -11"), { errno: -11 });
+  const errEdeadlk = Object.assign(new Error("EDEADLK"), { code: "EDEADLK" });
+  const errOther = Object.assign(new Error("EIO"), { errno: -5, code: "EIO" });
+
+  assert.equal(isMacDatalessError(errErrno11, "darwin"), true);
+  assert.equal(isMacDatalessError(errEdeadlk, "darwin"), true);
+  assert.equal(isMacDatalessError(errErrno11, "linux"), false);
+  assert.equal(isMacDatalessError(errEdeadlk, "win32"), false);
+  assert.equal(isMacDatalessError(errOther, "darwin"), false);
+  assert.equal(isMacDatalessError(null, "darwin"), false);
+
+  const triggered: string[] = [];
+  const fakeFh = {
+    async read() {
+      throw errErrno11;
+    },
+  };
+  await assert.rejects(
+    readHandleSlice(fakeFh, "/Users/demo/iCloud/report.md", Buffer.alloc(16), 0, 16, 0, {
+      platform: "darwin",
+      triggerDownload: (p) => triggered.push(p),
+    }),
+    (e: unknown) => e instanceof FilesError && e.code === "not_found" && e.message.includes("iCloud 云端"),
+  );
+  assert.deepEqual(triggered, ["/Users/demo/iCloud/report.md"]);
+
+  // Non-darwin or non-dataless errors are rethrown directly without triggering download.
+  await assert.rejects(
+    readHandleSlice(fakeFh, "/Users/demo/iCloud/report.md", Buffer.alloc(16), 0, 16, 0, {
+      platform: "linux",
+      triggerDownload: (p) => triggered.push(p),
+    }),
+    (e: unknown) => e === errErrno11,
+  );
+  assert.equal(triggered.length, 1);
 });

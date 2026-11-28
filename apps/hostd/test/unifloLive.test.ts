@@ -79,13 +79,18 @@ test("Uniflo's live stream reaches a listener as the phone would get it; what ca
     await u.close();
   });
   const got: Array<unknown> = [];
+  let changes = 0;
   a.onEvents(S, (e) => got.push(e));
-  a.start(() => {});
+  a.start(() => {
+    changes++;
+  });
   await until("the stream", () => u.connected() === 1);
+  await until("initial list", () => u.lists() >= 1);
   u.push("hello", { version: 1 });
   await until("live", () => a.live);
   assert.deepEqual(got, [null], "coming up asks for one page read");
 
+  const listsBeforeEvents = u.lists();
   u.push("event", { event: ev("e1#0", "hi") });
   u.push("event", { event: { id: "m:usage", session: S, ts: 1, kind: "usage", input: 1 } });
   u.push("event", { event: { ...ev("o1#0", "elsewhere"), session: "claude:other" } });
@@ -94,16 +99,120 @@ test("Uniflo's live stream reaches a listener as the phone would get it; what ca
   assert.deepEqual(got[1], { ...ev("e1#0", "hi"), pos: "7" });
   assert.equal(got[2], null, "too long for the page to show it unchanged: read the page instead");
 
-  // A session that appears (a fresh start, /clear) is matched within about a second, not at the next 8 s refresh.
+  // A session SSE frame applies in-place immediately without re-listing `/v1/sessions`.
   const before = u.lists();
-  u.push("session", { session: { key: "claude:new", harness: "claude", updated_at: 2, status: "work" } });
-  await until("a list read", () => u.lists() > before, 2000);
+  const changesBefore = changes;
+  u.push("session", { session: { key: "claude:new", harness: "claude", updated_at: 2, status: "work", pid: 777, cwd: "/w" } });
+  await until("in-place session update", () => a.sessions.some((s) => s.key === "claude:new") && changes > changesBefore, 2000);
+  await new Promise((r) => setTimeout(r, 350));
+  assert.equal(u.lists(), before, "in-place session frame must not trigger /v1/sessions refetch");
+  assert.ok(listsBeforeEvents >= 1);
 
   // The stream goes away: the adapter says so, asks for a page read, and comes back on its own.
   u.dropStreams();
   await until("not live", () => !a.live);
   assert.equal(got.at(-1), null);
   await until("reconnected", () => u.connected() === 1, 4000);
+});
+
+test("UnifloAdapter separates is:root and is:sub queries, ignores usage events for list refresh, and tracks subagent SSE frames in-place", async (t) => {
+  const streams: ServerResponse[] = [];
+  const queries: string[] = [];
+  const rootSession = { key: "claude:root-1", harness: "claude", cwd: "/w", pid: 901, updated_at: 100, status: "work" as const };
+  const subSessions = Array.from({ length: 5 }, (_, i) => ({
+    key: `claude:sub-${i}`,
+    harness: "claude",
+    parent: "claude:root-1",
+    updated_at: 500 + i,
+    status: (i < 2 ? "work" : "idle") as "work" | "idle",
+  }));
+
+  const server = createServer((req, res) => {
+    const url = new URL(req.url!, "http://x");
+    if (url.pathname === "/v1/stream") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      streams.push(res);
+      return;
+    }
+    res.setHeader("content-type", "application/json");
+    if (url.pathname === "/v1/health") return res.end(JSON.stringify({ ok: true }));
+    if (url.pathname === "/v1/sessions") {
+      const q = url.searchParams.get("q") ?? "";
+      queries.push(q);
+      if (q === "is:root") return res.end(JSON.stringify([rootSession]));
+      if (q === "is:sub") return res.end(JSON.stringify(subSessions));
+      // Without `is:root`, subagent burst would have crowded out rootSession.
+      return res.end(JSON.stringify(subSessions));
+    }
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const push = (type: string, body: Record<string, unknown>) => {
+    for (const s of streams) s.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...body })}\n\n`);
+  };
+
+  const adapter = new UnifloAdapter(base);
+  let onChanges = 0;
+  t.after(async () => {
+    adapter.stop();
+    for (const s of streams) s.destroy();
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  adapter.start(() => {
+    onChanges++;
+  });
+  await until("initial root + sub refresh", () => queries.includes("is:root") && queries.includes("is:sub") && streams.length === 1);
+  push("hello", { version: 1 });
+  await until("live", () => adapter.live);
+
+  assert.equal(adapter.sessions.length, 1);
+  assert.equal(adapter.sessions[0]!.key, "claude:root-1");
+  assert.deepEqual(adapter.childCounts.get("claude:root-1"), [5, 2]);
+  assert.equal(adapter.rootSessionKey("claude:sub-0"), "claude:root-1");
+
+  const queriesAfterInit = queries.length;
+
+  // Usage events (even for unknown session keys) and known-session message events must NEVER trigger `/v1/sessions`.
+  push("event", { event: { id: "u1", session: "claude:unknown-usage", ts: 1000, kind: "usage", input: 50 } });
+  push("event", { event: { id: "m1", session: "claude:root-1", ts: 1001, kind: "assistant_message", text: "ok" } });
+
+  // Live SSE session frame for a new root session updates `enrich()` in-place without `/v1/sessions`.
+  const changesBeforeRoot = onChanges;
+  push("session", {
+    session: { key: "claude:root-2", harness: "claude", cwd: "/w2", pid: 902, updated_at: 600, status: "work", title: "Live root" },
+  });
+  await until("live root applied", () => adapter.sessions[0]?.key === "claude:root-2" && onChanges > changesBeforeRoot);
+
+  // Live SSE session frame for a subagent updates `childCounts` and `rootSessionKey` in-place without `/v1/sessions`.
+  const changesBeforeSub = onChanges;
+  push("session", {
+    session: { key: "claude:sub-live", harness: "claude", parent: "claude:root-1", updated_at: 610, status: "work" },
+  });
+  await until("live sub applied", () => adapter.rootSessionKey("claude:sub-live") === "claude:root-1" && onChanges > changesBeforeSub);
+  assert.deepEqual(adapter.childCounts.get("claude:root-1"), [6, 3]);
+
+  // Wait past refreshSoon window to confirm zero extra `/v1/sessions` requests were triggered.
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(queries.length, queriesAfterInit, `unexpected /v1/sessions calls: ${JSON.stringify(queries)}`);
+
+  const baseAgent: Agent = {
+    key: "d/hc:t2",
+    deviceId: "d",
+    source: "hc",
+    localId: "t2",
+    harness: "claude-code",
+    cwd: "/w2",
+    status: "working",
+    isShell: false,
+    updatedAt: 0,
+  };
+  const enriched = adapter.enrich([baseAgent], new Map([["d/hc:t2", 902]]));
+  assert.equal(enriched[0]!.sessionKey, "claude:root-2");
+  assert.equal(enriched[0]!.title, "Live root");
 });
 
 type Frame = { type: string; id?: string; event?: any; result?: unknown; error?: unknown };

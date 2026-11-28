@@ -7,11 +7,15 @@ import {
   agentKey,
   encodeBinaryPortalStreamFrame,
   extractTerminalQueuedMessages,
+  isQuestionToolName,
   parseAgentKey,
   rowsChange,
+  summarizeAskQuestionInput,
   type Agent,
+  type AgentInteraction,
   type AgentListeningPort,
   type AgentSource,
+  type AgentStatus,
   type ConvEvent,
   type HerdrDoc,
   type LayoutSpace,
@@ -32,6 +36,8 @@ import {
 import {
   HcAdapter,
   demotedFinishedStatus,
+  detectScreenInteraction,
+  hasIdleComposerScreen,
   isFalseAntigravityWorkingState,
   isFalseBlockedCandidate,
   isFalseBlockedState,
@@ -201,6 +207,8 @@ export class Host {
   private agentPortsByKey = new Map<string, AgentListeningPort[]>();
   private agentPortsSig = "";
   private portsTimer: NodeJS.Timeout | null = null;
+  private portsDebounceTimer: NodeJS.Timeout | null = null;
+  private lastTerminalPidSig = "";
   private portsInFlight = false;
   private lastSpaceBridgeAt = 0;
   private spaceBridgeInFlight = false;
@@ -217,6 +225,16 @@ export class Host {
   private falseReviewBlockedByAgent = new Map<string, string>();
   /** Keys whose raw `hc` `antigravity` "working" state was verified against live screen as idle/finished (background tasks only). */
   private falseWorkingByAgent = new Map<string, string>();
+  /** Screen-verified active interactive prompt (Ask menu / approval / auth) bound to its CAS raw state signature. */
+  private activeInteractionByAgent = new Map<string, { rawSig: string; interaction: AgentInteraction }>();
+  /** Live structured question tool calls observed from Uniflo, promoting Chat UI before screen scan catches up. */
+  private liveQuestionToolByAgent = new Map<string, { callId: string; detectedAt: number; prompt?: string }>();
+  /** Tracks last observed raw `hc` status transition per agent so agents that transition to `idle` get scanned for Ask menus. */
+  private lastRawStatusByAgent = new Map<string, { status: AgentStatus; changedAt: number; transitioned?: boolean }>();
+  /** Prevents repeated immediate scans on the same idle raw signature. */
+  private scannedIdleSigByAgent = new Map<string, string>();
+  /** Native `herdr` TUI agents whose current `"done"` state has been marked seen via `agent.seen`. */
+  private herdrSeenDoneKeys = new Set<string>();
   private stopped = false;
   private backoff = 1000;
   /** How often the relay link is pinged; a ping still unanswered at the next one drops the link. */
@@ -249,8 +267,11 @@ export class Host {
   waits = new InputWaits();
   private waitTimer: NodeJS.Timeout | null = null;
   private screenQueueTimer: NodeJS.Timeout | null = null;
-  screenQueueMs = 2500;
-  private refreshingScreenQueues = false;
+  screenQueueMs = 5000;
+  private screenQueuesInFlight: Promise<void> | null = null;
+  private screenQueuesTrailing: Promise<void> | null = null;
+  private rescanScreenQueues = false;
+  private interactionRescanTimer: NodeJS.Timeout | null = null;
   /** This computer's own log lines, uploaded to the relay every minute. */
   logs = new LogBuffer();
   private logTimer: NodeJS.Timeout | null = null;
@@ -292,7 +313,7 @@ export class Host {
       getFilesOptions: () => ({
         privateDirs: [
           ...this.privateDirs,
-          join(homedir(), ".agents", "crosery", "credentials"),
+          join(homedir(), ".agents", "credentials"),
           join(homedir(), "Library", "Keychains"),
         ],
         extraRoots: [this.filesDir, homedir(), tmpdir(), "/tmp"],
@@ -495,7 +516,7 @@ export class Host {
     );
     this.screenQueueTimer = setInterval(() => void this.refreshScreenQueues(), this.screenQueueMs);
     this.screenQueueTimer.unref?.();
-    this.portsTimer = setInterval(() => void this.refreshListeningPorts(), 4_000);
+    this.portsTimer = setInterval(() => void this.refreshListeningPorts(), 15_000);
     this.portsTimer.unref?.();
     void this.refreshListeningPorts();
     const hook = await this.portal.startHookAndShims().catch(() => null);
@@ -542,13 +563,18 @@ export class Host {
       this.hc.on("change", () => {
         this.publish();
         this.portal.observeTerminalsUpdated();
+        const pidSig = this.terminalPidSig();
+        if (pidSig !== this.lastTerminalPidSig) {
+          this.lastTerminalPidSig = pidSig;
+          this.schedulePortsRefresh();
+        }
       });
       this.hc.on("doc", () => {
         void this.refreshNames().then(() => this.publish());
       });
       this.hc.start();
       void this.refreshNames();
-      this.namesTimer = setInterval(() => void this.refreshNames(), 4_000);
+      this.namesTimer = setInterval(() => void this.refreshNames(), 10_000);
       this.namesTimer.unref?.();
       added.push(`herdr GUI core (hc) ${this.hc.version ?? ""}`.trim());
     }
@@ -561,10 +587,7 @@ export class Host {
     if (uniflo) {
       this.sources.push("uniflo");
       this.uniflo.start(this.publish, (sessionKey, ev) => {
-        if (ev.kind !== "tool_call") return;
-        const rootKey = this.uniflo.rootSessionKey(sessionKey);
-        const agent = this.agents.find((x) => x.sessionKey === sessionKey || x.sessionKey === rootKey);
-        if (agent) this.portal.inspectToolCallForPortal(agent, ev.name, ev.input);
+        this.observeLiveSessionEvent(sessionKey, ev);
       });
       added.push("uniflo");
     }
@@ -605,7 +628,18 @@ export class Host {
     this.stopTelemetry = null;
     if (this.waitTimer) clearInterval(this.waitTimer);
     if (this.screenQueueTimer) clearInterval(this.screenQueueTimer);
+    this.rescanScreenQueues = false;
+    this.screenQueuesInFlight = null;
+    this.screenQueuesTrailing = null;
+    if (this.interactionRescanTimer) {
+      clearTimeout(this.interactionRescanTimer);
+      this.interactionRescanTimer = null;
+    }
     if (this.portsTimer) clearInterval(this.portsTimer);
+    if (this.portsDebounceTimer) {
+      clearTimeout(this.portsDebounceTimer);
+      this.portsDebounceTimer = null;
+    }
     this.flushLogs();
     this.hc.stop();
     this.herdr.stop();
@@ -696,7 +730,16 @@ export class Host {
       agents.push(HerdrAdapter.toAgent(info, id, herdrLabels));
     }
     const unifloEnriched = this.uniflo.enrich(agents, pids, hints, created, statusMsgs);
-    if (this.subscreenByAgent.size || this.falseReviewBlockedByAgent.size || this.falseWorkingByAgent.size) {
+    if (
+      this.subscreenByAgent.size ||
+      this.falseReviewBlockedByAgent.size ||
+      this.falseWorkingByAgent.size ||
+      this.activeInteractionByAgent.size ||
+      this.liveQuestionToolByAgent.size ||
+      this.lastRawStatusByAgent.size ||
+      this.scannedIdleSigByAgent.size ||
+      this.herdrSeenDoneKeys.size
+    ) {
       const liveKeys = new Set(unifloEnriched.map((a) => a.key));
       for (const k of [...this.subscreenByAgent.keys()]) {
         if (!liveKeys.has(k)) this.subscreenByAgent.delete(k);
@@ -707,14 +750,128 @@ export class Host {
       for (const k of [...this.falseWorkingByAgent.keys()]) {
         if (!liveKeys.has(k)) this.falseWorkingByAgent.delete(k);
       }
+      for (const k of [...this.activeInteractionByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.activeInteractionByAgent.delete(k);
+      }
+      for (const k of [...this.liveQuestionToolByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.liveQuestionToolByAgent.delete(k);
+      }
+      for (const k of [...this.lastRawStatusByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.lastRawStatusByAgent.delete(k);
+      }
+      for (const k of [...this.scannedIdleSigByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.scannedIdleSigByAgent.delete(k);
+      }
+      for (const k of [...this.herdrSeenDoneKeys]) {
+        if (!liveKeys.has(k)) this.herdrSeenDoneKeys.delete(k);
+      }
     }
+    const LIVE_QUESTION_TOOL_TTL_MS = 15_000;
     const normalized = unifloEnriched.map((a) => {
       let next = a;
-      const rawTerm = next.source === "hc" ? this.hc.terminals.get(next.localId) : undefined;
-      if (next.source === "hc" && isFalseBlockedCandidate(next)) {
-        const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}:${next.statusKind ?? ""}:${next.statusNote ?? ""}`;
+      if (next.source === "herdr") {
+        if (next.status === "done") {
+          if (this.herdrSeenDoneKeys.has(next.key)) {
+            next = { ...next, status: "idle" };
+          }
+        } else {
+          this.herdrSeenDoneKeys.delete(next.key);
+        }
+        const liveQ = this.liveQuestionToolByAgent.get(next.key);
+        if (liveQ) {
+          if (now - liveQ.detectedAt > LIVE_QUESTION_TOOL_TTL_MS || (next.status !== "working" && next.status !== "blocked")) {
+            this.liveQuestionToolByAgent.delete(next.key);
+          } else if (next.status === "working") {
+            next = {
+              ...next,
+              status: "blocked",
+              statusKind: "question",
+              ...(liveQ.prompt && !next.statusNote ? { statusNote: liveQ.prompt } : {}),
+              interaction: {
+                kind: "question",
+                ...(liveQ.prompt ? { prompt: liveQ.prompt } : {}),
+                source: "structured_tool",
+              },
+            };
+          }
+        }
+        return next;
+      }
+      if (next.source !== "hc") {
+        this.liveQuestionToolByAgent.delete(next.key);
+        return next;
+      }
+      const rawTerm = this.hc.terminals.get(next.localId);
+      const rawStatus = rawTerm ? HcAdapter.status(rawTerm) : next.status;
+      const prevRaw = this.lastRawStatusByAgent.get(next.key);
+      if (!prevRaw || prevRaw.status !== rawStatus) {
+        this.lastRawStatusByAgent.set(next.key, {
+          status: rawStatus,
+          changedAt: prevRaw ? now : (rawTerm?.status_ms ?? now),
+          transitioned: Boolean(prevRaw),
+        });
+      }
+      const rawSig = this.rawHcSig(next.localId, next);
+
+      // Priority 1: Screen-verified active interaction strictly overrides demotion and promotes working/idle Ask menus.
+      const activeInter = this.activeInteractionByAgent.get(next.key);
+      if (activeInter) {
+        if (activeInter.rawSig === rawSig) {
+          this.falseReviewBlockedByAgent.delete(next.key);
+          this.falseWorkingByAgent.delete(next.key);
+          const effectiveKind: Agent["statusKind"] =
+            next.statusKind === "auth" || next.statusKind === "permission"
+              ? next.statusKind
+              : activeInter.interaction.kind;
+          const effectiveInteraction: AgentInteraction =
+            effectiveKind && effectiveKind !== activeInter.interaction.kind
+              ? { ...activeInter.interaction, kind: effectiveKind }
+              : activeInter.interaction;
+          next = {
+            ...next,
+            status: "blocked",
+            statusKind: effectiveKind,
+            ...(effectiveInteraction.prompt && !next.statusNote ? { statusNote: effectiveInteraction.prompt } : {}),
+            interaction: effectiveInteraction,
+          };
+          return next;
+        }
+        this.activeInteractionByAgent.delete(next.key);
+      }
+
+      // Priority 2: Fresh structured question tool call from Uniflo while screen scan catches up.
+      const liveQ = this.liveQuestionToolByAgent.get(next.key);
+      if (liveQ) {
+        if (now - liveQ.detectedAt > LIVE_QUESTION_TOOL_TTL_MS || (next.status !== "working" && next.status !== "blocked")) {
+          this.liveQuestionToolByAgent.delete(next.key);
+        } else if (
+          next.status === "working" ||
+          (next.status === "blocked" &&
+            !next.interaction &&
+            next.statusKind !== "permission" &&
+            next.statusKind !== "auth")
+        ) {
+          this.falseReviewBlockedByAgent.delete(next.key);
+          this.falseWorkingByAgent.delete(next.key);
+          next = {
+            ...next,
+            status: "blocked",
+            statusKind: "question",
+            ...(liveQ.prompt && !next.statusNote ? { statusNote: liveQ.prompt } : {}),
+            interaction: {
+              kind: "question",
+              ...(liveQ.prompt ? { prompt: liveQ.prompt } : {}),
+              source: "structured_tool",
+            },
+          };
+          return next;
+        }
+      }
+
+      // Priority 3: Screen-verified false-block / false-working demotion bound to CAS raw signature.
+      if (isFalseBlockedCandidate(next)) {
         const demotedSig = this.falseReviewBlockedByAgent.get(next.key);
-        if (demotedSig === sig) {
+        if (demotedSig === rawSig) {
           next = {
             ...next,
             status: demotedFinishedStatus(rawTerm),
@@ -727,10 +884,9 @@ export class Host {
       } else {
         this.falseReviewBlockedByAgent.delete(next.key);
       }
-      if (next.source === "hc" && next.status === "working" && next.harness.toLowerCase() === "antigravity") {
-        const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}`;
+      if (next.status === "working" && next.harness.toLowerCase() === "antigravity") {
         const demotedSig = this.falseWorkingByAgent.get(next.key);
-        if (demotedSig === sig) {
+        if (demotedSig === rawSig) {
           next = { ...next, status: demotedFinishedStatus(rawTerm) };
         } else if (demotedSig !== undefined) {
           this.falseWorkingByAgent.delete(next.key);
@@ -751,6 +907,86 @@ export class Host {
       const sub = this.subscreenByAgent.get(next.key);
       return sub ? { ...next, subscreen: sub } : next;
     });
+  }
+
+  /** CAS signature capturing raw `hc` terminal state so async screen scans never apply across state transitions. */
+  private rawHcSig(
+    localId: string,
+    fallback?: Pick<Agent, "status" | "statusSince" | "turn" | "statusKind" | "statusNote" | "errored">,
+  ): string {
+    const rawTerm = this.hc.terminals.get(localId);
+    if (!rawTerm) {
+      if (!fallback) return "missing";
+      return `fallback:${fallback.status}:${fallback.statusSince ?? 0}:${fallback.turn ?? 0}:${fallback.statusKind ?? ""}:${fallback.statusNote ?? ""}:${fallback.errored ? 1 : 0}`;
+    }
+    const status = HcAdapter.status(rawTerm);
+    const statusKind = HcAdapter.statusKind(rawTerm) ?? "";
+    const statusNote = HcAdapter.note(rawTerm) ?? "";
+    const errored = HcAdapter.errored(rawTerm) ? 1 : 0;
+    return `hc:${status}:${rawTerm.status_ms ?? 0}:${rawTerm.turn ?? 0}:${statusKind}:${statusNote}:${errored}`;
+  }
+
+  /** Processes live Uniflo session events for Portal detection and cross-harness Ask tool promotion. */
+  private observeLiveSessionEvent(sessionKey: string, ev: ConvEvent): void {
+    const rootKey = this.uniflo.rootSessionKey(sessionKey);
+    const agent = this.agents.find((x) => x.sessionKey === sessionKey || x.sessionKey === rootKey);
+    if (!agent) return;
+    if (ev.kind === "tool_call") {
+      this.portal.inspectToolCallForPortal(agent, ev.name, ev.input);
+      if (agent.sessionKey === sessionKey && isQuestionToolName(ev.name)) {
+        const callId = ev.call_id || ev.id;
+        const prompt = summarizeAskQuestionInput(ev.input, 96);
+        this.liveQuestionToolByAgent.set(agent.key, {
+          callId,
+          detectedAt: Date.now(),
+          ...(prompt ? { prompt } : {}),
+        });
+        this.publish();
+        void this.refreshScreenQueues();
+      }
+      return;
+    }
+    if (ev.kind === "tool_result" && agent.sessionKey === sessionKey) {
+      const live = this.liveQuestionToolByAgent.get(agent.key);
+      if (live && (!ev.call_id || live.callId === ev.call_id || isQuestionToolName(ev.name))) {
+        this.liveQuestionToolByAgent.delete(agent.key);
+        this.publish();
+        void this.refreshScreenQueues();
+      }
+      return;
+    }
+    if (ev.kind === "turn_end" && agent.sessionKey === sessionKey) {
+      if (this.liveQuestionToolByAgent.delete(agent.key)) {
+        this.publish();
+      }
+    }
+  }
+
+  private scheduleInteractionRescan(delayMs = 300): void {
+    if (this.stopped) return;
+    if (this.interactionRescanTimer) clearTimeout(this.interactionRescanTimer);
+    this.interactionRescanTimer = setTimeout(() => {
+      this.interactionRescanTimer = null;
+      if (!this.stopped) void this.refreshScreenQueues();
+    }, delayMs);
+    this.interactionRescanTimer.unref?.();
+  }
+
+  private terminalPidSig(): string {
+    return [...this.hc.terminals.values()]
+      .map((t) => `${t.address}:${t.pid ?? ""}:${t.foreground?.pid ?? ""}`)
+      .sort()
+      .join("|");
+  }
+
+  private schedulePortsRefresh(): void {
+    if (this.stopped) return;
+    if (this.portsDebounceTimer) clearTimeout(this.portsDebounceTimer);
+    this.portsDebounceTimer = setTimeout(() => {
+      this.portsDebounceTimer = null;
+      void this.refreshListeningPorts();
+    }, 500);
+    this.portsDebounceTimer.unref?.();
   }
 
   private async refreshListeningPorts(): Promise<void> {
@@ -840,7 +1076,22 @@ export class Host {
     if (data === this.lastPublished) return;
     this.lastPublished = data;
     this.send({ type: "agents", agents: this.agents });
-    if (this.agents.some((a) => a.source === "hc" && isFalseBlockedCandidate(a))) {
+    const now = Date.now();
+    const needsImmediateScan = this.agents.some((a) => {
+      if (a.source !== "hc" || a.isShell) return false;
+      const sig = this.rawHcSig(a.localId, a);
+      if (this.activeInteractionByAgent.get(a.key)?.rawSig === sig) return false;
+      if (isFalseBlockedCandidate(a)) return true;
+      if (this.liveQuestionToolByAgent.has(a.key)) return true;
+      if (a.status === "idle" && this.scannedIdleSigByAgent.get(a.key) !== sig) {
+        const lastRaw = this.lastRawStatusByAgent.get(a.key);
+        if (lastRaw?.transitioned && lastRaw.status === "idle" && now - lastRaw.changedAt <= 15_000) {
+          return true;
+        }
+      }
+      return false;
+    });
+    if (needsImmediateScan) {
       void this.refreshScreenQueues();
     }
   }
@@ -1134,7 +1385,8 @@ export class Host {
             let seq = 0;
             const cols = typeof p.cols === "number" && Number.isFinite(p.cols) ? p.cols : 80;
             const rows = typeof p.rows === "number" && Number.isFinite(p.rows) ? p.rows : 24;
-            const history = Math.min(Math.max(Number(p.history ?? 2000) || 2000, 0), 4000);
+            const rawHistory = p.history === undefined ? 2000 : Number(p.history);
+            const history = Math.min(Math.max(Number.isFinite(rawHistory) ? Math.floor(rawHistory) : 2000, 0), 4000);
             const display = p.display && typeof p.display === "object" ? (p.display as TerminalDisplay) : undefined;
             stop = await this.hc.watchRaw(
               a.localId,
@@ -1405,26 +1657,61 @@ export class Host {
     this.waitTimer.unref?.();
   }
 
-  /** Scans working/blocked TUI screens so queued messages and subscreens stay synced to Chat UI. */
-  private async refreshScreenQueues(): Promise<void> {
-    if (this.stopped || this.refreshingScreenQueues) return;
+  /** Scans working/blocked/recently-idle TUI screens so Ask menus, false-block/working demotions, queues, and subscreens stay synced to Chat UI. */
+  private refreshScreenQueues(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.screenQueuesInFlight) {
+      this.rescanScreenQueues = true;
+      if (!this.screenQueuesTrailing) {
+        this.screenQueuesTrailing = this.screenQueuesInFlight.then(() => {
+          this.screenQueuesTrailing = null;
+          if (!this.rescanScreenQueues || this.stopped) return;
+          this.rescanScreenQueues = false;
+          return this.refreshScreenQueues();
+        });
+      }
+      return this.screenQueuesTrailing;
+    }
+    let pass: Promise<void> | null = null;
+    pass = this.runRefreshScreenQueues().finally(() => {
+      if (this.screenQueuesInFlight === pass) {
+        this.screenQueuesInFlight = null;
+      }
+    });
+    this.screenQueuesInFlight = pass;
+    return pass;
+  }
+
+  private async runRefreshScreenQueues(): Promise<void> {
+    if (this.stopped) return;
     if (!this.agents.length) return;
     const subscribedTermAgents = new Set<string>();
     for (const meta of this.streamMeta.values()) {
       if (meta.kind === "terminal") subscribedTermAgents.add(meta.agent);
     }
-    const inspectable = this.agents.filter(
-      (a) =>
-        !a.isShell &&
-        a.source === "hc" &&
-        !this.sendQueues.has(a.key) &&
-        (a.status === "working" ||
-          a.status === "blocked" ||
-          subscribedTermAgents.has(a.key) ||
-          this.subscreenByAgent.has(a.key) ||
-          this.falseReviewBlockedByAgent.has(a.key) ||
-          this.falseWorkingByAgent.has(a.key)),
-    );
+    const now = Date.now();
+    const inspectable = this.agents.filter((a) => {
+      if (a.isShell || a.source !== "hc" || this.sendQueues.has(a.key)) return false;
+      if (
+        a.status === "working" ||
+        a.status === "blocked" ||
+        subscribedTermAgents.has(a.key) ||
+        this.subscreenByAgent.has(a.key) ||
+        this.falseReviewBlockedByAgent.has(a.key) ||
+        this.falseWorkingByAgent.has(a.key) ||
+        this.activeInteractionByAgent.has(a.key) ||
+        this.liveQuestionToolByAgent.has(a.key)
+      ) {
+        return true;
+      }
+      if (a.status === "idle") {
+        const lastRaw = this.lastRawStatusByAgent.get(a.key);
+        const recentByStatusSince = typeof a.statusSince === "number" && now - a.statusSince <= 15_000;
+        const recentByTransition = lastRaw?.status === "idle" && now - lastRaw.changedAt <= 15_000;
+        if (recentByStatusSince || recentByTransition) return true;
+      }
+      return false;
+    });
     const activeKeys = new Set(inspectable.filter((a) => a.status === "working" || a.status === "blocked").map((a) => a.key));
     let changed = this.waits.pruneScreenQueued(activeKeys);
     const inspectableKeys = new Set(inspectable.map((a) => a.key));
@@ -1438,19 +1725,51 @@ export class Host {
       if (changed) this.publish();
       return;
     }
-    this.refreshingScreenQueues = true;
-    try {
-      await Promise.all(
-        inspectable.map(async (a) => {
-          try {
-            const snap = await this.hc.snapshotWithMeta(a.localId, 60);
-            const text = snap?.text ?? (await this.hc.read(a.localId, 60)).text;
-            const rawTerm = this.hc.terminals.get(a.localId);
-            const rawHarness = rawTerm ? HcAdapter.harness(rawTerm) : a.harness;
-            const rawStatus = rawTerm ? HcAdapter.status(rawTerm) : a.status;
-            const rawStatusKind = rawTerm ? HcAdapter.statusKind(rawTerm) : a.statusKind;
-            const rawStatusNote = rawTerm ? HcAdapter.note(rawTerm) : a.statusNote;
-            const rawErrored = rawTerm ? HcAdapter.errored(rawTerm) : Boolean(a.errored);
+    await Promise.all(
+      inspectable.map(async (a) => {
+        try {
+          if (!this.hc.terminals.has(a.localId)) return;
+          const beforeRawSig = this.rawHcSig(a.localId, a);
+          const snap = await this.hc.snapshotWithMeta(a.localId, 60);
+          const text = snap?.text ?? (await this.hc.read(a.localId, 60)).text;
+          const rawTerm = this.hc.terminals.get(a.localId);
+          if (!rawTerm) return;
+          const afterRawSig = this.rawHcSig(a.localId, a);
+          // CAS guard: discard stale screen scan results when raw terminal state transitioned mid-read.
+          if (afterRawSig !== beforeRawSig) return;
+
+          const rawHarness = HcAdapter.harness(rawTerm);
+          const rawStatus = HcAdapter.status(rawTerm);
+          const rawStatusKind = HcAdapter.statusKind(rawTerm);
+          const rawStatusNote = HcAdapter.note(rawTerm);
+          const rawErrored = HcAdapter.errored(rawTerm);
+          if (rawStatus === "idle") {
+            this.scannedIdleSigByAgent.set(a.key, beforeRawSig);
+          }
+
+          // Positive Ask / approval / auth detection strictly supersedes false-block / false-working demotion.
+          const detected = rawErrored
+            ? null
+            : detectScreenInteraction(text, { harness: rawHarness, rawStatusKind });
+          if (detected) {
+            if (this.falseReviewBlockedByAgent.delete(a.key)) changed = true;
+            if (this.falseWorkingByAgent.delete(a.key)) changed = true;
+            if (this.subscreenByAgent.delete(a.key)) changed = true;
+            const prevInter = this.activeInteractionByAgent.get(a.key);
+            if (
+              !prevInter ||
+              prevInter.rawSig !== beforeRawSig ||
+              JSON.stringify(prevInter.interaction) !== JSON.stringify(detected)
+            ) {
+              this.activeInteractionByAgent.set(a.key, { rawSig: beforeRawSig, interaction: detected });
+              changed = true;
+            }
+          } else {
+            if (this.activeInteractionByAgent.delete(a.key)) changed = true;
+            if (this.liveQuestionToolByAgent.has(a.key) && hasIdleComposerScreen(text, rawHarness)) {
+              this.liveQuestionToolByAgent.delete(a.key);
+              changed = true;
+            }
             if (
               isFalseBlockedCandidate({
                 harness: rawHarness,
@@ -1460,7 +1779,6 @@ export class Host {
                 isShell: a.isShell,
               })
             ) {
-              const rawSig = `${rawTerm?.status_ms ?? a.statusSince ?? 0}:${rawTerm?.turn ?? a.turn ?? 0}:${rawStatusKind ?? ""}:${rawStatusNote ?? ""}`;
               const isFalseBlock = isFalseBlockedState({
                 harness: rawHarness,
                 status: rawStatus,
@@ -1471,8 +1789,8 @@ export class Host {
                 screen: text,
               });
               if (isFalseBlock) {
-                if (this.falseReviewBlockedByAgent.get(a.key) !== rawSig) {
-                  this.falseReviewBlockedByAgent.set(a.key, rawSig);
+                if (this.falseReviewBlockedByAgent.get(a.key) !== beforeRawSig) {
+                  this.falseReviewBlockedByAgent.set(a.key, beforeRawSig);
                   changed = true;
                   this.note(
                     "info",
@@ -1488,15 +1806,14 @@ export class Host {
               changed = true;
             }
             if (rawStatus === "working" && rawHarness.toLowerCase() === "antigravity") {
-              const rawWorkSig = `${rawTerm?.status_ms ?? a.statusSince ?? 0}:${rawTerm?.turn ?? a.turn ?? 0}`;
               const isFalseWork = isFalseAntigravityWorkingState({
                 harness: rawHarness,
                 status: rawStatus,
                 screen: text,
               });
               if (isFalseWork) {
-                if (this.falseWorkingByAgent.get(a.key) !== rawWorkSig) {
-                  this.falseWorkingByAgent.set(a.key, rawWorkSig);
+                if (this.falseWorkingByAgent.get(a.key) !== beforeRawSig) {
+                  this.falseWorkingByAgent.set(a.key, beforeRawSig);
                   changed = true;
                   this.note(
                     "info",
@@ -1511,19 +1828,21 @@ export class Host {
             } else if (this.falseWorkingByAgent.delete(a.key)) {
               changed = true;
             }
-            if (
-              !this.falseWorkingByAgent.has(a.key) &&
-              !this.falseReviewBlockedByAgent.has(a.key) &&
-              (a.status === "working" || a.status === "blocked")
-            ) {
-              if (this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness))) {
-                changed = true;
-              }
-            } else if (this.waits.setScreenQueued(a.key, [])) {
+          }
+          if (
+            !this.falseWorkingByAgent.has(a.key) &&
+            !this.falseReviewBlockedByAgent.has(a.key) &&
+            (a.status === "working" || a.status === "blocked" || Boolean(detected))
+          ) {
+            if (this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness))) {
               changed = true;
             }
-            const fgArgv = rawTerm?.foreground?.argv;
-            this.portal.inspectScreenForOAuth(a, text, fgArgv);
+          } else if (this.waits.setScreenQueued(a.key, [])) {
+            changed = true;
+          }
+          const fgArgv = rawTerm.foreground?.argv;
+          this.portal.inspectScreenForOAuth(a, text, fgArgv);
+          if (!detected) {
             const sub = this.hc.detectSubscreenFromSnapshot(a.localId, { text, altScreen: snap?.altScreen });
             if (sub) {
               if (this.subscreenByAgent.get(a.key) !== sub) {
@@ -1533,15 +1852,13 @@ export class Host {
             } else if (this.subscreenByAgent.delete(a.key)) {
               changed = true;
             }
-          } catch {
-            /* ignore transient read errors for closing terminals */
           }
-        }),
-      );
-      if (changed) this.publish();
-    } finally {
-      this.refreshingScreenQueues = false;
-    }
+        } catch {
+          /* ignore transient read errors for closing terminals */
+        }
+      }),
+    );
+    if (changed) this.publish();
   }
 
   /** A caller's name for the log. */
@@ -1814,6 +2131,9 @@ export class Host {
       } else if (clearedFalseWorking) {
         this.publish();
       }
+      if (p.enter !== false && (this.activeInteractionByAgent.has(a.key) || this.liveQuestionToolByAgent.has(a.key))) {
+        this.scheduleInteractionRescan();
+      }
       return { ok: true as const, queueId: queued.id, position: queued.position, agentStatus: status, waiting };
     },
     "terminal.keys": async (p) => {
@@ -1823,6 +2143,9 @@ export class Host {
         throw new RpcFailure("bad_request", "keys must be a non-empty list");
       if (a.source === "hc") await this.hc.keys(a.localId, p.keys);
       else await this.herdr.keys(a.localId, p.keys);
+      if (this.activeInteractionByAgent.has(a.key) || this.liveQuestionToolByAgent.has(a.key)) {
+        this.scheduleInteractionRescan();
+      }
       return { ok: true as const };
     },
     "terminal.input": async (p) => {
@@ -1855,6 +2178,9 @@ export class Host {
           this.portal.observeTerminalInput(a, p.data);
           if (screenCmd) {
             this.portal.observeSubmittedCommand(a, screenCmd, "terminal_input");
+          }
+          if (this.activeInteractionByAgent.has(a.key) || this.liveQuestionToolByAgent.has(a.key)) {
+            this.scheduleInteractionRescan();
           }
         }
         return { ok: true as const };
@@ -1971,6 +2297,9 @@ export class Host {
       if (this.opts.readOnly) reason = "这台电脑开了只读模式";
       else if (!this.sources.includes("hc")) reason = "这台电脑没有装桌面 herdr";
       else if (this.hc.terminals.size === 0) await this.hc.list().catch(() => undefined);
+      const herdrWsPromise = this.sources.includes("herdr")
+        ? this.herdr.refreshWorkspaces().catch(() => [])
+        : null;
       try {
         spaces = await this.app.spaces(this.hc.terminals);
       } catch (e) {
@@ -2018,8 +2347,8 @@ export class Host {
           }
         }
       }
-      if (this.sources.includes("herdr")) {
-        await this.herdr.refreshWorkspaces().catch(() => []);
+      if (herdrWsPromise) {
+        await herdrWsPromise;
         const herdrCounts = new Map<string, number>();
         for (const a of this.herdr.agents) {
           if (this.herdr.isMirroredCoreAgent(a)) {
@@ -2259,7 +2588,7 @@ export class Host {
       const extraRoots = [this.filesDir, homedir(), tmpdir(), "/tmp"];
       const privateDirs = [
         ...this.privateDirs,
-        join(homedir(), ".agents", "crosery", "credentials"),
+        join(homedir(), ".agents", "credentials"),
         join(homedir(), "Library", "Keychains"),
       ];
       const r = await this.files(() => readFileSlice(a.cwd, p, { privateDirs, extraRoots }));
@@ -2431,18 +2760,36 @@ export class Host {
         if (
           t &&
           typeof t.turn === "number" &&
+          t.turn > 0 &&
           (HcAdapter.status(t) === "done" ||
             a.status === "done" ||
             this.falseWorkingByAgent.has(a.key) ||
             this.falseReviewBlockedByAgent.has(a.key))
         ) {
-          const rawSeen = t.labels?.["herdr.seen"];
-          const seen = rawSeen !== undefined && rawSeen.trim() !== "" ? Number(rawSeen) : NaN;
+          // Turn guard: never let a stale client acknowledge a newer completed turn.
+          if (typeof p.turn === "number" && Number.isFinite(p.turn) && t.turn > p.turn) {
+            return { ok: true as const };
+          }
+          const rawSeen: unknown = t.labels?.["herdr.seen"];
+          const seen =
+            typeof rawSeen === "number"
+              ? rawSeen
+              : typeof rawSeen === "string" && rawSeen.trim() !== ""
+                ? Number(rawSeen)
+                : NaN;
           if (!(Number.isFinite(seen) && seen >= t.turn)) {
             await this.hc.label(a.localId, { "herdr.seen": String(t.turn) });
+            this.hc.recordSeenWatermark(a.localId, t.turn);
             await this.hc.list();
             this.publishNow();
+          } else if (a.status === "done") {
+            this.publishNow();
           }
+        }
+      } else if (a.source === "herdr") {
+        if (a.status === "done") {
+          this.herdrSeenDoneKeys.add(a.key);
+          this.publishNow();
         }
       }
       return { ok: true as const };

@@ -128,8 +128,174 @@ export function mergeConvEvents(prev: ConvEvent[], add: ConvEvent[]): ConvEvent[
   return [...byId.values()].sort(compareConvEvents).slice(-KEEP_EVENTS);
 }
 
+export interface SessionOwner {
+  agentKey: string;
+  sessionKey: string | null;
+}
+
+export interface SessionTrackTransition {
+  /** Tracks last known agent+session without erasing a known sessionKey on transient `undefined`. */
+  nextTrack: SessionOwner;
+  /** Owner of the currently displayed `events` buffer after applying this transition. */
+  nextOwner: SessionOwner;
+  /** True when the agent changed or switched to a different non-empty sessionKey. */
+  switched: boolean;
+}
+
+function normalizeSessionKey(key?: string | null): string | null {
+  const trimmed = typeof key === "string" ? key.trim() : "";
+  return trimmed || null;
+}
+
+/**
+ * Reconciles `agent.key` / `agent.sessionKey` transitions for Chat UI ownership.
+ * For the same agent, a transient `undefined` / empty `agent.sessionKey` (during `/new`, `/clear`,
+ * hostd restart, or Uniflo refresh) preserves the previously known non-empty sessionKey so the
+ * subsequent new sessionKey is always detected as a switch and never merged with old events.
+ */
+export function resolveSessionTrackTransition(
+  prevTrack: SessionOwner,
+  prevOwner: SessionOwner,
+  agentKey: string,
+  agentSessionKey?: string | null,
+): SessionTrackTransition {
+  const incoming = normalizeSessionKey(agentSessionKey);
+  if (prevTrack.agentKey !== agentKey || prevOwner.agentKey !== agentKey) {
+    const next: SessionOwner = { agentKey, sessionKey: incoming };
+    return { nextTrack: next, nextOwner: next, switched: true };
+  }
+  const prevTrackKey = normalizeSessionKey(prevTrack.sessionKey);
+  const prevOwnerKey = normalizeSessionKey(prevOwner.sessionKey);
+  if (!incoming) {
+    return {
+      nextTrack: { agentKey, sessionKey: prevTrackKey ?? prevOwnerKey },
+      nextOwner: { agentKey, sessionKey: prevOwnerKey ?? prevTrackKey },
+      switched: false,
+    };
+  }
+  const switched =
+    (prevOwnerKey !== null && prevOwnerKey !== incoming) ||
+    (prevTrackKey !== null && prevTrackKey !== incoming);
+  const next: SessionOwner = { agentKey, sessionKey: incoming };
+  return { nextTrack: next, nextOwner: next, switched };
+}
+
+export type SessionEventsBatchKind = "initial" | "reopened" | "poll" | "recovery" | "older";
+
+export interface ReconcileSessionEventsInput {
+  kind: SessionEventsBatchKind;
+  prevEvents: ConvEvent[];
+  owner: SessionOwner;
+  /** Current tracked agent+session (checked for stale `older` responses). */
+  track?: SessionOwner;
+  requestAgentKey: string;
+  requestSessionKey?: string | null;
+  responseSessionKey?: string | null;
+  responseEvents: ConvEvent[];
+  more?: boolean;
+  nextBefore?: string | null;
+  beforeCursor?: string | null;
+  /** Forces full replacement (e.g. initial page load immediately following a session switch). */
+  forceReplace?: boolean;
+}
+
+export interface ReconcileSessionEventsResult {
+  action: "discard" | "replace" | "merge";
+  events: ConvEvent[];
+  nextOwner: SessionOwner;
+  /** True when `responseSessionKey` belonged to a different session than `owner.sessionKey`. */
+  sessionChanged: boolean;
+  /** Updated `olderCursor` when applicable (`undefined` leaves existing cursor unchanged). */
+  olderCursor?: string | null;
+}
+
+/**
+ * Pure state reconciliation for `session.events` RPC responses across initial load,
+ * stream reopen, polling, visibility recovery, and load-older pagination.
+ * Guarantees two different sessions' events are NEVER merged (e.g. a new session with lower
+ * byte-offset `pos` sorting above a previous session's high `pos`).
+ */
+export function reconcileSessionEventsBatch(
+  input: ReconcileSessionEventsInput,
+): ReconcileSessionEventsResult {
+  const {
+    kind,
+    prevEvents,
+    owner,
+    track,
+    requestAgentKey,
+    responseEvents,
+    more,
+    nextBefore,
+    beforeCursor,
+    forceReplace,
+  } = input;
+
+  if (owner.agentKey !== requestAgentKey || (track && track.agentKey !== requestAgentKey)) {
+    return { action: "discard", events: prevEvents, nextOwner: owner, sessionChanged: false };
+  }
+
+  const ownerKey = normalizeSessionKey(owner.sessionKey);
+  const trackKey = track ? normalizeSessionKey(track.sessionKey) : ownerKey;
+  const reqKey = normalizeSessionKey(input.requestSessionKey);
+  const resKey = normalizeSessionKey(input.responseSessionKey);
+
+  if (kind === "older") {
+    if (
+      (reqKey !== null && trackKey !== null && trackKey !== reqKey) ||
+      (reqKey !== null && ownerKey !== null && ownerKey !== reqKey) ||
+      (resKey !== null && ownerKey !== null && resKey !== ownerKey) ||
+      (resKey !== null && reqKey !== null && resKey !== reqKey)
+    ) {
+      return { action: "discard", events: prevEvents, nextOwner: owner, sessionChanged: false };
+    }
+    const nextOwner: SessionOwner = { agentKey: owner.agentKey, sessionKey: resKey ?? ownerKey };
+    const nextCursor =
+      !more || !nextBefore || nextBefore === beforeCursor || responseEvents.length === 0
+        ? null
+        : nextBefore;
+    return {
+      action: "merge",
+      events: mergeConvEvents(prevEvents, responseEvents),
+      nextOwner,
+      sessionChanged: false,
+      olderCursor: nextCursor,
+    };
+  }
+
+  // If the current owner already moved to a newer session than what this request asked for,
+  // and this late response still carries that stale requested session, discard it instead of reverting.
+  if (reqKey !== null && ownerKey !== null && reqKey !== ownerKey && resKey !== null && resKey === reqKey) {
+    return { action: "discard", events: prevEvents, nextOwner: owner, sessionChanged: false };
+  }
+
+  const sessionChanged = resKey !== null && ownerKey !== null && resKey !== ownerKey;
+  const nextOwner: SessionOwner = { agentKey: owner.agentKey, sessionKey: resKey ?? ownerKey };
+
+  if (sessionChanged || forceReplace) {
+    const replaced = responseEvents.length ? mergeConvEvents([], responseEvents) : [];
+    const olderCursor = more ? (nextBefore ?? null) : null;
+    return {
+      action: "replace",
+      events: replaced,
+      nextOwner,
+      sessionChanged,
+      olderCursor,
+    };
+  }
+
+  const olderCursor = kind === "initial" ? (more ? (nextBefore ?? null) : null) : undefined;
+  return {
+    action: "merge",
+    events: mergeConvEvents(prevEvents, responseEvents),
+    nextOwner,
+    sessionChanged: false,
+    ...(olderCursor !== undefined ? { olderCursor } : {}),
+  };
+}
+
 export interface BufferedEventMerger {
-  onInitialPage: (events: ConvEvent[]) => void;
+  onInitialPage: (events: ConvEvent[], options?: { replace?: boolean }) => void;
   onInitialReady: () => void;
   onStreamEvent: (ev: ConvEvent) => void;
   dispose: () => void;
@@ -141,7 +307,7 @@ export interface BufferedEventMerger {
  * coalesces rapid live bursts into 16ms batches to prevent slice artifacts and re-render storms.
  */
 export function createBufferedEventMerger(
-  applyMerge: (events: ConvEvent[]) => void,
+  applyMerge: (events: ConvEvent[], options?: { replace?: boolean }) => void,
   fallbackMs = 1500,
 ): BufferedEventMerger {
   let pageReady = false;
@@ -162,14 +328,22 @@ export function createBufferedEventMerger(
     }
   };
 
-  const onInitialPage = (events: ConvEvent[]) => {
+  const onInitialPage = (events: ConvEvent[], options?: { replace?: boolean }) => {
     if (disposed) return;
     clearFallback();
+    const wasReady = pageReady;
     pageReady = true;
     const buffered = prePageBuffer;
     prePageBuffer = [];
+    if (options?.replace && wasReady) {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      liveBatch = [];
+    }
     const combined = buffered.length ? [...events, ...buffered] : events;
-    applyMerge(combined);
+    applyMerge(combined, options);
   };
 
   const onInitialReady = () => {

@@ -74,6 +74,20 @@ function normFolder(raw?: string): string {
 }
 
 /**
+ * Returns true for `herdr` TUI's built-in empty default scratch workspace (`~` with no tabs/agents),
+ * which should neither clutter `spaces.list` nor be resurrected into `herdr-core` after deletion.
+ */
+export function isEmptyDefaultHomeWorkspace(ws: HerdrWorkspaceInfo, agentCount = 0): boolean {
+  const label = ws.label.trim();
+  if (label !== "~") return false;
+  const nf = normFolder(ws.folder);
+  if (nf && nf !== "~") return false;
+  const tabCount = Math.max(ws.tabs?.length ?? 0, ws.tabCount ?? 0);
+  const paneCount = ws.paneCount ?? 0;
+  return tabCount === 0 && paneCount === 0 && agentCount <= 0;
+}
+
+/**
  * Merges `herdr` TUI workspaces into `spaces.list` results without duplicating spaces that
  * already exist in `herdr-core` (matched by normalized name or working folder).
  */
@@ -94,11 +108,12 @@ export function mergeHerdrWorkspacesIntoSpaces(
   }
 
   for (const ws of herdrWorkspaces) {
+    const extraTerms = herdrAgentCounts?.get(ws.id) ?? 0;
+    if (isEmptyDefaultHomeWorkspace(ws, extraTerms)) continue;
     const label = ws.label.trim() || ws.id;
     const nn = normName(label);
     const nf = normFolder(ws.folder);
     const hit = (nn ? byName.get(nn) : undefined) ?? (nf && nf !== "~" ? byFolder.get(nf) : undefined);
-    const extraTerms = herdrAgentCounts?.get(ws.id) ?? 0;
     if (hit) {
       hit.terminals += extraTerms;
       if (!hit.folder && ws.folder) {
@@ -169,6 +184,7 @@ export async function syncSpacesBidirectional(opts: {
 
     let addedThisAttempt = 0;
     for (const ws of herdrWorkspaces) {
+      if (isEmptyDefaultHomeWorkspace(ws)) continue;
       const label = ws.label.trim();
       if (!label) continue;
       const nn = normName(label);

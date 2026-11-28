@@ -99,6 +99,22 @@ import {
   refreshWarmWebglAddon,
   unregisterWebglAddonInstance,
 } from "../lib/terminalWebglPatch";
+import {
+  LOCAL_FONT_WAIT_MS,
+  LOCAL_HOST_READY_FALLBACK_MS,
+  MOUNT_SAFETY_REVEAL_MS,
+  RELAY_HOST_READY_FALLBACK_MS,
+  attachImmediateWebglContextLossListener,
+  createRelayFallbackController,
+  getWebglAddonContext,
+  recoverActiveTerminalAfterWebglDispose,
+  releaseWebglAddonContext,
+  runTerminalActivationPhase0,
+  runTerminalActivationPhase1,
+  runTerminalStartupWithFallback,
+  shouldEnableTerminalCursorBlink,
+  type RelayFallbackController,
+} from "../lib/terminalActivation";
 import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { isDirectConnected, rpcCall, subscribeStream } from "../lib/relay";
 import { uploadRemoteFile } from "../lib/uploadLargeFile";
@@ -472,6 +488,7 @@ export function TerminalSurface({
   const ctrlLinkConsumedAtRef = useRef(0);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const prevActiveRef = useRef(false);
   const focusedRef = useRef(focused);
   focusedRef.current = focused;
   const isShellRef = useRef(Boolean(agent.isShell));
@@ -1336,8 +1353,8 @@ export function TerminalSurface({
 
   const visualSig = useCallback(
     (familyCss: string) =>
-      `${familyCss}|${termCfg.fontSize}|${lineHeight}|${termCfg.fontWeight}|${termCfg.cursorBlink ? 1 : 0}|${activeSpec.fg}|${activeSpec.bg}|${activeSpec.cursor}|${activeSpec.minimumContrastRatio}`,
-    [activeSpec.bg, activeSpec.cursor, activeSpec.fg, activeSpec.minimumContrastRatio, lineHeight, termCfg.cursorBlink, termCfg.fontSize, termCfg.fontWeight],
+      `${familyCss}|${termCfg.fontSize}|${lineHeight}|${termCfg.fontWeight}|${activeSpec.fg}|${activeSpec.bg}|${activeSpec.cursor}|${activeSpec.minimumContrastRatio}`,
+    [activeSpec.bg, activeSpec.cursor, activeSpec.fg, activeSpec.minimumContrastRatio, lineHeight, termCfg.fontSize, termCfg.fontWeight],
   );
 
   // Keep font faces, theme colors, texture atlas, and overlay coordinates synchronized with live changes.
@@ -1355,7 +1372,6 @@ export function TerminalSurface({
       term.options.lineHeight = lineHeight;
       term.options.fontWeight = termCfg.fontWeight as 300 | 400 | 500 | 600 | 700;
       term.options.fontWeightBold = Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900;
-      term.options.cursorBlink = termCfg.cursorBlink;
       term.options.customGlyphs = true;
       term.options.theme = activeSpec.theme;
       term.options.minimumContrastRatio = activeSpec.minimumContrastRatio;
@@ -1378,7 +1394,7 @@ export function TerminalSurface({
     return () => {
       cancelled = true;
     };
-  }, [activeSpec, fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight, visualSig]);
+  }, [activeSpec, fontFamily, lineHeight, paintOverlays, syncResize, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight, visualSig]);
 
   useEffect(() => {
     const hostEl = hostRef.current;
@@ -1395,7 +1411,12 @@ export function TerminalSurface({
 
     const term = new XTerm({
       allowProposedApi: true,
-      cursorBlink: termCfg.cursorBlink,
+      cursorBlink: shouldEnableTerminalCursorBlink({
+        configBlink: termCfg.cursorBlink,
+        active: activeRef.current,
+        focused: focusedRef.current,
+        windowFocused: typeof document === "undefined" || (!document.hidden && document.hasFocus()),
+      }),
       cursorStyle: "block",
       customGlyphs: true,
       rescaleOverlappingGlyphs: true,
@@ -1452,19 +1473,23 @@ export function TerminalSurface({
     kittyKeys.reset();
 
     hostEl.dataset.ready = "false";
-    const mountStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    let mountStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     let initialReadyDone = false;
     let initialAttachPending = false;
+    let hostReadyFallback = 0;
+    let safetyRevealTimer = 0;
     const markHostReady = (mode: "local" | "relay" | "fallback" = "fallback") => {
       if (initialReadyDone) return;
       initialReadyDone = true;
       initialAttachPending = false;
+      window.clearTimeout(safetyRevealTimer);
+      safetyRevealTimer = 0;
       hostEl.dataset.ready = "true";
       const now = typeof performance !== "undefined" ? performance.now() : Date.now();
       trackTerminalReveal(now - mountStartedAt, mode);
     };
-    let hostReadyFallback = 0;
     term.open(hostEl);
+    prevActiveRef.current = activeRef.current;
     appliedVisualSigRef.current = visualSig(fontFamily);
     fitAddon.fit();
     refreshCachedCellSize(term);
@@ -1475,17 +1500,23 @@ export function TerminalSurface({
     // reactivate cached contexts in O(1) without synchronous DomRenderer rebuilds.
     const poolKey = Symbol(agent.key);
     let mountWebglRaf = 0;
+    let removeWebglContextLostListener: (() => void) | null = null;
 
     const disposeWebglAddon = () => {
+      removeWebglContextLostListener?.();
+      removeWebglContextLostListener = null;
       const addon = webglRef.current;
       if (!addon) return;
       webglRef.current = null;
       unregisterWebglAddonInstance(addon);
+      const gl = getWebglAddonContext(addon);
       try {
         addon.dispose();
       } catch {
         // ignore already disposed addon
       }
+      releaseWebglAddonContext(addon, gl);
+      recoverActiveTerminalAfterWebglDispose(term, alive && activeRef.current && termRef.current === term);
     };
     const detachWebgl = () => {
       releaseWebglSlot(poolKey);
@@ -1501,7 +1532,9 @@ export function TerminalSurface({
         detachWebgl();
         return;
       }
-      acquireWebglSlot(poolKey, disposeWebglAddon);
+      if (!acquireWebglSlot(poolKey, disposeWebglAddon)) {
+        disposeWebglAddon();
+      }
     };
     const attachWebgl = () => {
       if (!alive || termRef.current !== term) return;
@@ -1526,10 +1559,16 @@ export function TerminalSurface({
         term.loadAddon(addon);
         patchWebglAddonInstance(addon);
         webglRef.current = addon;
+        removeWebglContextLostListener?.();
+        removeWebglContextLostListener = attachImmediateWebglContextLossListener(addon, hostEl, () => {
+          if (webglRef.current === addon) detachWebgl();
+        });
         wakeTerminalRendererImmediate(term);
         if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
         paintTerminalViewportImmediate(term);
       } catch {
+        removeWebglContextLostListener?.();
+        removeWebglContextLostListener = null;
         releaseWebglSlot(poolKey);
         // Environments without WebGL2 fall back cleanly to xterm's DOM renderer.
       }
@@ -3010,7 +3049,7 @@ export function TerminalSurface({
     };
 
     let unsubRelay: (() => void) | null = null;
-    let seedTimer = 0;
+    let relayFallback: RelayFallbackController | null = null;
     let unsubLocalClose: (() => void) | null = null;
     let unsubLocalSize: (() => void) | null = null;
     let activeLocalConnId: string | null = null;
@@ -3096,10 +3135,11 @@ export function TerminalSurface({
       pendingBytes.push(bytes);
       pendingByteCount += bytes.length;
       if (!activeRef.current && pendingByteCount > HIDDEN_PENDING_CAP) {
-        while (pendingBytes.length > 1 && pendingByteCount > HIDDEN_PENDING_CAP) {
-          const dropped = pendingBytes.shift();
-          if (dropped) pendingByteCount = Math.max(0, pendingByteCount - dropped.length);
-        }
+        // Never drop head VT chunks (e.g. ?1049h or initial screen draw) on hidden tabs;
+        // xterm's RenderService is paused while hidden, so flushing parses full VT state without painting.
+        sawAnyOutput = true;
+        flushPendingBytes();
+        return;
       }
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       const hitCap = pendingByteCount >= FLUSH_BYTE_CAP;
@@ -3228,9 +3268,11 @@ export function TerminalSurface({
       }
       if (!alive) return;
       await Promise.race([
-        ensureFontCatalog().then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600)),
+        ensureFontCatalog()
+          .then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600))
+          .catch(() => {}),
         new Promise<void>((r) => {
-          window.setTimeout(r, 120);
+          window.setTimeout(r, LOCAL_FONT_WAIT_MS);
         }),
       ]);
       if (!alive || termRef.current !== term) return;
@@ -3245,20 +3287,28 @@ export function TerminalSurface({
         initialAttachPending = true;
       }
       if (!initialReadyDone && !hostReadyFallback) {
-        hostReadyFallback = window.setTimeout(() => markHostReady("relay"), 280);
+        hostReadyFallback = window.setTimeout(() => markHostReady("relay"), RELAY_HOST_READY_FALLBACK_MS);
       }
-      let rawModeConfirmed = false;
-      const runFallbackRead = () => {
-        if (!alive || sawRaw || rawModeConfirmed) return;
-        initialAttachPending = false;
-        void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
-          .then((res) => {
-            if (alive && !sawRaw && !rawModeConfirmed) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
-          })
-          .catch(() => {
-            if (alive && !initialReadyDone) markHostReady("fallback");
-          });
-      };
+      relayFallback?.dispose();
+      relayFallback = createRelayFallbackController({
+        isAlive: () => alive,
+        hasSawRaw: () => sawRaw,
+        readScreen: () => rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 }),
+        onFallbackReadStart: () => {
+          initialAttachPending = false;
+        },
+        onFallbackScreen: (res) => {
+          writeFallbackScreen((res.ansi || res.text || "").split("\n"));
+        },
+        onFallbackReadError: () => {
+          if (alive && !initialReadyDone) markHostReady("fallback");
+        },
+        onRawModeConfirmed: () => {
+          initialAttachPending = false;
+        },
+        setTimeoutFn: (fn, ms) => window.setTimeout(fn, ms) as unknown as ReturnType<typeof setTimeout>,
+        clearTimeoutFn: (id) => window.clearTimeout(id as unknown as number),
+      });
       relayActiveRef.current = true;
       unsubRelay = subscribeStream(
         agent.deviceId,
@@ -3274,10 +3324,14 @@ export function TerminalSurface({
         (ev) => {
           if (!alive || !ev) return;
           if (ev.kind === "terminal_data" && typeof ev.data === "string") {
-            if (seedTimer) {
-              clearTimeout(seedTimer);
-              seedTimer = 0;
+            let decoded: Uint8Array;
+            try {
+              decoded = decodeBase64Bytes(ev.data);
+            } catch {
+              return;
             }
+            if (decoded.byteLength === 0) return;
+            relayFallback?.onRawBytes();
             const evCols = typeof ev.cols === "number" && ev.cols >= 20 ? ev.cols : 0;
             const evRows = typeof ev.rows === "number" && ev.rows >= 5 ? ev.rows : 0;
             const wasFirstRaw = !sawRaw;
@@ -3313,11 +3367,7 @@ export function TerminalSurface({
               refreshCachedCellSize(term);
               scheduleOverlay();
             }
-            try {
-              queueRawBytes(decodeBase64Bytes(ev.data));
-            } catch {
-              /* ignore malformed chunk */
-            }
+            queueRawBytes(decoded);
           } else if (ev.kind === "terminal" && ev.screen) {
             writeFallbackScreen(String(ev.screen.ansi || ev.screen.text || "").split("\n"));
           } else if (ev.kind === "terminal_rows") {
@@ -3327,30 +3377,39 @@ export function TerminalSurface({
           }
         },
         (state: { kind?: string; result?: { raw?: boolean } } | undefined) => {
-          if (!alive || !state) return;
-          if (state.kind === "live" && state.result?.raw === true) {
-            rawModeConfirmed = true;
-            initialAttachPending = false;
-            if (seedTimer) {
-              clearTimeout(seedTimer);
-              seedTimer = 0;
-            }
-          } else if (state.kind === "error") {
-            if (seedTimer) {
-              clearTimeout(seedTimer);
-              seedTimer = 0;
-            }
-            runFallbackRead();
-          }
+          relayFallback?.onStreamState(state);
         },
       );
-      seedTimer = window.setTimeout(runFallbackRead, 240);
+      relayFallback.start();
     };
+
+    const armSafetyReveal = () => {
+      if (!alive || initialReadyDone || safetyRevealTimer) return;
+      safetyRevealTimer = window.setTimeout(() => {
+        safetyRevealTimer = 0;
+        if (!alive || initialReadyDone || !activeRef.current) return;
+        if (!activeLocalConnId && !unsubRelay) {
+          localAttachPendingRef.current = false;
+          try {
+            startRelayStream();
+          } catch {
+            // fall through to markHostReady
+          }
+        }
+        markHostReady("fallback");
+      }, MOUNT_SAFETY_REVEAL_MS);
+    };
+    if (activeRef.current) {
+      armSafetyReveal();
+    }
 
     let readyToAttachResolve: (() => void) | null = null;
     const isLayoutAttachable = () =>
       hostEl.clientWidth >= 60 && hostEl.clientHeight >= 40;
     const notifyAttachReady = () => {
+      if (activeRef.current && !initialReadyDone) {
+        armSafetyReveal();
+      }
       if (readyToAttachResolve && isLayoutAttachable()) {
         const resolve = readyToAttachResolve;
         readyToAttachResolve = null;
@@ -3377,7 +3436,7 @@ export function TerminalSurface({
           initialAttachPending = true;
         }
         if (!initialReadyDone && !hostReadyFallback) {
-          hostReadyFallback = window.setTimeout(() => markHostReady("local"), 280);
+          hostReadyFallback = window.setTimeout(() => markHostReady("local"), LOCAL_HOST_READY_FALLBACK_MS);
         }
         fitAddon.fit();
         refreshCachedCellSize(term);
@@ -3521,8 +3580,12 @@ export function TerminalSurface({
         userScrollAdjustUntilRef.current = 0;
         pendingViewportSyncRef.current = true;
         hostEl.dataset.ready = "false";
+        mountStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
         window.clearTimeout(hostReadyFallback);
-        hostReadyFallback = window.setTimeout(() => markHostReady("local"), 280);
+        hostReadyFallback = window.setTimeout(() => markHostReady("local"), LOCAL_HOST_READY_FALLBACK_MS);
+        window.clearTimeout(safetyRevealTimer);
+        safetyRevealTimer = 0;
+        if (activeRef.current) armSafetyReveal();
         window.clearTimeout(orphanNudgeTimer);
         orphanNudgeTimer = 0;
         pendingBytes = [];
@@ -3539,15 +3602,14 @@ export function TerminalSurface({
       };
       reattachLocalRef.current = triggerLocalReattach;
 
-      void (async () => {
-        await waitUntilAttachable();
-        if (!alive) return;
+      const startLocalAttach = async () => {
+        if (!alive || activeLocalConnId || unsubRelay) return;
         const [resolvedLocalId] = await Promise.all([
           localHostIdStore.get() ? Promise.resolve(localHostIdStore.get()) : ensureLocalHostDeviceId(),
           waitLayoutAndFonts(),
           ensureLocalTermMux(),
         ]);
-        if (!alive) return;
+        if (!alive || activeLocalConnId || unsubRelay) return;
         if (!resolvedLocalId || resolvedLocalId !== agent.deviceId) {
           localAttachPendingRef.current = false;
           if (reattachLocalRef.current === triggerLocalReattach) reattachLocalRef.current = null;
@@ -3587,13 +3649,46 @@ export function TerminalSurface({
         unsubLocalClose = offClose;
         unsubLocalSize = offSize;
         await connectLocal(0);
-      })();
+      };
+
+      void runTerminalStartupWithFallback({
+        isAlive: () => alive,
+        waitUntilAttachable,
+        resetMountStartedAt: () => {
+          mountStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+        },
+        startPrimary: startLocalAttach,
+        onError: (err) => {
+          logger.warn("term", "term.local.startup_failed", {
+            agent: agent.key,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+        clearLocalAttachPending: () => {
+          localAttachPendingRef.current = false;
+          if (reattachLocalRef.current === triggerLocalReattach) reattachLocalRef.current = null;
+        },
+        isLocalConnected: () => Boolean(activeLocalConnId),
+        startRelayFallback: () => startRelayStream(),
+        hasRelaySubscription: () => Boolean(unsubRelay),
+        markHostReadyFallback: () => markHostReady("fallback"),
+      });
     } else {
-      void waitUntilAttachable().then(() => {
-        if (!alive) return;
-        return waitLayoutAndFonts().then(() => {
-          if (alive) startRelayStream();
-        });
+      void runTerminalStartupWithFallback({
+        isAlive: () => alive,
+        waitUntilAttachable,
+        resetMountStartedAt: () => {
+          mountStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+        },
+        startPrimary: async () => {
+          if (!alive || unsubRelay) return;
+          await waitLayoutAndFonts();
+          if (alive && !unsubRelay) startRelayStream();
+        },
+        isLocalConnected: () => false,
+        startRelayFallback: () => startRelayStream(),
+        hasRelaySubscription: () => Boolean(unsubRelay),
+        markHostReadyFallback: () => markHostReady("fallback"),
       });
     }
 
@@ -3764,7 +3859,11 @@ export function TerminalSurface({
         resolve();
       }
       window.clearTimeout(hostReadyFallback);
-      window.clearTimeout(seedTimer);
+      window.clearTimeout(safetyRevealTimer);
+      safetyRevealTimer = 0;
+      prevActiveRef.current = false;
+      relayFallback?.dispose();
+      relayFallback = null;
       window.clearTimeout(flushTimer);
       window.clearTimeout(orphanNudgeTimer);
       onMissingVirtualAssetRef.current = null;
@@ -3869,6 +3968,39 @@ export function TerminalSurface({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.deviceId, agent.key]);
 
+  // Only blink the terminal cursor when configured AND this pane and OS window are active/focused,
+  // avoiding background WebKit wakeups without clearing the shared texture atlas.
+  useEffect(() => {
+    const syncCursorBlink = (windowFocused: boolean) => {
+      const term = termRef.current;
+      if (!term) return;
+      const wantBlink = shouldEnableTerminalCursorBlink({
+        configBlink: termCfg.cursorBlink,
+        active: activeRef.current,
+        focused: focusedRef.current,
+        windowFocused,
+      });
+      if (term.options.cursorBlink !== wantBlink) {
+        term.options.cursorBlink = wantBlink;
+      }
+    };
+    const syncFromDocument = () => {
+      syncCursorBlink(typeof document === "undefined" || (!document.hidden && document.hasFocus()));
+    };
+    const onFocus = () => syncCursorBlink(true);
+    const onBlur = () => syncCursorBlink(false);
+    syncFromDocument();
+    if (typeof window === "undefined") return;
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", syncFromDocument);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", syncFromDocument);
+    };
+  }, [active, focused, termCfg.cursorBlink]);
+
   // Close context menu cleanly on outside pointer click, Escape, or blur.
   useEffect(() => {
     if (!ctxMenu) return;
@@ -3890,11 +4022,14 @@ export function TerminalSurface({
     };
   }, [ctxMenu]);
 
-  // Phase 0 (synchronous before paint): mark outgoing WebGL warm or touch incoming warm slot and snap scroll immediately.
-  // Phase 1 (next animation frame): promote cold pane to WebGL, skip unchanged fit() reflows, focus, and sync PTY/overlays.
+  // Phase 0 (synchronous before paint, ONLY on inactive -> active): touch warm WebGL slot, snap scroll, and paint visible rows.
+  // Phase 1 (next animation frame): promote cold pane to WebGL, refresh only if needed, skip unchanged fit() reflows, focus, and sync PTY/overlays.
   useLayoutEffect(() => {
     const localConnId = localConnRef.current;
     if (!active || !termRef.current) {
+      if (!active) {
+        prevActiveRef.current = false;
+      }
       if (localConnId) {
         void localTermFocus(localConnId, false);
       }
@@ -3902,40 +4037,83 @@ export function TerminalSurface({
       markWebglInactiveRef.current?.();
       return;
     }
+    const term = termRef.current;
+    const wasActive = prevActiveRef.current;
+    prevActiveRef.current = true;
+    if (wasActive) {
+      // Split-pane focus change on an already-active terminal: only update DOM/PTY focus
+      // without re-running WebGL warm refresh, renderer wake, scroll snap, or full repaint.
+      const id = requestAnimationFrame(() => {
+        if (termRef.current !== term || !activeRef.current) return;
+        const curConnId = localConnRef.current;
+        if (focusedRef.current) {
+          if (term.textarea) term.textarea.focus({ preventScroll: true });
+          else term.focus();
+        }
+        if (curConnId) {
+          void localTermFocus(curConnId, focusedRef.current);
+        }
+      });
+      return () => {
+        cancelAnimationFrame(id);
+      };
+    }
     pendingViewportSyncRef.current = true;
     onActivatedAttachRef.current?.();
-    attachWebglRef.current?.();
-    if (webglRef.current) refreshWarmWebglAddon(webglRef.current);
-    const term = termRef.current;
     const stickToBottom = wasAtBottomRef.current;
     const savedOffset = savedOffsetFromBottomRef.current;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
     const hostEl = hostRef.current;
     const w0 = hostEl?.clientWidth ?? 0;
     const h0 = hostEl?.clientHeight ?? 0;
-    const wokeOrNeedsRefresh = wakeTerminalRendererImmediate(term);
     const canOwnPane = focusedRef.current || windowOwnsActivePane();
-    if (w0 >= 180 && h0 >= 90 && ((externalSizeOverrideRef.current && canOwnPane) || term.cols < 24 || term.rows < 6)) {
-      lastObservedBoxRef.current = { w: w0, h: h0 };
-      syncResize(term, canOwnPane);
-    } else if (externalSizeOverrideRef.current) {
-      lastResizeSigRef.current = "";
-    }
-    if (snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
-      pendingViewportSyncRef.current = false;
-    }
-    if (wokeOrNeedsRefresh || dirtyWhileInactiveRef.current || !webglRef.current) {
-      dirtyWhileInactiveRef.current = false;
-      paintTerminalViewportImmediate(term);
-    }
+
+    const phase0 = runTerminalActivationPhase0({
+      getWebgl: () => webglRef.current,
+      touchWarmWebgl: () => touchWarmWebglRef.current?.(),
+      refreshWarmWebgl: (addon) => refreshWarmWebglAddon(addon),
+      wakeRenderer: () => wakeTerminalRendererImmediate(term),
+      maybeResize: () => {
+        if (w0 >= 180 && h0 >= 90 && ((externalSizeOverrideRef.current && canOwnPane) || term.cols < 24 || term.rows < 6)) {
+          lastObservedBoxRef.current = { w: w0, h: h0 };
+          syncResize(term, canOwnPane);
+        } else if (externalSizeOverrideRef.current) {
+          lastResizeSigRef.current = "";
+        }
+      },
+      snapViewport: () => {
+        if (snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
+          pendingViewportSyncRef.current = false;
+        }
+      },
+      isDirtyWhileInactive: () => dirtyWhileInactiveRef.current,
+      clearDirtyWhileInactive: () => {
+        dirtyWhileInactiveRef.current = false;
+      },
+      paintViewport: () => paintTerminalViewportImmediate(term),
+    });
+
     const id = requestAnimationFrame(() => {
       onActivatedAttachRef.current?.();
       if (termRef.current !== term || !activeRef.current) return;
-      attachWebglRef.current?.();
-      if (dirtyWhileInactiveRef.current) {
-        dirtyWhileInactiveRef.current = false;
-        term.refresh(0, Math.max(0, term.rows - 1));
-      }
+      runTerminalActivationPhase1(
+        {
+          getWebgl: () => webglRef.current,
+          attachWebgl: () => attachWebglRef.current?.(),
+          isDirtyWhileInactive: () => dirtyWhileInactiveRef.current,
+          clearDirtyWhileInactive: () => {
+            dirtyWhileInactiveRef.current = false;
+          },
+          refreshFullViewport: () => {
+            try {
+              term.refresh(0, Math.max(0, term.rows - 1));
+            } catch {
+              // ignore if terminal is tearing down
+            }
+          },
+        },
+        phase0,
+      );
       const w = hostRef.current?.clientWidth ?? 0;
       const h = hostRef.current?.clientHeight ?? 0;
       if (w >= 180 && h >= 90) {

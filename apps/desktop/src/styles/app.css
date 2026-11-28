@@ -798,7 +798,11 @@ a {
 
 /* Save GPU compositor wakeups & battery when window loses focus or tab is in background. */
 html[data-app-focused="false"] *,
-.v3-tab-layer.is-hidden * {
+html[data-app-focused="false"] *::before,
+html[data-app-focused="false"] *::after,
+.v3-tab-layer.is-hidden *,
+.v3-tab-layer.is-hidden *::before,
+.v3-tab-layer.is-hidden *::after {
   animation-play-state: paused !important;
 }
 
@@ -1962,7 +1966,7 @@ html[data-app-focused="false"] *,
    Desktop v2 (docs/design/desktop-v2.md)
    ---------------------------------------------------------------------------------------- */
 
-/* Energy: nothing endless runs while the window is hidden, on low power, or with reduced motion. */
+/* Energy: nothing endless runs while the window is hidden, blurred, on low power, or with reduced motion. */
 :root[data-idle] *,
 :root[data-idle] *::before,
 :root[data-idle] *::after,
@@ -1973,11 +1977,106 @@ html[data-app-focused="false"] *,
   transition-duration: 0.01ms !important;
 }
 
+/* Visible-unfocused or user-idle windows pause animations without disturbing one-shot transitions. */
+:root[data-blurred] *,
+:root[data-blurred] *::before,
+:root[data-blurred] *::after,
+:root[data-user-idle] *,
+:root[data-user-idle] *::before,
+:root[data-user-idle] *::after {
+  animation-play-state: paused !important;
+}
+
+/* Detach endless decorative/spinner animations completely under idle/calm/blurred/user-idle so WKWebView's
+   120Hz ProMotion CVDisplayLink can stop while keeping colored dots, rings, and icons clearly visible. */
+:root[data-idle] .status-dot.breathe,
+:root[data-calm] .status-dot.breathe,
+:root[data-blurred] .status-dot.breathe,
+:root[data-user-idle] .status-dot.breathe,
+:root[data-idle] .xiaoyang-orb .ring-outer,
+:root[data-calm] .xiaoyang-orb .ring-outer,
+:root[data-blurred] .xiaoyang-orb .ring-outer,
+:root[data-user-idle] .xiaoyang-orb .ring-outer,
+:root[data-idle] .xiaoyang-orb img,
+:root[data-calm] .xiaoyang-orb img,
+:root[data-blurred] .xiaoyang-orb img,
+:root[data-user-idle] .xiaoyang-orb img,
+:root[data-idle] .web-ai-dot,
+:root[data-calm] .web-ai-dot,
+:root[data-blurred] .web-ai-dot,
+:root[data-user-idle] .web-ai-dot,
+:root[data-idle] .update-toast-fill.pulse,
+:root[data-calm] .update-toast-fill.pulse,
+:root[data-blurred] .update-toast-fill.pulse,
+:root[data-user-idle] .update-toast-fill.pulse,
+:root[data-idle] .act-spin,
+:root[data-calm] .act-spin,
+:root[data-blurred] .act-spin,
+:root[data-user-idle] .act-spin,
+:root[data-idle] .chat-typing-dots span,
+:root[data-calm] .chat-typing-dots span,
+:root[data-blurred] .chat-typing-dots span,
+:root[data-user-idle] .chat-typing-dots span,
+:root[data-idle] .sub-cat-dot,
+:root[data-calm] .sub-cat-dot,
+:root[data-blurred] .sub-cat-dot,
+:root[data-user-idle] .sub-cat-dot,
+:root[data-idle] .sub-pop-refresh svg.spin,
+:root[data-calm] .sub-pop-refresh svg.spin,
+:root[data-blurred] .sub-pop-refresh svg.spin,
+:root[data-user-idle] .sub-pop-refresh svg.spin,
+:root[data-idle] .port-pill-dot,
+:root[data-calm] .port-pill-dot,
+:root[data-blurred] .port-pill-dot,
+:root[data-user-idle] .port-pill-dot,
+:root[data-idle] .port-pop-refresh svg.spin,
+:root[data-calm] .port-pop-refresh svg.spin,
+:root[data-blurred] .port-pop-refresh svg.spin,
+:root[data-user-idle] .port-pop-refresh svg.spin,
+:root[data-idle] .t3-live-shine,
+:root[data-calm] .t3-live-shine,
+:root[data-blurred] .t3-live-shine,
+:root[data-user-idle] .t3-live-shine,
+:root[data-idle] .inst-ic-dot,
+:root[data-calm] .inst-ic-dot,
+:root[data-blurred] .inst-ic-dot,
+:root[data-user-idle] .inst-ic-dot,
+:root[data-idle] .aib-pulse-dot,
+:root[data-calm] .aib-pulse-dot,
+:root[data-blurred] .aib-pulse-dot,
+:root[data-user-idle] .aib-pulse-dot,
+:root[data-idle] .tour-spotlight-ring,
+:root[data-calm] .tour-spotlight-ring,
+:root[data-blurred] .tour-spotlight-ring,
+:root[data-user-idle] .tour-spotlight-ring,
+:root[data-idle] .pk-spin,
+:root[data-calm] .pk-spin,
+:root[data-blurred] .pk-spin,
+:root[data-user-idle] .pk-spin,
+:root[data-idle] .mm-spin,
+:root[data-calm] .mm-spin,
+:root[data-blurred] .mm-spin,
+:root[data-user-idle] .mm-spin,
+:root[data-idle] .call-mini-wave span,
+:root[data-calm] .call-mini-wave span,
+:root[data-blurred] .call-mini-wave span,
+:root[data-user-idle] .call-mini-wave span {
+  animation: none !important;
+}
+
 /* Finite entrance animations (starting at opacity: 0) must skip rather than freeze invisible when unfocused or idle. */
 html[data-app-focused="false"] .settings-frame[data-state="open"],
 html[data-app-focused="false"] .v3-droplet,
 html[data-app-focused="false"] .v3-chord-hud,
 html[data-app-focused="false"] .update-toast-card,
+:root[data-blurred] .settings-frame[data-state="open"],
+:root[data-blurred] .v3-droplet,
+:root[data-blurred] .v3-chord-hud,
+:root[data-blurred] .update-toast-card,
+:root[data-user-idle] .settings-frame[data-state="open"],
+:root[data-user-idle] .v3-droplet,
+:root[data-user-idle] .v3-chord-hud,
+:root[data-user-idle] .update-toast-card,
 :root[data-idle] .settings-frame[data-state="open"],
 :root[data-idle] .v3-droplet,
 :root[data-idle] .v3-chord-hud,
@@ -5347,6 +5446,12 @@ html[data-app-focused="false"] .update-toast-card,
 html[data-app-focused="false"] .usage-vial-wave-front,
 html[data-app-focused="false"] .usage-vial-wave-back,
 html[data-app-focused="false"] .usage-vial-bubble,
+:root[data-blurred] .usage-vial-wave-front,
+:root[data-blurred] .usage-vial-wave-back,
+:root[data-blurred] .usage-vial-bubble,
+:root[data-user-idle] .usage-vial-wave-front,
+:root[data-user-idle] .usage-vial-wave-back,
+:root[data-user-idle] .usage-vial-bubble,
 :root[data-idle] .usage-vial-wave-front,
 :root[data-idle] .usage-vial-wave-back,
 :root[data-idle] .usage-vial-bubble,
@@ -5354,7 +5459,7 @@ html[data-app-focused="false"] .usage-vial-bubble,
 :root[data-calm] .usage-vial-wave-back,
 :root[data-calm] .usage-vial-bubble {
   will-change: auto;
-  animation-play-state: paused !important;
+  animation: none !important;
 }
 
 @media (prefers-reduced-motion: reduce) {

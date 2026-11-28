@@ -3,8 +3,8 @@
 // real location (symlinks followed) and checked to be inside the folder's real location. Files that
 // may hold keys are listed but never read, and so is this computer's own herdr-pocket folder.
 
-import { execFile } from "node:child_process";
-import { open, readdir, realpath, stat } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { open, readdir, realpath, stat, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
@@ -20,6 +20,60 @@ export class FilesError extends Error {
   constructor(code: FilesErrorCode, message: string) {
     super(message);
     this.code = code;
+  }
+}
+
+const ICLOUD_DATALESS_MESSAGE = "该文件目前仅保存在 iCloud 云端，已尝试触发本机下载，请稍候重试或在 Finder 中下载";
+const ICLOUD_DOWNLOAD_COOLDOWN_MS = 60_000;
+const ICLOUD_DOWNLOAD_MAX_CACHE = 256;
+const icloudDownloadCooldown = new Map<string, number>();
+
+/** True when reading a macOS iCloud dataless file fails with errno -11 / EDEADLK. */
+export function isMacDatalessError(err: unknown, plat: NodeJS.Platform = process.platform): boolean {
+  if (plat !== "darwin" || !err || typeof err !== "object") return false;
+  const e = err as { errno?: unknown; code?: unknown };
+  return e.errno === -11 || e.code === "EDEADLK";
+}
+
+function triggerMacICloudDownload(realPath: string): void {
+  if (process.platform !== "darwin") return;
+  const now = Date.now();
+  const last = icloudDownloadCooldown.get(realPath);
+  if (last !== undefined && now - last < ICLOUD_DOWNLOAD_COOLDOWN_MS) return;
+  if (icloudDownloadCooldown.size >= ICLOUD_DOWNLOAD_MAX_CACHE) {
+    const oldest = icloudDownloadCooldown.keys().next().value;
+    if (oldest !== undefined) icloudDownloadCooldown.delete(oldest);
+  }
+  icloudDownloadCooldown.set(realPath, now);
+  try {
+    const child = spawn("/usr/bin/brctl", ["download", realPath], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // Best-effort only; ignore spawn errors.
+  }
+}
+
+export async function readHandleSlice(
+  fh: Pick<FileHandle, "read">,
+  realPath: string,
+  buf: Buffer,
+  offset: number,
+  length: number,
+  position: number,
+  opts?: { platform?: NodeJS.Platform; triggerDownload?: (p: string) => void },
+): Promise<number> {
+  try {
+    return (await fh.read(buf, offset, length, position)).bytesRead;
+  } catch (e) {
+    if (isMacDatalessError(e, opts?.platform ?? process.platform)) {
+      (opts?.triggerDownload ?? triggerMacICloudDownload)(realPath);
+      throw new FilesError("not_found", ICLOUD_DATALESS_MESSAGE);
+    }
+    throw e;
   }
 }
 
@@ -111,6 +165,24 @@ export function isPrivateName(name: string): boolean {
   return PRIVATE_NAME.test(name);
 }
 
+/**
+ * True when any path contains a `.agents` segment followed by a `credentials` segment
+ * (e.g. `~/.agents/credentials` or `~/.agents/<profile>/credentials`), regardless of OS or username.
+ */
+export function isPrivateAgentCredentialsPath(p: string): boolean {
+  const segs = p.split(/[\\/]+/).filter(Boolean);
+  let sawAgents = false;
+  for (const seg of segs) {
+    const low = seg.toLowerCase();
+    if (low === ".agents") {
+      sawAgents = true;
+    } else if (sawAgents && low === "credentials") {
+      return true;
+    }
+  }
+  return false;
+}
+
 function expandHome(p: string): string {
   if (p === "~") return homedir();
   if (p.startsWith("~/") || (sep === "\\" && p.startsWith("~\\"))) return join(homedir(), p.slice(2));
@@ -149,6 +221,9 @@ export async function resolveInside(root: string | undefined, rel: unknown, o: F
   if (looksAbsOrHome) {
     const candidate = expandHome(raw);
     if (!isAbsolute(candidate)) throw new FilesError("bad_request", "路径要相对于 agent 的工作目录");
+    if (isPrivateAgentCredentialsPath(candidate)) {
+      throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
+    }
     let real: string;
     try {
       real = await realpath(candidate);
@@ -159,7 +234,7 @@ export async function resolveInside(root: string | undefined, rel: unknown, o: F
     const matchedRoot = allowedRoots.find((base) => inside(base, real));
     if (!matchedRoot) throw new FilesError("forbidden", "不能看工作目录以外的文件");
     const relFromRoot = relative(matchedRoot, real).split(sep).filter(Boolean);
-    if (relFromRoot.some(isPrivateName) || isPrivateName(basename(real))) {
+    if (relFromRoot.some(isPrivateName) || isPrivateName(basename(real)) || isPrivateAgentCredentialsPath(real)) {
       throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
     }
     for (const dir of o.privateDirs ?? []) {
@@ -174,7 +249,9 @@ export async function resolveInside(root: string | undefined, rel: unknown, o: F
 
   const parts = raw.split("/").filter((p) => p && p !== ".");
   if (parts.includes("..")) throw new FilesError("forbidden", "不能看工作目录以外的文件");
-  if (parts.some(isPrivateName)) throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
+  if (parts.some(isPrivateName) || isPrivateAgentCredentialsPath(parts.join("/"))) {
+    throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
+  }
   let real: string;
   try {
     real = await realpath(join(realRoot, ...parts));
@@ -184,6 +261,9 @@ export async function resolveInside(root: string | undefined, rel: unknown, o: F
   const matchedExtra = !inside(realRoot, real) ? resolvedExtras.find((base) => inside(base, real)) : undefined;
   if (!inside(realRoot, real) && !matchedExtra) {
     throw new FilesError("forbidden", "这个链接指向工作目录以外，不能打开");
+  }
+  if (isPrivateAgentCredentialsPath(real)) {
+    throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
   }
   if (matchedExtra) {
     const extraParts = relative(matchedExtra, real).split(sep).filter(Boolean);
@@ -248,6 +328,7 @@ async function findWorkspaceFileBySuffix(
       if (!isExact && !isCi) continue;
       const real = await realpath(full).catch(() => null);
       if (!real || !inside(realRoot, real)) continue;
+      if (isPrivateAgentCredentialsPath(real)) continue;
       if (realPrivates.some((dir) => inside(dir, real))) continue;
       const depth = rel.split("/").length - 1;
       if (isExact) {
@@ -333,7 +414,7 @@ async function searchArtifactRootsBySuffix(
       const st = await stat(real).catch(() => null);
       if (!st?.isFile()) continue;
       const relParts = relative(allowedParent, real).split(sep).filter(Boolean);
-      if (relParts.some(isPrivateName) || isPrivateName(basename(real))) continue;
+      if (relParts.some(isPrivateName) || isPrivateName(basename(real)) || isPrivateAgentCredentialsPath(real)) continue;
       if (realPrivates.some((dir) => inside(dir, real))) continue;
       return { realRoot: allowedParent, real, rel: relParts.join("/") || basename(real) };
     }
@@ -376,7 +457,7 @@ async function searchArtifactRootsBySuffix(
         const real = await realpath(full).catch(() => null);
         if (!real || !inside(allowedParent, real)) continue;
         const relParts = relative(allowedParent, real).split(sep).filter(Boolean);
-        if (relParts.some(isPrivateName) || isPrivateName(basename(real))) continue;
+        if (relParts.some(isPrivateName) || isPrivateName(basename(real)) || isPrivateAgentCredentialsPath(real)) continue;
         if (realPrivates.some((dir) => inside(dir, real))) continue;
         const st = await stat(real).catch(() => null);
         if (!st?.isFile()) continue;
@@ -517,7 +598,7 @@ export async function listFiles(
     const e: FileEntry = { name: d.name, path, kind: d.isDirectory() ? "dir" : "file" };
     if (hidden) e.hidden = true;
     if (ignored) e.ignored = true;
-    if (isPrivateName(d.name)) e.private = true;
+    if (isPrivateName(d.name) || isPrivateAgentCredentialsPath(full)) e.private = true;
     try {
       if (d.isSymbolicLink()) {
         const target = await realpath(full).catch(() => undefined);
@@ -576,6 +657,10 @@ export async function readFileSlice(
   try {
     fh = await open(real, "r");
   } catch (e) {
+    if (isMacDatalessError(e)) {
+      triggerMacICloudDownload(real);
+      throw new FilesError("not_found", ICLOUD_DATALESS_MESSAGE);
+    }
     throw new FilesError("forbidden", `读不了这个文件（${(e as NodeJS.ErrnoException).code ?? "error"}）`);
   }
   try {
@@ -583,21 +668,21 @@ export async function readFileSlice(
     if (mime) {
       if (size > FILES_LIMITS.image) return { ...base, binary: true, kind: "image", truncated: true, offset: 0, bytes: 0, mime };
       const buf = Buffer.alloc(size);
-      const { bytesRead } = await fh.read(buf, 0, size, 0);
+      const bytesRead = await readHandleSlice(fh, real, buf, 0, size, 0);
       return { ...base, binary: true, kind: "image", truncated: false, offset: 0, bytes: bytesRead, mime, base64: buf.subarray(0, bytesRead).toString("base64") };
     }
     const media = MEDIA_MIME[ext];
     if (media) {
       if (size > MEDIA_MAX_BYTES) return { ...base, binary: true, kind: media.kind, truncated: true, offset: 0, bytes: 0, mime: media.mime };
       const buf = Buffer.alloc(size);
-      const { bytesRead } = await fh.read(buf, 0, size, 0);
+      const bytesRead = await readHandleSlice(fh, real, buf, 0, size, 0);
       return { ...base, binary: true, kind: media.kind, truncated: false, offset: 0, bytes: bytesRead, mime: media.mime, base64: buf.subarray(0, bytesRead).toString("base64") };
     }
     const office = OFFICE_MIME[ext];
     if (office) {
       if (size > OFFICE_MAX_BYTES) return { ...base, binary: true, kind: office.kind, truncated: true, offset: 0, bytes: 0, mime: office.mime };
       const buf = Buffer.alloc(size);
-      const { bytesRead } = await fh.read(buf, 0, size, 0);
+      const bytesRead = await readHandleSlice(fh, real, buf, 0, size, 0);
       const slice = buf.subarray(0, bytesRead);
       let text: string | undefined;
       if (ext === "rtf" && !looksBinary(slice.subarray(0, Math.min(SNIFF_BYTES, slice.length)))) {
@@ -631,11 +716,11 @@ export async function readFileSlice(
       };
     }
     const sniff = Buffer.alloc(Math.min(SNIFF_BYTES, size));
-    const sniffed = (await fh.read(sniff, 0, sniff.length, 0)).bytesRead;
+    const sniffed = await readHandleSlice(fh, real, sniff, 0, sniff.length, 0);
     if (looksBinary(sniff.subarray(0, sniffed))) return { ...base, binary: true, kind: "binary", truncated: false, offset: 0, bytes: 0 };
     const want = Math.min(maxBytes + 4, size - offset);
     const buf = Buffer.alloc(want);
-    const got = (await fh.read(buf, 0, want, offset)).bytesRead;
+    const got = await readHandleSlice(fh, real, buf, 0, want, offset);
     // An offset in the middle of a character starts at the next one.
     let start = 0;
     while (start < got && start < 4 && (buf[start]! & 0xc0) === 0x80) start++;
@@ -693,7 +778,7 @@ export async function listFolders(
   const resolvedPrivate = await Promise.all((o.privateDirs ?? []).map((dir) => realpath(dir).catch(() => dir)));
   const isRestricted = (p: string): boolean => {
     const parts = p.split(/[\\/]+/).filter(Boolean);
-    if (parts.some(isPrivateName)) return true;
+    if (parts.some(isPrivateName) || isPrivateAgentCredentialsPath(p)) return true;
     return resolvedPrivate.some((dir) => inside(dir, p));
   };
   if (isRestricted(real)) throw new FilesError("forbidden", "这个目录可能存有密钥或私有配置，不能浏览");

@@ -10,7 +10,9 @@ import {
   HcAdapter,
   demotedFinishedStatus,
   detectDismissableSubscreen,
+  detectScreenInteraction,
   endsInPanel,
+  hasIdleComposerScreen,
   isFalseAntigravityReviewBlock,
   isFalseAntigravityWorkingState,
   isFalseBlockedCandidate,
@@ -698,14 +700,45 @@ test("isFalseAntigravityWorkingState demotes idle footer with background tasks w
   );
 });
 
-test("demotedFinishedStatus preserves done for unseen turns and returns idle when seen or turn 0", () => {
+test("demotedFinishedStatus returns idle when turn is missing/0 or seen >= turn, and done only when turn > 0 and unseen", () => {
   assert.equal(demotedFinishedStatus(undefined), "idle");
   assert.equal(demotedFinishedStatus({ address: "t0", turn: 0, labels: {} }), "idle");
+  assert.equal(demotedFinishedStatus({ address: "t0b", turn: 0, labels: { "herdr.seen": "0" } }), "idle");
+  assert.equal(demotedFinishedStatus({ address: "t0c", labels: { "herdr.seen": "5" } }), "idle");
   assert.equal(demotedFinishedStatus({ address: "t1", turn: 3, labels: {} }), "done");
   assert.equal(demotedFinishedStatus({ address: "t2", turn: 63, labels: { "herdr.seen": "25" } }), "done");
   assert.equal(demotedFinishedStatus({ address: "t3", turn: 1, labels: { "herdr.seen": "" } }), "done");
   assert.equal(demotedFinishedStatus({ address: "t4", turn: 26, labels: { "herdr.seen": "26" } }), "idle");
   assert.equal(demotedFinishedStatus({ address: "t5", turn: 26, labels: { "herdr.seen": "30" } }), "idle");
+  // Malformed non-string herdr.seen values must never throw.
+  assert.equal(
+    demotedFinishedStatus({ address: "t6", turn: 2, labels: { "herdr.seen": 2 as unknown as string } }),
+    "idle",
+  );
+  assert.equal(
+    demotedFinishedStatus({ address: "t7", turn: 2, labels: { "herdr.seen": null as unknown as string } }),
+    "done",
+  );
+});
+
+test("HcAdapter.list recovers cleanly when an in-flight call rejects instead of poisoning listTrailing", async () => {
+  const hc = new HcAdapter();
+  let calls = 0;
+  (hc as unknown as { oneShot(m: string, p: unknown): Promise<unknown> }).oneShot = async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("transient boom");
+    return {
+      result: {
+        terminals: [{ address: "t-ok", state: "live", status: { app: "codex", state: "idle" }, turn: 1 }],
+      },
+    };
+  };
+  const p1 = hc.list();
+  const p2 = hc.list();
+  await assert.rejects(p1, /transient boom/);
+  await p2;
+  assert.equal(calls, 2);
+  assert.equal(hc.terminals.has("t-ok"), true);
 });
 
 test("isFalseBlockedState demotes stale idle blocks across harnesses while enforcing all Hard Vetoes", () => {
@@ -1104,5 +1137,704 @@ process.stdin.on("data", (d) => {
     assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "done");
   } finally {
     hc.stop();
+  }
+});
+
+test("HcAdapter.setAll skips emitting change when the live terminal snapshot is identical", () => {
+  const hc = new HcAdapter("nonexistent-hc-bin");
+  let emissions = 0;
+  hc.on("change", () => {
+    emissions += 1;
+  });
+  const setAll = (hc as unknown as { setAll(list: unknown[]): void }).setAll.bind(hc);
+
+  const t1 = { address: "t1", state: "live", status: { app: "claude-code", state: "idle" }, turn: 2, labels: {} };
+  const t2 = { address: "t2", state: "live", status: { app: "omp", state: "working" }, turn: 1, labels: {} };
+  const finished = { address: "t3", state: "finished", status: { app: "omp", state: "done" }, turn: 1, labels: {} };
+
+  setAll([t1, t2, finished]);
+  assert.equal(emissions, 1);
+
+  // Exact same live snapshot (even in different array order or with different finished terminals): no duplicate emit.
+  setAll([t2, t1]);
+  assert.equal(emissions, 1);
+  setAll([{ ...t1 }, { ...t2 }, { ...finished, turn: 9 }]);
+  assert.equal(emissions, 1);
+
+  // Actual terminal state change emits again.
+  setAll([{ ...t1, status: { app: "claude-code", state: "working" } }, t2]);
+  assert.equal(emissions, 2);
+});
+
+test("HcAdapter.setAll merges turn/labels/herdr.seen monotonically, rejects stale generations, and coalesces concurrent list()", async () => {
+  const hc = new HcAdapter("nonexistent-hc-bin");
+  const setAll = (hc as unknown as { setAll(list: unknown[], gen?: number): void }).setAll.bind(hc);
+
+  // Initial snapshot with turn 5, herdr.seen = 5 (idle)
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 1000,
+        status: { app: "claude-code", state: "done" },
+        turn: 5,
+        labels: { "herdr.seen": "5", where: "Main / 1" },
+      },
+    ],
+    2,
+  );
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+
+  // Stale generation (gen 1 < appliedListGen 2) MUST be ignored completely.
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 1000,
+        status: { app: "claude-code", state: "working" },
+        turn: 4,
+        labels: { "herdr.seen": "3" },
+      },
+    ],
+    1,
+  );
+  assert.equal(hc.terminals.get("t1")?.turn, 5);
+  assert.equal(hc.terminals.get("t1")?.labels?.["herdr.seen"], "5");
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+
+  // Newer generation omitting turn/labels or reporting regressed turn/herdr.seen MUST NOT regress same terminal.
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 1000,
+        status: { app: "claude-code", state: "done" },
+      },
+    ],
+    3,
+  );
+  assert.equal(hc.terminals.get("t1")?.turn, 5);
+  assert.equal(hc.terminals.get("t1")?.labels?.["herdr.seen"], "5");
+  assert.equal(hc.terminals.get("t1")?.labels?.where, "Main / 1");
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 1000,
+        status: { app: "claude-code", state: "done" },
+        turn: 4,
+        labels: { "herdr.seen": "3" },
+      },
+    ],
+    4,
+  );
+  assert.equal(hc.terminals.get("t1")?.turn, 5);
+  assert.equal(hc.terminals.get("t1")?.labels?.["herdr.seen"], "5");
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+
+  // recordSeenWatermark advances watermark immediately and monotonically.
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 1000,
+        status: { app: "claude-code", state: "done" },
+        turn: 6,
+        labels: { "herdr.seen": "5" },
+      },
+    ],
+    5,
+  );
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "done");
+  assert.equal(hc.recordSeenWatermark("t1", 6), true);
+  assert.equal(hc.recordSeenWatermark("t1", 4), false); // never decreases
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+
+  // Even a subsequent snapshot missing herdr.seen cannot bounce back to "done".
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 1000,
+        status: { app: "claude-code", state: "done" },
+        turn: 6,
+        labels: {},
+      },
+    ],
+    6,
+  );
+  assert.equal(hc.terminals.get("t1")?.labels?.["herdr.seen"], "6");
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+
+  // Freshly recreated terminal with newer created_ms DOES reset turn and labels cleanly.
+  setAll(
+    [
+      {
+        address: "t1",
+        state: "live",
+        created_ms: 2000,
+        status: { app: "claude-code", state: "done" },
+        turn: 1,
+        labels: {},
+      },
+    ],
+    7,
+  );
+  assert.equal(hc.terminals.get("t1")?.turn, 1);
+  assert.equal(hc.terminals.get("t1")?.labels?.["herdr.seen"], undefined);
+  assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "done");
+
+  // Single-flight coalescing on list(): 4 concurrent callers run at most 2 oneShot passes (1 in-flight + 1 trailing).
+  let oneShotCalls = 0;
+  let releaseFirst!: () => void;
+  (hc as unknown as { oneShot: (m: string, p: unknown) => Promise<unknown> }).oneShot = async () => {
+    oneShotCalls += 1;
+    const callNum = oneShotCalls;
+    if (callNum === 1) {
+      await new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+    }
+    return {
+      result: {
+        terminals: [
+          {
+            address: "t1",
+            state: "live",
+            created_ms: 2000,
+            status: { app: "claude-code", state: "done" },
+            turn: callNum,
+            labels: {},
+          },
+        ],
+      },
+    };
+  };
+  const p1 = hc.list();
+  const p2 = hc.list();
+  const p3 = hc.list();
+  const p4 = hc.list();
+  assert.equal(oneShotCalls, 1, "concurrent list() callers coalesce behind active single-flight request");
+  releaseFirst();
+  await Promise.all([p1, p2, p3, p4]);
+  assert.equal(oneShotCalls, 2, "queued callers trigger exactly one trailing re-list");
+  assert.equal(hc.terminals.get("t1")?.turn, 2);
+});
+
+test("Host agent.seen enforces turn guard, prevents bounce via watermark, handles native herdr TUI, and CAS-guards async screen scans", async () => {
+  const frames: any[] = [];
+  const wss = new WebSocketServer({ noServer: true });
+  const server = createServer();
+  server.on("upgrade", (req, socket, head) =>
+    wss.handleUpgrade(req, socket, head, (ws) => ws.on("message", (d) => frames.push(JSON.parse(d.toString())))),
+  );
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+
+  const h = new Host({
+    config: { server: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, token: "t", deviceId: "d1", name: "test-host" },
+    log: () => {},
+  });
+
+  const labelsSet: Array<{ addr: string; labels: Record<string, string> }> = [];
+  h.hc.terminals.set("t-turn", {
+    address: "t-turn",
+    state: "live",
+    created_ms: 100,
+    status: { app: "claude-code", state: "done" },
+    status_ms: 100,
+    turn: 8,
+    labels: { "herdr.seen": "6" },
+  });
+  h.hc.terminals.set("t-cas", {
+    address: "t-cas",
+    state: "live",
+    created_ms: 100,
+    status: { app: "antigravity", state: "working" },
+    status_ms: 100,
+    turn: 4,
+    labels: {},
+  });
+  h.herdr.agents = [
+    {
+      terminal_id: "ht1",
+      pane_id: "p1",
+      agent: "claude-code",
+      title: "Native Herdr Agent",
+      agent_status: "done",
+    },
+  ];
+
+  // Simulate hc.label writing to core without mutating hc.terminals directly, and hc.list returning a stale snapshot lacking herdr.seen.
+  h.hc.label = async (addr, labels) => {
+    labelsSet.push({ addr, labels });
+  };
+  (h.hc as unknown as { oneShot: (m: string, p: unknown) => Promise<unknown> }).oneShot = async () => ({
+    result: {
+      terminals: [
+        {
+          address: "t-turn",
+          state: "live",
+          created_ms: 100,
+          status: { app: "claude-code", state: "done" },
+          status_ms: 100,
+          turn: 8,
+          labels: { "herdr.seen": "6" },
+        },
+        h.hc.terminals.get("t-cas")!,
+      ],
+    },
+  });
+
+  // Simulate a slow screen scan for t-cas whose raw state transitions while snapshotWithMeta is in flight.
+  const agyIdleBgScreen = [
+    "Done.",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon · 12% ctx · idle",
+  ].join("\n");
+  h.hc.snapshotWithMeta = async (addr) => {
+    if (addr === "t-cas") {
+      // Mid-read transition: new turn 5 starts working!
+      h.hc.terminals.set("t-cas", {
+        address: "t-cas",
+        state: "live",
+        created_ms: 100,
+        status: { app: "antigravity", state: "working" },
+        status_ms: 999,
+        turn: 5,
+        labels: {},
+      });
+      return { text: agyIdleBgScreen, cols: 100, rows: 30, altScreen: false, ansi: "" };
+    }
+    return { text: "", cols: 100, rows: 30, altScreen: false, ansi: "" };
+  };
+  h.hc.read = async () => ({ text: "" });
+
+  try {
+    (h as unknown as { connect(): void }).connect();
+    for (let i = 0; i < 100 && !h.connected; i++) await wait(15);
+
+    h.agents = h.collect();
+    assert.equal(h.agents.find((a) => a.localId === "t-turn")?.status, "done");
+    assert.equal(h.agents.find((a) => a.localId === "ht1")?.status, "done");
+
+    // 1. CAS guard: stale screen scan from turn 4 MUST NOT demote turn 5!
+    await (h as unknown as { refreshScreenQueues(): Promise<void> }).refreshScreenQueues();
+    const afterCas = h.collect();
+    assert.equal(afterCas.find((a) => a.localId === "t-cas")?.status, "working");
+
+    // 2. Stale agent.seen with turn 7 < current turn 8 MUST be ignored (no label write, stays "done").
+    await (h as unknown as { handleRpc(f: unknown): Promise<void> }).handleRpc({
+      type: "rpc",
+      id: "seen-stale",
+      from: "relay",
+      method: "agent.seen",
+      params: { agent: "d1/hc:t-turn", turn: 7 },
+    });
+    assert.deepEqual(labelsSet, []);
+    assert.equal(h.collect().find((a) => a.localId === "t-turn")?.status, "done");
+
+    // 3. Matching turn 8 succeeds, writes herdr.seen=8, watermark survives stale hc.list() with zero bounce!
+    await (h as unknown as { handleRpc(f: unknown): Promise<void> }).handleRpc({
+      type: "rpc",
+      id: "seen-ok",
+      from: "relay",
+      method: "agent.seen",
+      params: { agent: "d1/hc:t-turn", turn: 8 },
+    });
+    assert.deepEqual(labelsSet, [{ addr: "t-turn", labels: { "herdr.seen": "8" } }]);
+    assert.equal(h.hc.terminals.get("t-turn")?.labels?.["herdr.seen"], "8");
+    assert.equal(h.agents.find((a) => a.localId === "t-turn")?.status, "idle");
+
+    // 4. Native herdr TUI agent.seen transitions "done" -> "idle", and clears when a new turn works and finishes.
+    await (h as unknown as { handleRpc(f: unknown): Promise<void> }).handleRpc({
+      type: "rpc",
+      id: "seen-herdr",
+      from: "relay",
+      method: "agent.seen",
+      params: { agent: "d1/herdr:ht1" },
+    });
+    assert.equal(h.agents.find((a) => a.localId === "ht1")?.status, "idle");
+
+    h.herdr.agents = [{ ...h.herdr.agents[0]!, agent_status: "working" }];
+    assert.equal(h.collect().find((a) => a.localId === "ht1")?.status, "working");
+    h.herdr.agents = [{ ...h.herdr.agents[0]!, agent_status: "done" }];
+    assert.equal(h.collect().find((a) => a.localId === "ht1")?.status, "done");
+  } finally {
+    h.stop();
+    for (const c of wss.clients) c.terminate();
+    wss.close();
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("detectScreenInteraction detects Ask menus and approvals across all harnesses while rejecting idle composers and viewers", () => {
+  // 1. Antigravity (? ... + ❯ 1. ...)
+  const agyAsk = [
+    "? Which deployment strategy should we use?",
+    "❯ 1. Canary rollout (Recommended)",
+    "  2. Blue-green swap",
+    "  3. Other",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    "Gemini 4 Neon (XHigh) · 20% ctx · working",
+  ].join("\n");
+  const agyRes = detectScreenInteraction(agyAsk, { harness: "antigravity" });
+  assert.equal(agyRes?.kind, "question");
+  assert.equal(agyRes?.source, "terminal");
+  assert.equal(agyRes?.prompt, "Which deployment strategy should we use?");
+  assert.equal(agyRes?.multiSelect, false);
+  assert.equal(agyRes?.choices?.length, 3);
+  assert.equal(agyRes?.choices?.[0]?.selected, true);
+
+  // 2. Claude Code AskUserQuestion (numbered & checkbox multi-select)
+  const claudeMulti = [
+    "☐ Verification",
+    "Which checks should run before release?",
+    "❯ 1. [x] Typecheck",
+    "  2. [ ] Lint",
+    "  3. [x] Unit tests",
+    "Enter to select · Space to toggle · Esc to cancel",
+  ].join("\n");
+  const claudeRes = detectScreenInteraction(claudeMulti, { harness: "claude-code" });
+  assert.equal(claudeRes?.kind, "question");
+  assert.equal(claudeRes?.prompt, "Which checks should run before release?");
+  assert.equal(claudeRes?.multiSelect, true);
+  assert.deepEqual(
+    claudeRes?.choices?.map((c) => [c.key, c.label, c.checked]),
+    [
+      ["1", "Typecheck", true],
+      ["2", "Lint", false],
+      ["3", "Unit tests", true],
+    ],
+  );
+
+  // 3. OMP ask (radio + arrow-only under ? )
+  const ompRadio = [
+    "? Select target cluster",
+    "❯ ○ Staging",
+    "  ○ Production",
+    "↑/↓ navigate · Enter confirm · Esc cancel",
+  ].join("\n");
+  const ompRadioRes = detectScreenInteraction(ompRadio, { harness: "omp" });
+  assert.equal(ompRadioRes?.kind, "question");
+  assert.equal(ompRadioRes?.prompt, "Select target cluster");
+  assert.equal(ompRadioRes?.multiSelect, false);
+  assert.equal(ompRadioRes?.choices?.length, 2);
+
+  const ompArrow = [
+    "? Continue with migration?",
+    "❯ Run dry-run first",
+    "  Apply immediately",
+  ].join("\n");
+  const ompArrowRes = detectScreenInteraction(ompArrow, { harness: "omp" });
+  assert.equal(ompArrowRes?.kind, "question");
+  assert.equal(ompArrowRes?.prompt, "Continue with migration?");
+  assert.equal(ompArrowRes?.choices?.length, 2);
+
+  // 4. Codex request_user_input
+  const codexAsk = [
+    "Question 1/2",
+    "Keep legacy v1 API endpoints?",
+    "❯ 1. Yes, keep v1 endpoints (Recommended)",
+    "  2. Remove v1 endpoints",
+    "enter to submit · esc to cancel",
+  ].join("\n");
+  const codexRes = detectScreenInteraction(codexAsk, { harness: "codex" });
+  assert.equal(codexRes?.kind, "question");
+  assert.equal(codexRes?.prompt, "Keep legacy v1 API endpoints?");
+  assert.equal(codexRes?.choices?.length, 2);
+
+  // 5. Pi / Gemini CLI / OpenCode with full ANSI CSI + OSC sequences
+  const ansiMenu = [
+    "\x1b]0;gemini-cli\x07\x1b[?25l\x1b[38;5;208m? Choose package manager\x1b[0m",
+    "\x1b[1;32m❯ 1. pnpm\x1b[0m",
+    "\x1b[2m  2. npm\x1b[0m",
+    "\x1b]8;;https://example.com\x1b\\  3. yarn\x1b]8;;\x1b\\",
+    "\x1b[2mUse arrow keys to navigate\x1b[0m",
+  ].join("\n");
+  const ansiRes = detectScreenInteraction(ansiMenu, { harness: "gemini" });
+  assert.equal(ansiRes?.kind, "question");
+  assert.equal(ansiRes?.prompt, "Choose package manager");
+  assert.deepEqual(
+    ansiRes?.choices?.map((c) => c.label),
+    ["pnpm", "npm", "yarn"],
+  );
+
+  // 6. Non-numbered [y/n] approval & auth modal
+  const ynRes = detectScreenInteraction("Allow running `rm -rf dist`? [y/n]");
+  assert.equal(ynRes?.kind, "permission");
+  assert.equal(ynRes?.source, "terminal");
+  assert.equal(ynRes?.choices, undefined);
+
+  const authRes = detectScreenInteraction("Please sign in to continue. Device code: ABCD-1234");
+  assert.equal(authRes?.kind, "auth");
+  assert.equal(authRes?.source, "terminal");
+
+  // 7. Permission menus across Codex & Claude preserve kind="permission" and pick the question line over `$ cmd`.
+  const permChoices = [
+    "Allow tool execution?",
+    "❯ 1. Yes, allow once",
+    "  2. No",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(permChoices, { rawStatusKind: "permission" })?.kind, "permission");
+
+  const codexCommandApproval = [
+    "Would you like to run the following command?",
+    "$ rm -rf dist",
+    "› 1. Yes, proceed",
+    "  2. No, and tell Codex what to do differently",
+  ].join("\n");
+  const codexPerm = detectScreenInteraction(codexCommandApproval, { harness: "codex", rawStatusKind: "permission" });
+  assert.equal(codexPerm?.kind, "permission");
+  assert.equal(codexPerm?.prompt, "Would you like to run the following command?");
+  assert.equal(detectScreenInteraction(codexCommandApproval, { harness: "codex" })?.kind, "permission");
+
+  const claudeEditApproval = [
+    "Do you want to make this edit to a.ts?",
+    "❯ 1. Yes",
+    "  2. Yes, allow all edits during this session",
+    "  3. No",
+  ].join("\n");
+  const claudeEdit = detectScreenInteraction(claudeEditApproval, { harness: "claude-code", rawStatusKind: "permission" });
+  assert.equal(claudeEdit?.kind, "permission");
+  assert.equal(claudeEdit?.prompt, "Do you want to make this edit to a.ts?");
+
+  const claudeProceedApproval = [
+    "Do you want to proceed?",
+    "❯ 1. Yes",
+    "  2. No",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(claudeProceedApproval, { harness: "claude-code" })?.kind, "permission");
+
+  // Open WH-questions mentioning "would you like to run" must remain kind="question", not "permission".
+  const openWhQuestion = [
+    "Which test suite would you like to run first?",
+    "❯ 1. Unit tests",
+    "  2. Integration tests",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(openWhQuestion, { harness: "claude-code" })?.kind, "question");
+  assert.equal(
+    detectScreenInteraction(openWhQuestion, { harness: "claude-code", rawStatusKind: "question" })?.kind,
+    "question",
+  );
+
+  // 7b. Legacy Claude rounded-box draft (without footer) and legacy Codex `▌` composer reject historical scrollback prompts.
+  const legacyClaudeBoxedDraft = [
+    "Should I delete unused files? (y/n)",
+    "╭────────────────────────────────────────────╮",
+    "│ ❯ drafting my next message                 │",
+    "╰────────────────────────────────────────────╯",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(legacyClaudeBoxedDraft, { harness: "claude-code" }), null);
+
+  const legacyCodexBlockCursor = [
+    "Old plan options:",
+    "> 1. Keep current cache",
+    "  2. Drop cache",
+    "▌ Ask Codex anything...",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(legacyCodexBlockCursor, { harness: "codex" }), null);
+
+  // 8. Normal idle composers and historical scrollback prompts above an idle composer MUST return null!
+  const idleWithOldMenu = [
+    "? Old question from previous turn",
+    "❯ 1. Option A",
+    "  2. Option B",
+    "Done! Everything is ready.",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon · 18% ctx · idle",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(idleWithOldMenu, { harness: "antigravity" }), null);
+  assert.equal(hasIdleComposerScreen(idleWithOldMenu, "antigravity"), true);
+
+  const claudeIdleWithApprovalProse = [
+    "I updated the approve/reject handlers and fixed the [y/n] parser.",
+    "──────────────────────────────────────────────────────────────",
+    "❯",
+    "──────────────────────────────────────────────────────────────",
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(claudeIdleWithApprovalProse, { harness: "claude-code" }), null);
+  assert.equal(hasIdleComposerScreen(claudeIdleWithApprovalProse, "claude-code"), true);
+
+  // Active working spinner with prose mentioning "approve" or "[y/n]" MUST return null.
+  const workingWithProse = [
+    "Checking whether to approve or reject stale [y/n] prompts...",
+    "⣯ Running tests (esc to interrupt)",
+  ].join("\n");
+  assert.equal(detectScreenInteraction(workingWithProse, { harness: "claude-code" }), null);
+
+  // Viewer subscreens (Swarm board, /status) MUST return null.
+  assert.equal(
+    detectScreenInteraction("Swarm board\n❯ 1. worker-a\n  2. worker-b\ntab switch pane · esc back"),
+    null,
+  );
+});
+
+test("Host promotes working and recently-idle Ask menus + live Uniflo question tool calls into blocked with AgentInteraction", async () => {
+  const wss = new WebSocketServer({ noServer: true });
+  const server = createServer();
+  server.on("upgrade", (req, socket, head) =>
+    wss.handleUpgrade(req, socket, head, () => {}),
+  );
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+
+  const h = new Host({
+    config: { server: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, token: "t", deviceId: "d1", name: "test-host" },
+    log: () => {},
+  });
+
+  const now = Date.now();
+  h.hc.terminals.set("t-work-ask", {
+    address: "t-work-ask",
+    state: "live",
+    status: { app: "antigravity", state: "working" },
+    status_ms: now - 1000,
+    turn: 3,
+    labels: {},
+  });
+  h.hc.terminals.set("t-idle-ask", {
+    address: "t-idle-ask",
+    state: "live",
+    status: { app: "codex", state: "idle" },
+    status_ms: now - 1000,
+    turn: 2,
+    labels: {},
+  });
+  h.hc.terminals.set("t-tool-ask", {
+    address: "t-tool-ask",
+    state: "live",
+    status: { app: "omp", state: "working" },
+    status_ms: now - 1000,
+    turn: 4,
+    labels: {},
+  });
+
+  const agyMenuScreen = [
+    "? Pick release track",
+    "❯ 1. Stable (Recommended)",
+    "  2. Beta",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    "Gemini 4 Neon · 20% ctx · working",
+  ].join("\n");
+  const codexIdleAskScreen = [
+    "Question 1/1",
+    "Apply database migration now?",
+    "❯ 1. Yes",
+    "  2. Skip for now",
+    "enter to submit · esc to cancel",
+  ].join("\n");
+  let ompScreen = "⠋ Preparing question… (esc to interrupt)";
+
+  const screens = new Map<string, () => string>([
+    ["t-work-ask", () => agyMenuScreen],
+    ["t-idle-ask", () => codexIdleAskScreen],
+    ["t-tool-ask", () => ompScreen],
+  ]);
+  h.hc.snapshotWithMeta = async (addr) => ({ text: screens.get(addr)?.() ?? "", cols: 100, rows: 30, altScreen: false, ansi: "" });
+  h.hc.read = async (addr) => ({ text: screens.get(addr)?.() ?? "" });
+
+  try {
+    // Bind Uniflo session to t-tool-ask so live tool_call matches it.
+    h.uniflo.sessions = [
+      {
+        key: "omp:s-ask",
+        harness: "omp",
+        cwd: "/tmp/proj",
+        status: "work",
+        updated_at: now,
+      },
+    ];
+    h.hc.terminals.get("t-tool-ask")!.cwd = "/tmp/proj";
+
+    h.agents = h.collect();
+    assert.equal(h.agents.find((a) => a.localId === "t-tool-ask")?.sessionKey, "omp:s-ask");
+
+    // 1. Live Uniflo question tool_call immediately promotes working agent via structured_tool fallback.
+    (h as unknown as { observeLiveSessionEvent(k: string, ev: unknown): void }).observeLiveSessionEvent("omp:s-ask", {
+      id: "e1",
+      session: "omp:s-ask",
+      ts: now,
+      kind: "tool_call",
+      call_id: "c1",
+      name: "ask",
+      input: { question: "Should we enable strict mode?", options: ["Yes", "No"] },
+    });
+    const afterToolCall = h.collect();
+    const ompLive = afterToolCall.find((a) => a.localId === "t-tool-ask");
+    assert.equal(ompLive?.status, "blocked");
+    assert.equal(ompLive?.statusKind, "question");
+    assert.equal(ompLive?.interaction?.source, "structured_tool");
+    assert.equal(ompLive?.interaction?.prompt, "Should we enable strict mode?");
+
+    // 2. Screen scan promotes both working (Antigravity) AND recently-idle (Codex) Ask menus with full choices.
+    ompScreen = [
+      "? Should we enable strict mode?",
+      "❯ ○ Yes",
+      "  ○ No",
+    ].join("\n");
+    await (h as unknown as { refreshScreenQueues(): Promise<void> }).refreshScreenQueues();
+    const afterScan = h.collect();
+
+    const agy = afterScan.find((a) => a.localId === "t-work-ask");
+    assert.equal(agy?.status, "blocked");
+    assert.equal(agy?.statusKind, "question");
+    assert.equal(agy?.interaction?.source, "terminal");
+    assert.equal(agy?.interaction?.prompt, "Pick release track");
+    assert.equal(agy?.interaction?.choices?.length, 2);
+
+    const codex = afterScan.find((a) => a.localId === "t-idle-ask");
+    assert.equal(codex?.status, "blocked");
+    assert.equal(codex?.statusKind, "question");
+    assert.equal(codex?.interaction?.source, "terminal");
+    assert.equal(codex?.interaction?.prompt, "Apply database migration now?");
+    assert.equal(codex?.interaction?.choices?.length, 2);
+
+    const ompUpgraded = afterScan.find((a) => a.localId === "t-tool-ask");
+    assert.equal(ompUpgraded?.status, "blocked");
+    assert.equal(ompUpgraded?.interaction?.source, "terminal");
+    assert.equal(ompUpgraded?.interaction?.choices?.length, 2);
+
+    // 3. Once the terminal returns to an idle composer and tool_result arrives, interaction clears cleanly.
+    ompScreen = [
+      "Strict mode enabled.",
+      "──────────────────────────────────────────────────────────────",
+      "❯",
+      "──────────────────────────────────────────────────────────────",
+      "  claude-opus-4-6 · 24% ctx · idle",
+    ].join("\n");
+    (h as unknown as { observeLiveSessionEvent(k: string, ev: unknown): void }).observeLiveSessionEvent("omp:s-ask", {
+      id: "e2",
+      session: "omp:s-ask",
+      ts: Date.now(),
+      kind: "tool_result",
+      call_id: "c1",
+      name: "ask",
+      output: "Yes",
+      is_error: false,
+    });
+    await (h as unknown as { refreshScreenQueues(): Promise<void> }).refreshScreenQueues();
+    const afterCleared = h.collect();
+    const ompCleared = afterCleared.find((a) => a.localId === "t-tool-ask");
+    assert.equal(ompCleared?.status, "working");
+    assert.equal(ompCleared?.interaction, undefined);
+  } finally {
+    h.stop();
+    for (const c of wss.clients) c.terminate();
+    wss.close();
+    server.closeAllConnections();
+    server.close();
   }
 });

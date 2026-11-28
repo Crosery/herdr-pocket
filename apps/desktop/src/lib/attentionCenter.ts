@@ -46,14 +46,20 @@ const PEEK_DURATION_MS = 5_600;
 const DEMO_HOLD_MS = 12_000;
 
 export function classifyAttentionCategory(
-  agent: Pick<Agent, "status" | "statusKind" | "statusNote" | "errored">,
+  agent: Pick<Agent, "status" | "statusKind" | "statusNote" | "errored" | "interaction">,
 ): AttentionCategory | null {
+  const interactionKind = agent.interaction?.kind;
+  if (interactionKind === "permission" || interactionKind === "auth") {
+    return "approval";
+  }
+  if (agent.status === "blocked" && (agent.statusKind === "permission" || agent.statusKind === "auth")) {
+    return "approval";
+  }
+  if (interactionKind === "question") {
+    return "question";
+  }
   if (agent.status === "blocked") {
-    if (
-      agent.statusKind === "permission" ||
-      agent.statusKind === "auth" ||
-      (agent.statusNote ? APPROVAL_NOTE_RE.test(agent.statusNote) : false)
-    ) {
+    if (agent.statusNote ? APPROVAL_NOTE_RE.test(agent.statusNote) : false) {
       return "approval";
     }
     return "question";
@@ -92,6 +98,7 @@ export interface AttentionTracker {
   seeded: boolean;
   prevStatus: Map<string, AgentStatus>;
   prevErrored: Map<string, boolean>;
+  prevInteractionKind: Map<string, NonNullable<Agent["interaction"]>["kind"] | undefined>;
   workStartedAt: Map<string, number>;
   demoUntil: number;
 }
@@ -101,6 +108,7 @@ export function createAttentionTracker(): AttentionTracker {
     seeded: false,
     prevStatus: new Map(),
     prevErrored: new Map(),
+    prevInteractionKind: new Map(),
     workStartedAt: new Map(),
     demoUntil: 0,
   };
@@ -113,7 +121,7 @@ export interface ReconcileResult {
 }
 
 function defaultSubtitleFor(
-  agent: Pick<Agent, "statusNote">,
+  agent: Pick<Agent, "statusNote" | "interaction">,
   category: AttentionCategory,
   elapsedMs: number,
 ): string {
@@ -121,10 +129,10 @@ function defaultSubtitleFor(
     return agent.statusNote?.trim() || "运行出现异常报错";
   }
   if (category === "approval") {
-    return agent.statusNote?.trim() || "请求操作授权确认";
+    return agent.interaction?.prompt?.trim() || agent.statusNote?.trim() || "请求操作授权确认";
   }
   if (category === "question") {
-    return agent.statusNote?.trim() || "等待你的进一步指示或输入";
+    return agent.interaction?.prompt?.trim() || agent.statusNote?.trim() || "等待你的进一步指示或输入";
   }
   if (elapsedMs >= 1000) {
     return `已完成（耗时 ${Math.max(1, Math.round(elapsedMs / 1000))} 秒）`;
@@ -155,7 +163,8 @@ export function reconcileAttentionSnapshot(
     }
     const agent = byKey.get(item.agentKey);
     if (!agent) continue;
-    if ((item.category === "approval" || item.category === "question") && agent.status !== "blocked") continue;
+    const hasInteraction = Boolean(agent.interaction?.kind);
+    if ((item.category === "approval" || item.category === "question") && agent.status !== "blocked" && !hasInteraction) continue;
     if (item.category === "error" && !agent.errored) continue;
     if (item.category === "completed") {
       if (agent.status !== "done" || (windowFocused && focusedKeys.has(agent.key))) continue;
@@ -171,8 +180,10 @@ export function reconcileAttentionSnapshot(
   for (const a of agents) {
     const prevSt = tracker.prevStatus.get(a.key);
     const prevErr = tracker.prevErrored.get(a.key) ?? false;
+    const prevInteraction = tracker.prevInteractionKind?.get(a.key);
     tracker.prevStatus.set(a.key, a.status);
     tracker.prevErrored.set(a.key, Boolean(a.errored));
+    tracker.prevInteractionKind?.set(a.key, a.interaction?.kind);
 
     if (a.status === "working") {
       if (!tracker.workStartedAt.has(a.key)) {
@@ -205,7 +216,9 @@ export function reconcileAttentionSnapshot(
       continue;
     }
 
-    const enteredBlocked = a.status === "blocked" && prevSt !== "blocked";
+    const needsInteractive = a.status === "blocked" || Boolean(a.interaction?.kind);
+    const prevNeedsInteractive = prevSt === "blocked" || Boolean(prevInteraction);
+    const enteredBlocked = needsInteractive && !prevNeedsInteractive;
     const enteredError = Boolean(a.errored) && !prevErr;
     const finishedWork = a.status === "done" && prevSt === "working";
 
@@ -391,7 +404,10 @@ export function jumpToAttentionAgent(agentKey: string): boolean {
     }
     const agent = findAgent(agentKey);
     if (agent) {
-      void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
+      void rpcCall(agent.deviceId, "agent.seen", {
+        agent: agent.key,
+        ...(typeof agent.turn === "number" ? { turn: agent.turn } : {}),
+      }).catch(() => {});
     }
   }
 
