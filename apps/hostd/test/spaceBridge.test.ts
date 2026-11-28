@@ -182,10 +182,11 @@ test("mergeHerdrWorkspacesIntoSpaces deduplicates expanded home paths against ti
   ];
   const herdrWorkspaces: HerdrWorkspaceInfo[] = [
     { id: "w1", label: "Different Label", folder: join(homedir(), "work", "demo-repo"), active: false, tabs: [] },
+    { id: "w2", label: "Win Backslash Label", folder: "~\\work\\demo-repo\\", active: false, tabs: [] },
   ];
-  const merged = mergeHerdrWorkspacesIntoSpaces(coreSpaces, herdrWorkspaces, new Map([["w1", 2]]));
+  const merged = mergeHerdrWorkspacesIntoSpaces(coreSpaces, herdrWorkspaces, new Map([["w1", 2], ["w2", 1]]));
   assert.equal(merged.length, 1);
-  assert.equal(merged[0]?.terminals, 3);
+  assert.equal(merged[0]?.terminals, 4);
 });
 
 /** Test double for `HerdrAdapter` that intercepts NDJSON socket calls in-memory. */

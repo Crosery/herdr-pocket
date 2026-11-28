@@ -70,7 +70,7 @@ function normName(raw?: string): string {
 
 function normFolder(raw?: string): string {
   const s = shortHome(raw, homedir()) ?? raw?.trim() ?? "";
-  return s.replace(/[\\/]+$/, "").toLowerCase();
+  return s.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 /**
